@@ -71,6 +71,29 @@ class EventStreamPacing:
             self.next_start = clock() + self.minimum_interval
 
 
+class McpHttpClient(httpx.AsyncClient):
+    """Give each detached MCP HTTP request task a total lifetime in seconds."""
+
+    def __init__(self, rpc_timeout: float, **options):
+        """Retain HTTP inactivity timeouts as well as the JSON-RPC deadline."""
+        super().__init__(timeout=rpc_timeout, **options)
+        self.rpc_timeout = rpc_timeout
+
+    def build_request(self, method, url, **kwargs) -> httpx.Request:
+        """Start the deadline on the SDK's own POST task before it sends the request."""
+        request = super().build_request(method, url, **kwargs)
+        message = kwargs.get("json")
+        if request.method == "POST" and isinstance(message, dict) and "method" in message and "id" in message:
+            # The pinned SDK runs each JSON-RPC request in a separate task. Bound
+            # that task through SSE heartbeats and resumption, independently of
+            # the gateway caller waiting for a reply. Responses to server
+            # requests, notifications and idle GETs run on longer-lived tasks.
+            task = asyncio.current_task()
+            deadline = asyncio.get_running_loop().call_later(self.rpc_timeout, task.cancel)
+            task.add_done_callback(lambda _completed: deadline.cancel())
+        return request
+
+
 @asynccontextmanager
 async def open_session(config, timeout: float, authorization: str | None = None,
                        probe: ConnectionProbe | None = None):
@@ -98,8 +121,8 @@ async def open_session(config, timeout: float, authorization: str | None = None,
             if config.forward_trace_context:
                 request_hooks.append(inject_http_trace)
             hooks = {"response": [probe.response], "request": request_hooks}
-            client = await stack.enter_async_context(httpx.AsyncClient(
-                headers=headers, timeout=timeout, follow_redirects=False, trust_env=not config.loopback,
+            client = await stack.enter_async_context(McpHttpClient(
+                timeout, headers=headers, follow_redirects=False, trust_env=not config.loopback,
                 event_hooks=hooks,
             ))
             streams = await stack.enter_async_context(streamable_http_client(config.url, http_client=client))

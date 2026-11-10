@@ -15,6 +15,7 @@ _SEGMENTS = 4
 LOG_FILE_MAX_BYTES = 50_000_000
 DEFAULT_LOG_RETENTION_DAYS = 7
 LOG_RETENTION_INTERVAL_SECONDS = 60
+_RETIRED_TOOL_LIMIT = 256
 
 
 class Journal:
@@ -197,13 +198,30 @@ class Telemetry:
         """Expose observed successful latency when agent discovery is enabled."""
         return self.history.mean(tool) if self.history is not None else (None, 0)
 
+    def prune_tools(self, live_names, denied) -> None:
+        """Keep live counters and the 256 most recently introduced retired identities."""
+        retired = 0
+        remove = []
+        for name in reversed(self.tools):
+            if name == "(unknown)" or name in live_names or name in denied:
+                continue
+            retired += 1
+            if retired > _RETIRED_TOOL_LIMIT:
+                remove.append(name)
+        for name in remove:
+            del self.tools[name]
+
     def completed(self, tool, outcome, elapsed_ms, merged, input_bytes, output_bytes, *,
-                  session_tag=None, trace_id=None, error_code=None):
+                  session_tag=None, trace_id=None, error_code=None, track_tool=True):
         """Update rollups and append one sanitized event per inbound request."""
         duration = round(elapsed_ms, 2)
         if self.history is not None and outcome == "ok" and not merged:
             self.history.add(tool, duration)
-        for counts in (self.total, self.tools.setdefault(tool, Counts())):
+        self.total.add_call(outcome, elapsed_ms, merged, input_bytes, output_bytes)
+        counts = self.tools.get(tool)
+        if counts is None and track_tool:
+            counts = self.tools[tool] = Counts()
+        if counts is not None:
             counts.add_call(outcome, elapsed_ms, merged, input_bytes, output_bytes)
         event = {
             "at": datetime.now(timezone.utc).isoformat(),
@@ -231,10 +249,12 @@ class Telemetry:
         else:
             _LOG.info("%s %s %.1fms%s", tool, outcome, elapsed_ms, " joined" if merged else "")
 
-    def snapshot(self) -> dict:
-        """Return rollups for the CLI and dashboard without reading the journal."""
-        return {
-            "total": self.total.snapshot(),
-            "tools": {name: count.snapshot() for name, count in self.tools.items()},
-            "journal_errors": self.journal_errors,
-        }
+    def snapshot(self, tool_names: list[str] | None = None) -> dict:
+        """Return all rollups or just those on the selected dashboard page."""
+        names = self.tools if tool_names is None else tool_names
+        tools = {}
+        for name in names:
+            counts = self.tools.get(name)
+            if counts is not None:
+                tools[name] = counts.snapshot()
+        return {"total": self.total.snapshot(), "tools": tools, "journal_errors": self.journal_errors}

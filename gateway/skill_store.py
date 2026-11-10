@@ -193,11 +193,14 @@ class SkillStore:
             WHERE approved_search MATCH ?
             ORDER BY bm25(approved_search, 3.0, 1.0)*(1.0+0.5*(a.helpful+1.0)/(a.votes+2)), a.id
         """, (match,))
-        if available is None:
-            return rows.fetchmany(limit)
+        return self._usable_first(rows, limit, available)
+
+    @staticmethod
+    def _usable_first(rows, limit: int, available: set[str] | None) -> list[sqlite3.Row]:
+        """Take usable rows in rank order and fill any remaining slots with stale matches."""
         usable, stale = [], []
         for row in rows:
-            if set(json.loads(row["steps"])) <= available:
+            if available is None or all(tool in available for tool in json.loads(row["steps"])):
                 usable.append(row)
                 if len(usable) == limit:
                     return usable
@@ -225,8 +228,9 @@ class SkillStore:
                 if relevance:
                     matches.append((relevance, row))
             matches.sort(key=lambda hit: hit[0], reverse=True)
+        ranked_cache = self._usable_first((row for _, row in matches), limit, available)
         return {"skills": [public_approach(row) for row in approved],
-                "cache": [public_approach(row) for _, row in matches[:limit]]}
+                "cache": [public_approach(row) for row in ranked_cache]}
 
     def get(self, identity: str, kind: str) -> dict:
         """Return full content only for an exact identity and expected lifecycle state."""

@@ -16,7 +16,7 @@ from gateway.http_app import create_app
 from gateway.module_data import ModuleError, pointer
 from gateway.module_registry import (ActivateHook, Bind, Delete, Module, ModuleRegistry, PinHook, Run, Save,
                                      SetGenerations)
-from gateway.module_runtime import ModuleService, run_local
+from gateway.module_runtime import ModuleService, result_data, run_local
 from gateway.policy_settings import PolicyChange, ToolPolicySettings
 from gateway.profile import Profile
 from gateway.router import Router
@@ -24,6 +24,19 @@ from gateway.telemetry import Journal, Telemetry
 
 ORIGIN = "http://127.0.0.1:18792"
 TOKEN = "fixture-modules-token"
+
+
+def test_chain_text_fallback_keeps_json_data_limits():
+    """Treat plain text as text while preserving the validation of parsed JSON."""
+
+    def result(text):
+        """Build the single text block accepted by a manual MCP chain."""
+        return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
+
+    assert result_data(result("plain response"), allow_text=True) == "plain response"
+    assert result_data(result("[1,2]"), allow_text=True) == [1, 2]
+    with pytest.raises(ModuleError, match="structural limit"):
+        result_data(result(json.dumps([0] * 12_001)), allow_text=True)
 
 
 def definition(identity, *steps):

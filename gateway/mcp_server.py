@@ -4,25 +4,27 @@ from mcp import McpError, types
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
-VERSION = "0.11.1"
+VERSION = "0.12.0"
 _PAGE_SIZE = 100
 
 
 def make_server(list_tools, call_tool) -> Server:
     """Preserve full tool results and let the policy handler see blocked calls."""
     server = Server("ag-mcp-gateway", version=VERSION)
-    async def catalog(request: types.ListToolsRequest) -> types.ListToolsResult:
+
+    async def catalog(request: types.ListToolsRequest) -> types.ServerResult:
         """Read one catalog page with its opaque cursor."""
         cursor = request.params.cursor if request.params else None
-        return await list_tools(cursor)
-
-    server.list_tools()(catalog)
+        return types.ServerResult(await list_tools(cursor))
 
     async def call(request: types.CallToolRequest) -> types.ServerResult:
         """Forward one typed MCP request through the supplied dispatcher."""
         result = await call_tool(request.params)
         return types.ServerResult(result)
 
+    # Both operations use the gateway catalog. The SDK list decorator would
+    # retain every descriptor seen across revisions in its unused tool cache.
+    server.request_handlers[types.ListToolsRequest] = catalog
     server.request_handlers[types.CallToolRequest] = call
     return server
 

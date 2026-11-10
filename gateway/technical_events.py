@@ -20,6 +20,7 @@ CALL_ERRORS = {
     "connection_changed": "Upstream connection changed before dispatch.",
     "upstream_timeout": "Upstream call timed out.",
     "upstream_transport": "Upstream transport failed.",
+    "invalid_upstream_output": "Upstream tool output failed schema validation.",
     "upstream_tool_error": "Upstream returned a tool error.",
     "internal_error": "Gateway tool processing failed.",
 }

@@ -47,10 +47,14 @@ def bounded_json(value, limit: int = MAX_DATA, *, node_limit: int = 12_000) -> b
         raise ModuleError("Module data must be valid JSON") from error
 
 
-def parse_json(text: str):
-    """Parse JSON without NaN or infinity and enforce the module data limits."""
+def parse_json(text: str, *, allow_text: bool = False):
+    """Parse and validate JSON, or keep plain text when explicitly permitted."""
     try:
         value = json.loads(text)
+    except json.JSONDecodeError as error:
+        if not allow_text:
+            raise ModuleError("Module data must be valid JSON") from error
+        value = text
     except (ValueError, RecursionError) as error:
         raise ModuleError("Module data must be valid JSON") from error
     bounded_json(value)

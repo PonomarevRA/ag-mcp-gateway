@@ -6,6 +6,7 @@ import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -80,6 +81,58 @@ def test_cache_count_expiry_and_page_limit(tmp_path):
     assert store.get(approved, "approved")["instructions"] == "reviewed"
     assert store.get(draft, "draft")["instructions"] == "draft"
     assert path.stat().st_mode & 0o077 == 0
+
+
+def test_cache_search_ranks_live_approaches_before_stale_matches(tmp_path):
+    """Fill the limited response with an available approach before stale matches."""
+    store = SkillStore(tmp_path / "skills.sqlite3", SkillSettings())
+    usable = store.save("logs", "archive", [TOOL])["id"]
+    blocked = store.save("logs", "logs archive", ["demo.blocked"])["id"]
+    assert store.find("logs", 1)["cache"][0]["id"] == blocked
+    assert store.find("logs", 1, {TOOL})["cache"][0]["id"] == usable
+
+
+def test_search_refreshes_availability_after_a_policy_change(tmp_path, monkeypatch):
+    """Refresh a limited SQLite ranking when its initially usable match is denied."""
+    store = SkillStore(tmp_path / "skills.sqlite3", SkillSettings())
+    initial = store.save("logs archive", "review", [TOOL], "first instructions")["id"]
+    other = store.save("archive", "logs review", ["demo.other"], "other instructions")["id"]
+    store.approve(initial)
+    store.approve(other)
+    profile = SimpleNamespace(denied=set())
+    router = SimpleNamespace(profile=profile, routes={
+        TOOL: SimpleNamespace(worker=None),
+        "demo.other": SimpleNamespace(worker=None),
+    })
+    tools = SkillTools(store, router)
+    find = store.find
+    finish = Event()
+
+    async def exercise():
+        """Change the policy after the first query has read the existing catalogue."""
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+
+        def blocked_find(query, limit, available):
+            """Freeze the first completed query until the new policy is visible."""
+            result = find(query, limit, available)
+            loop.call_soon_threadsafe(started.set)
+            if not finish.wait(3):
+                raise AssertionError("Fixture did not release the skill search")
+            return result
+
+        monkeypatch.setattr(store, "find", blocked_find)
+        search = asyncio.create_task(tools.search(SkillSearch(query="logs", limit=1)))
+        try:
+            await asyncio.wait_for(started.wait(), 3)
+            profile.denied.add(TOOL)
+        finally:
+            finish.set()
+        result = await search
+        assert [row["id"] for row in result["skills"]] == [other]
+        assert result["skills"][0]["usable"] and not result["suggest_skill_draft"]
+
+    asyncio.run(exercise())
 
 
 def test_full_with_only_protected_records_can_recover(tmp_path):

@@ -1,19 +1,23 @@
 """Protect page work, schema reuse, shared sizing and event-stream traffic."""
 
 import asyncio
+import json
 
 import httpx
 import pytest
 from jsonschema import Draft202012Validator, ValidationError
 from mcp import McpError, types
+from mcp.client.streamable_http import streamable_http_client
 
+from gateway.mcp_client import CatalogSession
+from gateway.mcp_server import make_server
 from gateway.policy_settings import PolicyChange, ToolPolicySettings
 from gateway.profile import Profile
 from gateway.router import Route, Router
 from gateway.schema_checks import SchemaChecks
 from gateway.telemetry import Journal, Telemetry
 from gateway.tool_discovery import Discovery, Query
-from gateway.upstream import EventStreamPacing
+from gateway.upstream import EventStreamPacing, McpHttpClient
 
 
 def fixture_router(tmp_path):
@@ -22,6 +26,40 @@ def fixture_router(tmp_path):
         "demo": {"transport": "stdio", "command": "unused"},
     }, "singleflight": ["demo.same"]})
     return Router(profile, Telemetry(Journal(tmp_path, 65536)))
+
+
+def test_server_catalog_does_not_retain_old_tool_descriptors():
+    """Keep paginated MCP catalog handling independent of the SDK tool cache."""
+    async def exercise():
+        """List multiple revisions and call through the same server instance."""
+        revision = 0
+
+        async def list_tools(cursor):
+            """Return a new descriptor for the selected page in each revision."""
+            page = "first" if cursor is None else "second"
+            tool = types.Tool(name=f"demo.rev_{revision}_{page}", inputSchema={"type": "object"})
+            return types.ListToolsResult(tools=[tool], nextCursor="next" if cursor is None else None)
+
+        async def call_tool(params):
+            """Return the requested name without consulting an SDK catalog cache."""
+            return types.CallToolResult(content=[types.TextContent(type="text", text=params.name)])
+
+        server = make_server(list_tools, call_tool)
+        assert server.create_initialization_options().capabilities.tools is not None
+        handler = server.request_handlers[types.ListToolsRequest]
+        for revision in range(3):
+            first = await handler(types.ListToolsRequest())
+            assert first.root.tools[0].name == f"demo.rev_{revision}_first"
+            params = types.PaginatedRequestParams(cursor=first.root.nextCursor)
+            second = await handler(types.ListToolsRequest(params=params))
+            assert second.root.tools[0].name == f"demo.rev_{revision}_second"
+
+        call = types.CallToolRequest(params=types.CallToolRequestParams(name="demo.rev_2_second"))
+        result = await server.request_handlers[types.CallToolRequest](call)
+        assert result.root.content[0].text == "demo.rev_2_second"
+        assert not server._tool_cache
+
+    asyncio.run(exercise())
 
 
 def test_catalog_materializes_only_current_page(tmp_path, monkeypatch):
@@ -149,3 +187,112 @@ def test_cursorless_sse_reconnects_are_paced_without_delaying_tool_resumption():
         assert seen[3][1] - seen[0][1] >= 0.028
 
     asyncio.run(exercise())
+
+
+def test_http_request_deadline_closes_heartbeat_stream_and_keeps_session_alive():
+    """Stop a detached SDK POST at its deadline and still resume a later tool response."""
+    async def exercise():
+        """Run an unfinished and a resumable tool call through the real SDK transport."""
+        closed = asyncio.Event()
+        ping_replied = asyncio.Event()
+        timeout = 0.10
+        resumed_id = None
+        sse_headers = {"content-type": "text/event-stream"}
+
+        class Heartbeats(httpx.AsyncByteStream):
+            """Keep the incomplete SSE response active until the client closes it."""
+
+            async def __aiter__(self):
+                """Send comments more often than the client's inactivity timeout."""
+                while True:
+                    await asyncio.sleep(0.01)
+                    yield b": heartbeat\n\n"
+
+            async def aclose(self):
+                """Record HTTP response cleanup independently of the tool waiter."""
+                closed.set()
+
+        class NotificationStream(httpx.AsyncByteStream):
+            """Deliver a server-initiated ping on the persistent notification stream."""
+
+            async def __aiter__(self):
+                """Keep the stream open after the ping until normal session shutdown."""
+                yield b'data: {"jsonrpc":"2.0","id":"upstream-ping","method":"ping"}\n\n'
+                await asyncio.Event().wait()
+
+        async def respond(request):
+            """Serve the server ping, incomplete tool response and later resumption."""
+            nonlocal resumed_id
+            if request.method == "GET":
+                if "last-event-id" not in request.headers:
+                    return httpx.Response(200, headers=sse_headers, stream=NotificationStream())
+                assert request.headers["last-event-id"] == "tool-cursor"
+                payload = json.dumps({"jsonrpc": "2.0", "id": resumed_id, "result": {"content": []}})
+                return httpx.Response(200, headers=sse_headers, content=f"data: {payload}\n\n".encode())
+            if request.method == "DELETE":
+                return httpx.Response(204)
+
+            body = json.loads(request.content)
+            if "method" not in body:
+                assert body == {"jsonrpc": "2.0", "id": "upstream-ping", "result": {}}
+                ping_replied.set()
+                return httpx.Response(202)
+            if body["method"] == "initialize":
+                result = {"protocolVersion": body["params"]["protocolVersion"], "capabilities": {},
+                          "serverInfo": {"name": "fixture", "version": "1"}}
+                return httpx.Response(200, headers={"mcp-session-id": "fixture"},
+                                      json={"jsonrpc": "2.0", "id": body["id"], "result": result})
+            if body["method"] == "notifications/initialized":
+                return httpx.Response(202)
+            assert body["method"] == "tools/call"
+            if body["params"]["name"] == "heartbeat":
+                return httpx.Response(200, headers=sse_headers, stream=Heartbeats())
+            resumed_id = body["id"]
+            return httpx.Response(200, headers=sse_headers,
+                                  content=b"event: message\nid: tool-cursor\nretry: 5\ndata:\n\n")
+
+        pacing = EventStreamPacing()
+        async with McpHttpClient(timeout, transport=httpx.MockTransport(respond),
+                                 event_hooks={"request": [pacing.request]}) as http:
+            async with streamable_http_client("http://fixture/mcp", http_client=http) as streams:
+                async with CatalogSession(*streams[:2]) as session:
+                    await session.initialize()
+                    await asyncio.wait_for(ping_replied.wait(), 0.25)
+                    # A server ping response must not arm a timer on the SDK's shared writer.
+                    await asyncio.sleep(timeout * 1.5)
+                    with pytest.raises(TimeoutError):
+                        async with asyncio.timeout(timeout):
+                            await session.request_tool("heartbeat", {}, None)
+                    await asyncio.wait_for(closed.wait(), 0.25)
+                    async with asyncio.timeout(timeout):
+                        result = await session.request_tool("resume", {}, None)
+                    assert not result.isError
+
+    asyncio.run(exercise())
+
+
+def test_upstream_output_schema_failure_has_its_own_diagnostic(tmp_path):
+    """Distinguish a completed upstream call with invalid output from transport failure."""
+    from gateway.mcp_client import CatalogSession
+
+    class Upstream(CatalogSession):
+        """Return a successful transport response containing a schema mismatch."""
+
+        def __init__(self):
+            """Use the real published-output validator without opening a transport."""
+
+        async def request_tool(self, name, arguments, meta):
+            """Return a type that violates the advertised output schema."""
+            return types.CallToolResult(content=[], structuredContent={"value": "synthetic-private-output"})
+
+    router = fixture_router(tmp_path)
+    tool = types.Tool(name="bad", inputSchema={"type": "object"},
+                      outputSchema={"type": "object", "properties": {"value": {"type": "integer"}}})
+    router.routes["demo.bad"] = Route(tool, Upstream())
+    result = asyncio.run(router.call("demo.bad", {}))
+    assert result.isError
+    assert result.content[0].text == "Upstream tool output failed schema validation"
+    event = json.loads(router.telemetry.journal.paths[0].read_text())
+    assert event["error_code"] == "invalid_upstream_output"
+    assert "synthetic-private-output" not in str(event)
+    assert router.telemetry.total.upstream == router.telemetry.total.errors == 1

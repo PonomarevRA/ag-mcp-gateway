@@ -12,7 +12,7 @@ from mcp import ClientSession, types
 from .connections import BackendConnections, Connection
 from .credentials import SecretStore
 from .hook_lifecycle import HOOK_META
-from .mcp_client import CatalogSession
+from .mcp_client import CatalogSession, PublishedOutputError
 from .mcp_server import catalog_window
 from .module_data import ModuleError, json_signature, object_required
 from .module_runtime import check_schema, run_local, transform_result
@@ -69,6 +69,8 @@ class Router:
         self.catalog_revision = 0
         self._visible_revision = -1
         self._visible_names: tuple[str, ...] = ()
+        self._ordered_names: tuple[str, ...] = ()
+        self._available_counts: dict[str, int] = {}
         self.statuses = dict.fromkeys(profile.backends, "starting")
         self.pending: dict[tuple[str, bytes, int], asyncio.Task[FlightResult]] = {}
         self.schema_checks = SchemaChecks()
@@ -97,6 +99,7 @@ class Router:
                     if previous is not None and previous.schema_signature == signature:
                         schema_generation = previous.schema_generation
                 self.routes[name] = Route(tool, worker.session, worker, schema_generation, signature)
+        self.telemetry.prune_tools(self.routes, self.profile.denied)
 
 
     @asynccontextmanager
@@ -114,7 +117,14 @@ class Router:
     def _catalog_names(self) -> tuple[str, ...]:
         """Cache visibility and ordering for one publication or policy revision."""
         if self._visible_revision != self.catalog_revision:
-            self._visible_names = tuple(sorted(name for name in self.routes if name not in self.profile.denied))
+            self._ordered_names = tuple(sorted(self.routes))
+            self._visible_names = tuple(name for name in self._ordered_names if name not in self.profile.denied)
+            counts = dict.fromkeys(self.profile.backends, 0)
+            for name in self._visible_names:
+                prefix = name.partition(".")[0]
+                if prefix in counts:
+                    counts[prefix] += 1
+            self._available_counts = counts
             self._visible_revision = self.catalog_revision
         return self._visible_names
 
@@ -145,32 +155,54 @@ class Router:
         return annotations is not None and annotations.readOnlyHint is True
 
     def snapshot(self) -> dict:
-        """Describe tool availability and measured traffic without revealing profile secrets."""
+        """Describe the complete catalog for machine-readable status callers."""
+        self._catalog_names()
+        return self._catalog_snapshot(self._ordered_names, self.telemetry.snapshot())
+
+    def dashboard_snapshot(self, query: str, offset: int, backend: str | None, *, page_size: int) -> dict:
+        """Filter the full catalog and materialize only the requested browser page."""
+        self._catalog_names()
+        term = query.casefold()
+        matches = []
+        groups = set()
+        for name in self._ordered_names:
+            prefix = name.partition(".")[0]
+            if backend is not None and prefix != backend:
+                continue
+            if term and term not in name.casefold():
+                description = self.routes[name].tool.description or ""
+                if term not in description.casefold():
+                    continue
+            matches.append(name)
+            groups.add(prefix)
+        total = len(matches)
+        last_page = max(0, total - 1) // page_size * page_size
+        offset = min(offset // page_size * page_size, last_page)
+        page = matches[offset:offset + page_size]
+        result = self._catalog_snapshot(page, self.telemetry.snapshot(page))
+        result["page"] = {"total": total, "offset": offset, "size": page_size, "backend": backend, "groups": groups}
+        return result
+
+    def _catalog_snapshot(self, names, metrics: dict) -> dict:
+        """Assemble current catalog policy and connection metadata for the selected names."""
         catalog = []
-        for name, route in sorted(self.routes.items()):
-            catalog.append({
-                "name": name,
-                "description": route.tool.description or "",
-                "denied": name in self.profile.denied,
-                "singleflight": self.singleflight_active(name, route),
-            })
+        for name in names:
+            route = self.routes[name]
+            catalog.append({"name": name, "description": route.tool.description or "",
+                            "denied": name in self.profile.denied,
+                            "singleflight": self.singleflight_active(name, route)})
         return {
             "profile": self.profile.name,
             "environment": self.profile.environment,
             "backends": self.statuses.copy(),
-            "connections": self.connection_catalog(catalog),
+            "connections": self.connection_catalog(),
             "catalog": catalog,
-            "metrics": self.telemetry.snapshot(),
+            "metrics": metrics,
         }
 
-    def connection_catalog(self, tools: list[dict]) -> list[dict]:
+    def connection_catalog(self) -> list[dict]:
         """Summarize readiness, authentication, dispatch time and tool count per backend."""
-        counts = dict.fromkeys(self.profile.backends, 0)
-        for tool in tools:
-            if not tool["denied"]:
-                prefix = tool["name"].partition(".")[0]
-                if prefix in counts:
-                    counts[prefix] += 1
+        counts = self._available_counts
         items = []
         for name, backend in self.profile.backends.items():
             auth = "none"
@@ -294,7 +326,9 @@ class Router:
             session_tag = context.tag if context else None
             self.telemetry.completed(metric_name, outcome, elapsed_ms, joined, input_bytes, output_bytes,
                                      session_tag=session_tag, trace_id=trace.trace_id if trace else None,
-                                     error_code=error_code)
+                                     error_code=error_code,
+                                     track_tool=metric_name == "(unknown)" or metric_name in self.routes
+                                     or metric_name in self.profile.denied)
 
     def _contextual_call(self, name, route, arguments, metadata, context, trace):
         """Apply the selected backend's forwarding rules to request metadata and identity."""
@@ -347,6 +381,8 @@ class Router:
             return FlightResult(result)
         except TimeoutError:
             return FlightResult.failed("Upstream call timed out", "upstream_timeout")
+        except PublishedOutputError:
+            return FlightResult.failed("Upstream tool output failed schema validation", "invalid_upstream_output")
         except Exception:
             return FlightResult.failed("Upstream transport failed", "upstream_transport")
         finally:

@@ -157,6 +157,15 @@ class TelemetryAPI:
         except (OSError, sqlite3.Error, ValueError):
             return api_error(503)
 
+    async def read_page(self, after: int | None, before: int | None, limit: int) -> tuple[dict, list[dict]]:
+        """Read committed records and reject malformed fields shared by HTTP and agents."""
+        status, rows = await asyncio.to_thread(self.journal.page, after, before, limit)
+        for row in rows:
+            if (not isinstance(row.get("properties"), dict) or "traceId" not in row or "sessionId" not in row
+                    or row.get("level") not in ("TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL")):
+                raise ValueError("Invalid technical journal event")
+        return status, rows
+
     async def events(self, request):
         """Read one coherent journal page without blocking the gateway event loop."""
         if not permitted_request(request):
@@ -166,7 +175,7 @@ class TelemetryAPI:
         except ValueError:
             return api_error(400)
         try:
-            status, rows = await asyncio.to_thread(self.journal.page, query.after, query.before, query.limit + 1)
+            status, rows = await self.read_page(query.after, query.before, query.limit + 1)
         except (OSError, sqlite3.Error, ValueError):
             return api_error(503)
         if query.expired(status):

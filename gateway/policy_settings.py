@@ -73,6 +73,7 @@ class ToolPolicySettings:
             profile.denied = denied
             profile.singleflight = singleflight
             self.router.catalog_revision += 1
+            self.router.telemetry.prune_tools(self.router.routes, denied)
         self.router.management_singleflight = singleflight - self.baseline_singleflight
         self.state = state
 

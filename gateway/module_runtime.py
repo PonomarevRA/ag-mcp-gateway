@@ -93,13 +93,7 @@ def result_data(result: types.CallToolResult, *, allow_text: bool = False):
     if result.structuredContent is not None:
         return result.structuredContent
     if len(result.content) == 1 and isinstance(result.content[0], types.TextContent):
-        text = result.content[0].text
-        try:
-            return parse_json(text)
-        except ModuleError:
-            if allow_text:
-                return text
-            raise
+        return parse_json(result.content[0].text, allow_text=allow_text)
     raise ModuleError("The tool did not return a single JSON result")
 
 

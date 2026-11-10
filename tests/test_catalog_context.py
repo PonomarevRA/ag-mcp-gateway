@@ -192,3 +192,40 @@ def test_cli_identity_accepts_dash_prefixed_remote_id():
     context = SessionContext.parse({"remoteSessionId": "-opaque"})
     args = parser().parse_args(["stdio", *context.cli_arguments()])
     assert session_from_cli(args) == context
+
+
+def test_dashboard_pages_search_the_full_catalog(tmp_path):
+    """Keep full search and status while rendering only one browser page."""
+    from starlette.testclient import TestClient
+
+    from gateway.http_app import create_app
+
+    profile = Profile.model_validate({
+        "name": "paged",
+        "backends": {name: {"transport": "stdio", "command": "unused"} for name in ("alpha", "beta")},
+        "denied": ["alpha.tool_001"],
+    })
+    router = Router(profile, Telemetry(Journal(tmp_path, 4096)))
+    for backend in ("alpha", "beta"):
+        for index in range(125):
+            name = f"tool_{index:03}"
+            description = "Final needle <escaped>" if backend == "beta" and index == 124 else "Fixture tool"
+            tool = types.Tool(name=name, description=description, inputSchema={"type": "object"})
+            router.routes[f"{backend}.{name}"] = Route(tool, RecordingSession())
+
+    client = TestClient(create_app(router, 18792, None), base_url="http://127.0.0.1:18792")
+    first = client.get("/").text
+    assert "Инструменты · 250" in first
+    assert "alpha.tool_000" in first and "alpha.tool_099" in first and "alpha.tool_100" not in first
+    assert 'rel="next" href="/?offset=100"' in first and 'href="/?backend=beta"' in first
+    assert "alpha.tool_001</strong> <small>Запрещён" in first
+    second = client.get("/?offset=100").text
+    assert "alpha.tool_100" in second and "beta.tool_074" in second and "beta.tool_075" not in second
+    last = client.get("/?backend=beta&offset=999999").text
+    assert "Инструменты · 125" in last and "beta.tool_124" in last and "alpha.tool_124" not in last
+    filtered = client.get("/", params={"q": "NEEDLE"}).text
+    assert "Инструменты · 1" in filtered and "beta.tool_124" in filtered and "alpha.tool_000" not in filtered
+    assert "&lt;escaped&gt;" in filtered and "<escaped>" not in filtered
+    status = client.get("/api/status/paged").json()
+    assert len(status["catalog"]) == 250
+    assert {item["name"]: item["tools"] for item in status["connections"]} == {"alpha": 124, "beta": 125}

@@ -93,9 +93,16 @@ class SkillTools:
     async def search(self, request: SkillSearch) -> dict:
         """Find relevant usable records first and offer a draft when there are none."""
         live, denied = self._availability()
-        result = await asyncio.to_thread(self.store.find, request.query, request.limit, live - denied)
+        # Retry once if a policy or connection changed during the SQLite ranking.
+        for _ in range(2):
+            available = live - denied
+            result = await asyncio.to_thread(self.store.find, request.query, request.limit, available)
+            live, denied = self._availability()
+            if live - denied == available:
+                break
         for category in ("skills", "cache"):
-            result[category] = [self._with_availability(row, live, denied) for row in result[category]]
+            rows = [self._with_availability(row, live, denied) for row in result[category]]
+            result[category] = sorted(rows, key=lambda row: not row["usable"])
         result["suggest_skill_draft"] = not any(row["usable"] for row in result["skills"])
         return result
 

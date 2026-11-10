@@ -16,7 +16,7 @@ from starlette.routing import Route
 from .connection_diagnostics import FAILURE_LABELS
 from .connections import ReauthorizationError
 from .credential_ui import CredentialsUI, SECURE_HTML, read_form
-from .dashboard import STYLE, render
+from .dashboard import CATALOG_PAGE_SIZE, STYLE, render
 from .management import Management
 from .mcp_server import make_server
 from .module_data import ModuleError
@@ -180,15 +180,21 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
                 return
             await manager.handle_request(scope, receive, send)
 
-    def dashboard(query: str = "", *, notice: str = "", status_code: int = 200):
-        """Render one current, sanitized view and the authorized browser controls."""
-        page = render(router.snapshot(), query, credentials=credentials.enabled, management=management is not None,
+    def dashboard(query: str = "", *, offset: int = 0, backend: str | None = None,
+                  notice: str = "", status_code: int = 200):
+        """Render a single catalog page and the authorized browser controls."""
+        snapshot = router.dashboard_snapshot(query, offset, backend, page_size=CATALOG_PAGE_SIZE)
+        page = render(snapshot, query, credentials=credentials.enabled, management=management is not None,
                       reconnect_csrf=credentials.csrf if token else None, notice=notice, modules=modules is not None)
         return HTMLResponse(page, status_code=status_code, headers=SECURE_HTML)
 
     async def overview(request):
         """Render the catalog with a bounded search filter."""
-        return dashboard(request.query_params.get("q", "")[:200])
+        value = request.query_params.get("offset", "")
+        offset = int(value) if value.isascii() and value.isdecimal() and len(value) <= 6 else 0
+        backend = request.query_params.get("backend")
+        return dashboard(request.query_params.get("q", "")[:200], offset=offset,
+                         backend=backend if backend in router.profile.backends else None)
 
     async def reconnect(request):
         """Replace one selected MCP after local browser authentication and CSRF checks."""

@@ -9,7 +9,6 @@ import os
 import sqlite3
 import sys
 import warnings
-from collections import deque
 from hashlib import sha256
 from pathlib import Path
 
@@ -38,6 +37,8 @@ from .token_secrets import resolve_token, valid_token
 from .tool_feedback import ToolFeedback
 
 _LOG = logging.getLogger("gateway")
+_LOG_MAX_LINE_BYTES = 64 * 1024
+_LOG_READ_CHUNK = _LOG_MAX_LINE_BYTES
 
 
 def executable() -> list[str]:
@@ -195,20 +196,55 @@ def save_token(key: str) -> None:
     print("Token saved in macOS Keychain")
 
 
+def newest_log_lines(source):
+    """Read complete NDJSON lines from the end, without scanning older chunks first."""
+    offset = source.seek(0, os.SEEK_END)
+    suffix = b""
+    found_terminator = False
+    while offset:
+        size = min(offset, _LOG_READ_CHUNK)
+        offset -= size
+        source.seek(offset)
+        first, *following = source.read(size).split(b"\n")
+        if not following:
+            if found_terminator and suffix is not None:
+                # Generated records fit comfortably in one chunk. Ignore oversized corrupt lines.
+                suffix = first + suffix if len(first) + len(suffix) <= _LOG_MAX_LINE_BYTES else None
+            continue
+
+        tail = following.pop()
+        if found_terminator and suffix is not None and len(tail) + len(suffix) <= _LOG_MAX_LINE_BYTES:
+            yield tail + suffix
+        # The first chunk with a newline ended with a possibly incomplete record.
+        found_terminator = True
+        yield from reversed(following)
+        suffix = first
+    if found_terminator and suffix is not None:
+        yield suffix
+
+
 def show_logs(directory: Path, limit: int, backend: str | None, session_tag: str | None,
               trace_id: str | None = None):
-    """Read a bounded tail across rotations, tolerating a segment moving during a read."""
-    recent = deque(maxlen=limit)
-    for index in range(3, -1, -1):
+    """Find the requested latest matches and print them in chronological order."""
+    if limit <= 0:
+        return
+    recent = []
+    seen = set()
+    for index in range(4):
         path = directory / "logs" / f"calls.{index}.jsonl"
         try:
-            with path.open("r", encoding="utf-8") as source:
-                for line in source:
-                    if not line.endswith("\n"):
-                        continue
+            with path.open("rb") as source:
+                stat = os.fstat(source.fileno())
+                identity = stat.st_dev, stat.st_ino
+                if stat.st_ino and identity in seen:
+                    # A segment already read may have moved to this slot during rotation.
+                    continue
+                seen.add(identity)
+                for raw in newest_log_lines(source):
                     try:
+                        line = raw.decode("utf-8").removesuffix("\r")
                         event = json.loads(line)
-                    except ValueError:
+                    except (ValueError, RecursionError):
                         continue
                     if not isinstance(event, dict):
                         continue
@@ -219,10 +255,14 @@ def show_logs(directory: Path, limit: int, backend: str | None, session_tag: str
                         continue
                     if trace_id is not None and event.get("trace_id") != trace_id:
                         continue
-                    recent.append(line)
+                    recent.append(line + "\n")
+                    if len(recent) == limit:
+                        break
         except FileNotFoundError:
             continue
-    sys.stdout.writelines(recent)
+        if len(recent) == limit:
+            break
+    sys.stdout.writelines(reversed(recent))
 
 
 def config_fragment(args, profile: Profile, session: SessionContext | None = None) -> str:

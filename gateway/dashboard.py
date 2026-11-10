@@ -2,8 +2,11 @@
 
 from datetime import datetime
 from html import escape
+from urllib.parse import urlencode
 
 from .connection_diagnostics import FAILURE_LABELS
+
+CATALOG_PAGE_SIZE = 100
 
 STYLE = """
 :root { color-scheme: light dark; font: 100% system-ui, sans-serif; }
@@ -138,7 +141,7 @@ def last_call_line(timestamp: str | None) -> str:
     return f'<p class="muted">Последний вызов: {value}</p>'
 
 
-def backend_card(backend: dict, can_manage: bool, has_tool_group: bool, csrf: str | None) -> str:
+def backend_card(backend: dict, can_manage: bool, tools_href: str | None, csrf: str | None) -> str:
     """Show confirmed transport readiness and relevant actions for one backend."""
     name = escape(backend["name"])
     state = backend["status"]
@@ -146,8 +149,8 @@ def backend_card(backend: dict, can_manage: bool, has_tool_group: bool, csrf: st
     transport = "Локальный процесс · stdio" if backend["transport"] == "stdio" else "Streamable HTTP"
     auth_label = {"basic": "HTTP Basic", "bearer": "Bearer", "none": "Без входа через шлюз"}[auth]
     actions = []
-    if has_tool_group:
-        actions.append(f'<a href="#tools-{name}">Инструменты</a>')
+    if tools_href:
+        actions.append(f'<a href="{escape(tools_href, quote=True)}">Инструменты</a>')
     if auth == "basic" and can_manage:
         action = "Переавторизоваться" if state == "ready" else "Настроить подключение"
         actions.append(f'<a href="/credentials?backend={name}">{action}</a>')
@@ -180,6 +183,34 @@ def tool_groups(tools: list[dict], query: str, metrics: dict) -> tuple[dict[str,
     return groups, count
 
 
+def catalog_url(query: str, backend: str | None, offset: int = 0) -> str:
+    """Build a relative URL for browser filters and page navigation."""
+    parameters = {}
+    if query:
+        parameters["q"] = query
+    if backend:
+        parameters["backend"] = backend
+    if offset:
+        parameters["offset"] = offset
+    encoded = urlencode(parameters)
+    return f"/?{encoded}" if encoded else "/"
+
+
+def catalog_navigation(page: dict | None, query: str) -> str:
+    """Render page links while keeping the selected backend and search term."""
+    if page is None or page["total"] <= page["size"]:
+        return ""
+    offset, size, total = page["offset"], page["size"], page["total"]
+    links = [f"<span>{offset + 1}–{min(total, offset + size)} из {total}</span>"]
+    if offset:
+        previous = escape(catalog_url(query, page["backend"], offset - size), quote=True)
+        links.append(f'<a rel="prev" href="{previous}">Назад</a>')
+    if offset + size < total:
+        following = escape(catalog_url(query, page["backend"], offset + size), quote=True)
+        links.append(f'<a rel="next" href="{following}">Далее</a>')
+    return f'<nav aria-label="Страницы инструментов">{" ".join(links)}</nav>'
+
+
 def render(status: dict, query: str, *, credentials: bool = False, management: bool = False,
            reconnect_csrf: str | None = None, notice: str = "", modules: bool = False) -> str:
     """Render one dashboard snapshot without executing upstream text or links."""
@@ -195,10 +226,25 @@ def render(status: dict, query: str, *, credentials: bool = False, management: b
         f"<div><dt>{label}</dt><dd>{display(metrics['total'][key])}</dd></div>"
         for key, label in _METRICS.items()
     )
-    groups, count = tool_groups(status["catalog"], query, metrics["tools"])
-    backends = "".join(
-        backend_card(item, credentials, item["name"] in groups, reconnect_csrf) for item in status["connections"]
-    )
+    page = status.get("page")
+    groups, count = tool_groups(status["catalog"], "" if page else query, metrics["tools"])
+    backend_filter = ""
+    if page is not None:
+        count = page["total"]
+        if page["backend"]:
+            backend = escape(page["backend"], quote=True)
+            reset = escape(catalog_url(query, None), quote=True)
+            backend_filter = f'<input type="hidden" name="backend" value="{backend}"><a href="{reset}">Все MCP</a>'
+    cards_html = []
+    for item in status["connections"]:
+        name = item["name"]
+        href = None
+        if name in groups:
+            href = f"#tools-{name}"
+        elif page is not None and (name in page["groups"] or (page["backend"] and item["tools"])):
+            href = catalog_url(query, name)
+        cards_html.append(backend_card(item, credentials, href, reconnect_csrf))
+    backends = "".join(cards_html)
     catalog = "".join(
         f'<div><h3 id="tools-{escape(prefix)}">{escape(prefix)}</h3><ul class="tools">{"".join(rows)}</ul></div>'
         for prefix, rows in groups.items()
@@ -221,7 +267,8 @@ def render(status: dict, query: str, *, credentials: bool = False, management: b
 <form action="/" method="get">
 <label for="q">Имя или описание</label>
 <input id="q" name="q" maxlength="200" value="{escape(query, quote=True)}">
-<button type="submit">Найти</button>
+<button type="submit">Найти</button>{backend_filter}
 </form>
+{catalog_navigation(page, query)}
 {catalog}</section>
 </main></html>"""

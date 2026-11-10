@@ -257,12 +257,21 @@ class TechnicalJournal:
                 raise OSError("Technical journal unavailable")
             status = self._status(db)
             if after is not None:
-                rows = db.execute("SELECT payload FROM events WHERE sequence > ? ORDER BY sequence LIMIT ?", (after, limit))
+                rows = db.execute("SELECT sequence, payload FROM events WHERE sequence > ? ORDER BY sequence LIMIT ?", (after, limit))
             elif before is not None:
-                rows = db.execute("SELECT payload FROM events WHERE sequence < ? ORDER BY sequence DESC LIMIT ?", (before, limit))
+                rows = db.execute("SELECT sequence, payload FROM events WHERE sequence < ? ORDER BY sequence DESC LIMIT ?", (before, limit))
             else:
-                rows = db.execute("SELECT payload FROM events ORDER BY sequence DESC LIMIT ?", (limit,))
-            events = [json.loads(payload) for (payload,) in rows]
+                rows = db.execute("SELECT sequence, payload FROM events ORDER BY sequence DESC LIMIT ?", (limit,))
+            events = []
+            for sequence, payload in rows:
+                try:
+                    event = json.loads(payload)
+                except RecursionError as error:
+                    raise ValueError("Invalid technical journal record") from error
+                if (not isinstance(event, dict) or event.get("sequence") != str(sequence)
+                        or event.get("journalEpoch") != status["journalEpoch"]):
+                    raise ValueError("Invalid technical journal record")
+                events.append(event)
             if after is None:
                 events.reverse()
             return status, events

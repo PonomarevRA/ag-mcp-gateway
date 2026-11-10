@@ -1,8 +1,14 @@
 """Read MCP catalogs and dispatch requests without the SDK's mutable tool cache."""
 
+from jsonschema.exceptions import SchemaError, ValidationError
 from mcp import ClientSession, types
+from referencing.exceptions import Unresolvable
 
 from .schema_checks import SchemaChecks
+
+
+class PublishedOutputError(ValueError):
+    """The upstream replied, but its structured output did not meet its advertised schema."""
 
 
 class CatalogSession(ClientSession):
@@ -27,6 +33,9 @@ class CatalogSession(ClientSession):
         result = await self.request_tool(tool.name, arguments, meta)
         if not result.isError and tool.outputSchema is not None:
             if result.structuredContent is None:
-                raise ValueError("tool output schema requires structured content")
-            checks.validate(result.structuredContent, tool.outputSchema)
+                raise PublishedOutputError("tool output schema requires structured content")
+            try:
+                checks.validate(result.structuredContent, tool.outputSchema)
+            except (SchemaError, ValidationError, Unresolvable, ValueError, RecursionError) as error:
+                raise PublishedOutputError("tool output failed schema validation") from error
         return result

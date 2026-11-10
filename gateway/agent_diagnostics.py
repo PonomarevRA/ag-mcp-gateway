@@ -1,7 +1,5 @@
 """Give authenticated management agents a bounded, read-only diagnosis surface."""
 
-import asyncio
-
 from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
@@ -67,7 +65,7 @@ class AgentDiagnostics:
         """Filter one bounded newest-first page and return a continuation if needed."""
         page = EventQuery(100, query.journal_epoch, None, query.before_sequence)
         try:
-            status, rows = await asyncio.to_thread(self.api.journal.page, before=query.before_sequence, limit=100)
+            status, rows = await self.api.read_page(None, query.before_sequence, 100)
         except ValueError as error:
             raise OSError("Technical journal is unavailable") from error
         if page.expired(status):

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sqlite3
 from time import monotonic, sleep
 
 from mcp import types
@@ -160,6 +161,12 @@ def test_external_collection_and_agent_diagnosis(tmp_path, monkeypatch):
             assert metric_tool["result"]["structuredContent"]["gateway"] == metrics["gateway"]
             assert journal.status()["cursor"] == final["cursor"]
 
+            with sqlite3.connect(journal.path) as connection:
+                connection.execute("UPDATE events SET payload=? WHERE sequence=4", (b"{}",))
+            assert client.get(LOGS + "/events", headers=HEADERS).status_code == 503
+            bad = rpc(client, "/manage/fixture", "tools/call", {"name": "gateway_read_errors", "arguments": {}})
+            assert bad.json()["result"]["isError"]
+
         with TestClient(app, base_url=ORIGIN, client=("192.0.2.42", 51200)) as remote:
             assert remote.get(METRICS, headers=HEADERS).status_code == 403
     finally:
@@ -216,3 +223,57 @@ def test_call_journal_file_cap_and_idle_expiry(tmp_path, monkeypatch):
 
     asyncio.run(expire())
     assert journal.paths[0].exists()
+
+
+def test_cli_logs_reads_recent_matches_before_scanning_retained_history(tmp_path, monkeypatch, capsys):
+    """Keep chronological filtered output across chunks and rotations, skipping incomplete records."""
+    from gateway import cli
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    matching = {"tool": "demo.lookup", "session_tag": "tag", "trace_id": "trace"}
+
+    def row(number):
+        """Encode one complete matching record for the test journal."""
+        return json.dumps({**matching, "n": number}).encode() + b"\n"
+
+    (logs / "calls.2.jsonl").write_bytes(row(0) * 1_000)
+    (logs / "calls.1.jsonl").write_bytes(row(1) + row(2))
+    (logs / "calls.0.jsonl").write_bytes(
+        row(3) + b'{"tool":"other.lookup"}\n' + b"invalid \xff\n" + b"x" * 256 + b"\n" + row(4) + row(5).rstrip()
+    )
+    monkeypatch.setattr(cli, "_LOG_READ_CHUNK", 17)
+    monkeypatch.setattr(cli, "_LOG_MAX_LINE_BYTES", 128)
+    original_loads = json.loads
+    parsed = []
+
+    def counted_loads(value):
+        """Observe which rows reached JSON parsing without altering the decoder."""
+        parsed.append(value)
+        return original_loads(value)
+
+    monkeypatch.setattr(cli.json, "loads", counted_loads)
+    cli.show_logs(tmp_path, 3, "demo", "tag", "trace")
+    assert capsys.readouterr().out == (row(2) + row(3) + row(4)).decode()
+    assert len(parsed) == 4
+
+
+def test_telemetry_bounds_retired_stats_and_preserves_global_counts(tmp_path, monkeypatch):
+    """Keep live and denied counters, with a stable bound for departed names."""
+    telemetry = Telemetry(Journal(tmp_path, 65_536))
+    events = []
+    monkeypatch.setattr(telemetry.journal, "write", events.append)
+    live = {"demo.live"}
+    denied = {"demo.denied"}
+    for name in ("demo.live", "demo.denied", "(unknown)", *(f"demo.old{n}" for n in range(300))):
+        telemetry.completed(name, "ok", 1, False, 0, 0)
+    telemetry.prune_tools(live, denied)
+
+    retained = list(telemetry.tools)
+    assert retained == ["demo.live", "demo.denied", "(unknown)", *(f"demo.old{n}" for n in range(44, 300))]
+    telemetry.completed("demo.old0", "ok", 1, False, 0, 0, track_tool=False)
+    telemetry.completed("demo.old44", "ok", 1, False, 0, 0, track_tool=False)
+    assert list(telemetry.tools) == retained
+    assert telemetry.tools["demo.old44"].received == 2
+    assert telemetry.total.received == 305
+    assert len(events) == 305

@@ -12,10 +12,12 @@ import uvicorn
 from filelock import FileLock, Timeout
 
 from .bridge import bridge, read_status
+from .credentials import SecretStoreError
 from .demo import demo_server
 from .http_app import create_app
+from .keychain import MacKeychain
 from .mcp_server import VERSION, serve_stdio
-from .profile import Profile, load_profile, secret
+from .profile import HttpBackend, Profile, load_profile, secret
 from .router import Router
 from .telemetry import Journal, Telemetry
 
@@ -82,11 +84,25 @@ def serve(args, profile: Profile, token: str | None):
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     with FileLock(str(directory / "gateway.lock"), timeout=0):
         journal = Journal(directory / "logs", profile.log_max_bytes)
-        router = Router(profile, Telemetry(journal))
+        store = mac_keychain(profile)
+        profile_file = args.profiles.expanduser() / f"{profile.name}.json"
+        router = Router(profile, Telemetry(journal), store=store, profile_file=str(profile_file.resolve()))
         app = create_app(router, args.port, token)
         _LOG.info("Profile %s · http://127.0.0.1:%s/", profile.name, args.port)
         uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False, proxy_headers=False,
                     ws="none", log_level="warning", timeout_graceful_shutdown=10)
+
+
+def mac_keychain(profile: Profile) -> MacKeychain | None:
+    """Open the native provider only for profiles with opt-in Basic backends."""
+    needs_store = any(isinstance(item, HttpBackend) and item.basic_keychain for item in profile.backends.values())
+    if not needs_store or sys.platform != "darwin":
+        return None
+    try:
+        return MacKeychain()
+    except (SecretStoreError, AttributeError):
+        _LOG.warning("macOS Keychain is unavailable")
+        return None
 
 
 def show_logs(directory: Path, limit: int, backend: str | None):

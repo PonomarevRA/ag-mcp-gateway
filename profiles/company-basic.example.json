@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "name": "company-basic",
+  "environment": "test",
+  "listen_port": 18795,
+  "access_token_env": "AG_GATEWAY_BASIC_EXAMPLE_TOKEN",
+  "backends": {
+    "grafana": {
+      "transport": "http",
+      "url": "https://grafana.example.com/mcp",
+      "basic_keychain": true
+    }
+  },
+  "denied": [],
+  "singleflight": []
+}

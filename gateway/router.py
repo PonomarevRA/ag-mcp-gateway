@@ -8,9 +8,10 @@ from time import monotonic
 
 from mcp import ClientSession, types
 
+from .connections import BackendConnections, Connection
+from .credentials import SecretStore
 from .profile import Profile
 from .telemetry import Telemetry
-from .upstream import run_backend
 
 
 def tool_error(message: str) -> types.CallToolResult:
@@ -24,12 +25,14 @@ class Route:
 
     tool: types.Tool
     session: ClientSession
+    worker: Connection | None = None
 
 
 class Router:
     """Own catalog, upstream workers and the singleflight scope of one profile."""
 
-    def __init__(self, profile: Profile, telemetry: Telemetry):
+    def __init__(self, profile: Profile, telemetry: Telemetry, *,
+                 store: SecretStore | None = None, profile_file: str = ""):
         """Start with an empty catalog for the supplied profile and metrics sink."""
         self.profile = profile
         self.telemetry = telemetry
@@ -37,39 +40,30 @@ class Router:
         self.catalog_revision = 0
         self.statuses = dict.fromkeys(profile.backends, "starting")
         self.pending: dict[tuple[str, bytes, int], asyncio.Task] = {}
+        self.connections = BackendConnections(profile, self._publish, store, profile_file)
+
+    def _publish(self, prefix: str, worker: Connection):
+        """Replace only this backend's catalog with the selected generation."""
+        self.statuses[prefix] = worker.status
+        self.catalog_revision += 1
+        old_names = [name for name in self.routes if name.startswith(prefix + ".")]
+        for name in old_names:
+            del self.routes[name]
+        if worker.session is not None:
+            for name, tool in worker.tools.items():
+                self.routes[name] = Route(tool, worker.session, worker)
 
     @asynccontextmanager
     async def running(self):
-        """Discover all backends, keeping failures isolated, and drain tasks on shutdown."""
-        started = {name: asyncio.Event() for name in self.profile.backends}
-
-        def publish(prefix, session, tools, status):
-            """Replace this backend's routes atomically and settle its readiness."""
-            self.statuses[prefix] = status
-            self.catalog_revision += 1
-            old_names = [name for name in self.routes if name.startswith(prefix + ".")]
-            for name in old_names:
-                del self.routes[name]
-            if session is not None:
-                for name, tool in tools.items():
-                    self.routes[name] = Route(tool, session)
-            started[prefix].set()
-
-        workers = [
-            asyncio.create_task(run_backend(name, backend, self.profile.timeout_seconds, publish))
-            for name, backend in self.profile.backends.items()
-        ]
-        try:
-            await asyncio.gather(*(event.wait() for event in started.values()))
-            yield
-        finally:
-            flights = tuple(self.pending.values())
-            for flight in flights:
-                flight.cancel()
-            await asyncio.gather(*flights, return_exceptions=True)
-            for worker in workers:
-                worker.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
+        """Serve discovered routes and settle shared dispatches before closing transports."""
+        async with self.connections.running():
+            try:
+                yield
+            finally:
+                flights = tuple(self.pending.values())
+                for flight in flights:
+                    flight.cancel()
+                await asyncio.gather(*flights, return_exceptions=True)
 
     def visible_tools(self) -> list[types.Tool]:
         """Expose accessible tools under stable names without upstream UI or task metadata."""
@@ -161,6 +155,11 @@ class Router:
 
     async def _dispatch(self, name, route, arguments, metadata: dict | None = None) -> types.CallToolResult:
         """Forward to upstream once and convert transport faults to safe tool errors."""
+        worker = route.worker
+        if worker is not None:
+            if self.routes.get(name) is not route:
+                return tool_error("Upstream connection changed before dispatch")
+            worker.acquire()
         self.telemetry.upstream_started(name)
         try:
             async with asyncio.timeout(self.profile.timeout_seconds):
@@ -169,3 +168,6 @@ class Router:
             return tool_error("Upstream call timed out")
         except Exception:
             return tool_error("Upstream transport failed")
+        finally:
+            if worker is not None:
+                worker.release()

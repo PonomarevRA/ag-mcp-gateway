@@ -12,10 +12,16 @@ h2 { margin-bottom: .75rem; font-size: 1.2rem; }
 section { margin-top: 1.75rem; }
 header, form { display: flex; align-items: end; justify-content: space-between;
   gap: .75rem; flex-wrap: wrap; }
+header nav { display: flex; flex-wrap: wrap; gap: .75rem; }
 a, input, button { color: inherit; }
 a:focus-visible, input:focus-visible, button:focus-visible { outline: 3px solid #3174c2; }
 a { padding: .4rem 0; }
 form { justify-content: start; align-items: center; }
+.credential-form { align-items: end; margin-top: .8rem; min-width: 0; }
+.credential-form div { display: grid; grid-template-columns: minmax(0, 1fr);
+  flex: 1 1 min(100%, 12rem); gap: .25rem; min-width: 0; max-width: 100%; }
+.credential-form input { width: 100%; min-width: 0; }
+.credential-form button { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 input, button { font: inherit; border: 1px solid #64768b; border-radius: .45rem;
   padding: .4rem .65rem; background: transparent; max-width: 100%; box-sizing: border-box; }
 .metrics { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(100%,9rem),1fr));
@@ -36,6 +42,11 @@ small, .muted { color: #445770; }
 """
 
 _ENVIRONMENTS = {"test": "Тестовая среда", "production": "Production"}
+
+_BACKEND_STATUS = {
+    "credentials-missing": "Нужны учётные данные",
+    "keychain-unavailable": "Связка ключей недоступна",
+}
 
 _METRICS = {
     "received": "Запросы",
@@ -72,17 +83,18 @@ def tool_row(tool: dict, metrics: dict) -> str:
     )
 
 
-def render(status: dict, query: str) -> str:
+def render(status: dict, query: str, *, credentials: bool = False) -> str:
     """Render one dashboard snapshot without executing upstream text or links."""
     label = _ENVIRONMENTS.get(status.get("environment"))
     environment = f" · {label}" if label else ""
+    management = '<a href="/credentials">Учётные данные MCP</a>' if credentials else ""
     metrics = status["metrics"]
     cards = "".join(
         f"<div><dt>{label}</dt><dd>{display(metrics['total'][key])}</dd></div>"
         for key, label in _METRICS.items()
     )
     backends = "".join(
-        f"<li><strong>{escape(name)}</strong> · {escape(state)}</li>"
+        f"<li><strong>{escape(name)}</strong> · {escape(_BACKEND_STATUS.get(state, state))}</li>"
         for name, state in status["backends"].items()
     )
     term = query.casefold()
@@ -97,7 +109,7 @@ def render(status: dict, query: str) -> str:
 <title>ag-mcp-gateway</title><link rel="stylesheet" href="/dashboard.css">
 <main>
 <header><div><h1>ag-mcp-gateway</h1><p>Профиль {escape(status['profile'])}{environment}</p></div>
-<a href="/">Обновить обзор</a></header>
+<nav aria-label="Действия обзора"><a href="/">Обновить обзор</a>{management}</nav></header>
 <section aria-labelledby="metrics"><h2 id="metrics">Вызовы с момента запуска</h2>
 <dl class="metrics">{cards}</dl>
 <p class="muted">Оценка токенов по размеру JSON. Ошибки записи журнала {metrics["journal_errors"]}.</p>

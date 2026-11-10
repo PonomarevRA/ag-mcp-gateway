@@ -11,16 +11,15 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
+from .credential_ui import CredentialsUI, SECURE_HTML
 from .dashboard import STYLE, render
 from .mcp_server import catalog_page, make_server
 
-_CSP = "default-src 'none'; style-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
 
-
-def authorized(header: str, token: str, *, basic: bool) -> bool:
-    """Check bearer credentials or browser Basic credentials for read-only routes."""
+def authorized(header: str, token: str, *, basic: bool, bearer: bool = True) -> bool:
+    """Check the profile token using the schemes allowed for the current route."""
     kind, _, value = header.partition(" ")
-    if kind.lower() == "bearer":
+    if bearer and kind.lower() == "bearer":
         return compare_digest(value.encode(), token.encode())
     if basic and kind.lower() == "basic":
         try:
@@ -52,9 +51,11 @@ class LocalBoundary:
             response = PlainTextResponse("Invalid local origin", status_code=403)
             await response(scope, receive, send)
             return
-        mcp = request.url.path.startswith("/mcp/")
+        path = request.url.path
+        mcp = path.startswith("/mcp/")
+        credentials = path == "/credentials" or path.startswith("/credentials/")
         header = request.headers.get("authorization", "")
-        if self.token and not authorized(header, self.token, basic=not mcp):
+        if self.token and not authorized(header, self.token, basic=not mcp, bearer=not credentials):
             challenge = "Bearer" if mcp else 'Basic realm="ag-mcp-gateway"'
             response = PlainTextResponse("Authorization required", status_code=401,
                                          headers={"WWW-Authenticate": challenge})
@@ -64,7 +65,8 @@ class LocalBoundary:
 
 
 def create_app(router, port: int, token: str | None):
-    """Attach MCP, status JSON and read-only HTML to the same gateway state."""
+    """Attach MCP, status JSON and credential management to one local profile."""
+    credentials = CredentialsUI(router.connections, f"http://127.0.0.1:{port}", bool(token))
 
     async def catalog(cursor):
         """List one page of the currently visible gateway catalog."""
@@ -94,11 +96,8 @@ def create_app(router, port: int, token: str | None):
     async def overview(request):
         """Render a current sanitized snapshot and bound the text filter."""
         query = request.query_params.get("q", "")[:200]
-        return HTMLResponse(render(router.snapshot(), query), headers={
-            "Content-Security-Policy": _CSP,
-            "Cache-Control": "no-store",
-            "X-Content-Type-Options": "nosniff",
-        })
+        page = render(router.snapshot(), query, credentials=credentials.enabled)
+        return HTMLResponse(page, headers=SECURE_HTML)
 
     async def status(_request):
         """Return profile status and metrics as machine-readable JSON."""
@@ -111,6 +110,8 @@ def create_app(router, port: int, token: str | None):
     app = Starlette(routes=[
         Route(f"/mcp/{router.profile.endpoint_key}", McpEndpoint()),
         Route("/", overview),
+        Route("/credentials", credentials.overview),
+        Route("/credentials/{backend}", credentials.update, methods=["POST"]),
         Route(f"/api/status/{router.profile.endpoint_key}", status),
         Route("/dashboard.css", stylesheet),
     ], lifespan=lifespan)

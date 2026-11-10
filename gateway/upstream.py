@@ -40,7 +40,7 @@ class ObservedReceiveStream(ObjectReceiveStream):
 
 
 @asynccontextmanager
-async def open_session(config, timeout: float):
+async def open_session(config, timeout: float, authorization: str | None = None):
     """Open the selected SDK transport and keep its contexts on the owning task."""
     async with AsyncExitStack() as stack:
         if isinstance(config, StdioBackend):
@@ -55,8 +55,10 @@ async def open_session(config, timeout: float):
             streams = await stack.enter_async_context(stdio_client(params, errlog=sink))
         else:
             assert isinstance(config, HttpBackend)
-            token = secret(config.bearer_token_env)
-            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            if authorization is None:
+                token = secret(config.bearer_token_env)
+                authorization = f"Bearer {token}" if token else None
+            headers = {"Authorization": authorization} if authorization else {}
             loopback = httpx.URL(config.url).host in {"127.0.0.1", "::1", "localhost"}
             client = await stack.enter_async_context(
                 httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=False, trust_env=not loopback)
@@ -93,10 +95,10 @@ async def discover(session: ClientSession, prefix: str):
     raise ValueError("upstream catalog exceeds 64 pages")
 
 
-async def run_backend(prefix, config, timeout, publish):
+async def run_backend(prefix, config, timeout, publish, authorization: str | None = None):
     """Keep the discovered session alive and publish a sanitized failure on exit."""
     try:
-        async with open_session(config, timeout) as (session, closed):
+        async with open_session(config, timeout, authorization) as (session, closed):
             async with asyncio.timeout(timeout):
                 await session.initialize()
                 tools = await discover(session, prefix)

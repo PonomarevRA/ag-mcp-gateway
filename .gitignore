@@ -13,6 +13,7 @@ dist/
 # Operator data stays outside the public sample directory.
 /profiles/*
 !/profiles/company.example.json
+!/profiles/company-basic.example.json
 !/profiles/company-test.example.json
 !/profiles/company-prod.example.json
 /private/runtime/

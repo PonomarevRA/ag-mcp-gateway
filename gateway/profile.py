@@ -33,6 +33,14 @@ class HttpBackend(BaseModel):
     transport: Literal["http"]
     url: str
     bearer_token_env: EnvName | None = None
+    basic_keychain: bool = Field(default=False, strict=True)
+
+    @model_validator(mode="after")
+    def validate_authentication(self):
+        """Choose at most one upstream authentication source."""
+        if self.basic_keychain and self.bearer_token_env:
+            raise ValueError("basic_keychain and bearer_token_env are mutually exclusive")
+        return self
 
     @field_validator("url")
     @classmethod
@@ -99,6 +107,9 @@ class Profile(BaseModel):
         """Require production authentication and validate configured tool policies."""
         if self.environment == "production" and self.access_token_env is None:
             raise ValueError("production profile requires access_token_env")
+        uses_keychain = any(isinstance(item, HttpBackend) and item.basic_keychain for item in self.backends.values())
+        if uses_keychain and self.access_token_env is None:
+            raise ValueError("basic_keychain requires a gateway access_token_env")
         if self.denied & self.singleflight:
             raise ValueError("denied and singleflight tool names overlap")
         for name in self.denied | self.singleflight:

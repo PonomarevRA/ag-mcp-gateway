@@ -10,11 +10,11 @@ from mcp import ClientSession, types
 
 from .connections import BackendConnections, Connection
 from .credentials import SecretStore
+from .mcp_client import CatalogSession
 from .profile import HttpBackend, Profile
 from .session_context import SESSION_META, SessionContext
 from .telemetry import Telemetry
 from .trace_context import TraceContext, without_trace_fields
-from .upstream import CatalogSession
 
 
 def tool_error(message: str) -> types.CallToolResult:

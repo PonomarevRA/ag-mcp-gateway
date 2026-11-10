@@ -36,7 +36,7 @@ class Connection:
 
     @property
     def live(self) -> bool:
-        """Read transport liveness even before its worker handles the close notification."""
+        """Return true while the initialized session can receive requests, even before worker cleanup."""
         return self.session is not None and not self.closed.is_set()
 
     def acquire(self):

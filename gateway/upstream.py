@@ -10,41 +10,17 @@ from datetime import timedelta
 import httpx
 from anyio import ClosedResourceError, EndOfStream
 from anyio.abc import ObjectReceiveStream
-from jsonschema import validate
-from mcp import ClientSession, StdioServerParameters, types
+from mcp import StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
-from referencing import Registry
 
 from .connection_diagnostics import ConnectionProbe
+from .mcp_client import CatalogSession
 from .profile import HttpBackend, StdioBackend, secret
 from .trace_context import inject_http_trace
 
 _LOG = logging.getLogger("gateway")
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_.-]+")
-
-
-class CatalogSession(ClientSession):
-    """Keep discovery and call validation tied to immutable published tool descriptors."""
-
-    async def catalog_page(self, cursor: str | None) -> types.ListToolsResult:
-        """Read a page without changing the SDK's per-tool output schema cache."""
-        params = types.PaginatedRequestParams(cursor=cursor) if cursor is not None else None
-        request = types.ClientRequest(types.ListToolsRequest(params=params))
-        return await self.send_request(request, types.ListToolsResult)
-
-    async def call_published_tool(self, tool: types.Tool, arguments: dict, meta: dict | None):
-        """Validate a successful response against the schema captured before dispatch."""
-        metadata = types.RequestParams.Meta(**meta) if meta is not None else None
-        params = types.CallToolRequestParams(name=tool.name, arguments=arguments, _meta=metadata)
-        request = types.ClientRequest(types.CallToolRequest(params=params))
-        result = await self.send_request(request, types.CallToolResult)
-        if not result.isError and tool.outputSchema is not None:
-            if result.structuredContent is None:
-                raise ValueError("tool output schema requires structured content")
-            # As in the SDK, a remote JSON Schema reference must never trigger network I/O.
-            validate(result.structuredContent, tool.outputSchema, registry=Registry())
-        return result
 
 
 class ObservedReceiveStream(ObjectReceiveStream):
@@ -149,7 +125,6 @@ async def refresh_catalog(session, prefix, timeout, publish, tools, changed, clo
         if not closed.is_set() and updated != tools:
             publish(prefix, session, updated, "ready")
             tools = updated
-
 
 
 async def run_backend(prefix, config, timeout, publish, authorization: str | None = None, *,

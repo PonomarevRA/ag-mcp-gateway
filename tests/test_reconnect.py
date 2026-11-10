@@ -6,9 +6,11 @@ import sys
 import textwrap
 from base64 import b64encode
 
+import httpx
 from mcp import types
 from starlette.testclient import TestClient
 
+from gateway.bridge import bridge
 from gateway.http_app import create_app
 from gateway.policy_settings import ToolPolicySettings
 from gateway.profile import Profile
@@ -162,5 +164,85 @@ def test_real_stdio_list_changed_replaces_catalog_and_keeps_old_on_failure(tmp_p
             finally:
                 await router.call("fixture.switch", {"release": True})
             assert (await in_flight).structuredContent == {"value": "old-result"}
+
+    asyncio.run(scenario())
+
+
+def test_agent_bridge_relist_keeps_already_dispatched_result(tmp_path, monkeypatch):
+    """Keep an old-generation call valid when an agent re-lists through its stdio bridge."""
+    async def scenario():
+        """Switch the published schema while a Bridge call is waiting for its result."""
+        entered, release = asyncio.Event(), asyncio.Event()
+        generation = 0
+
+        class Session:
+            """Return one generation-specific value and hold a requested call."""
+
+            def __init__(self, value):
+                self.value = value
+
+            async def call_tool(self, name, arguments, meta):
+                """Wait for the test to complete re-listing before returning the held value."""
+                if arguments.get("hold"):
+                    entered.set()
+                    await release.wait()
+                return types.CallToolResult(content=[], structuredContent={"value": self.value})
+
+        async def run_backend(name, config, timeout, publish, authorization, *, probe):
+            """Publish a new output schema each time the gateway opens a connection."""
+            nonlocal generation
+            generation += 1
+            value_type = "string" if generation == 1 else "integer"
+            schema = {"type": "object", "properties": {"value": {"type": value_type}}, "required": ["value"]}
+            tool = types.Tool(name="read", inputSchema={"type": "object"}, outputSchema=schema)
+            publish(name, Session("old-result" if generation == 1 else 7), {"local.read": tool}, "ready")
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr("gateway.connections.run_backend", run_backend)
+        profile = Profile.model_validate({"name": "test", "backends": {
+            "local": {"transport": "stdio", "command": "fixture"},
+        }})
+        router = Router(profile, Telemetry(Journal(tmp_path, 4096)))
+        app = create_app(router, 18792, None)
+
+        async def request_app(scope, receive, send):
+            """Share the state Uvicorn normally supplies from the ASGI lifespan."""
+            await app({**scope, "state": state}, receive, send)
+
+        def local_http(token, timeout):
+            """Send Bridge requests to the actual gateway handlers without opening a socket."""
+            return httpx.AsyncClient(transport=httpx.ASGITransport(app=request_app), timeout=timeout)
+
+        async def exercise_bridge(server):
+            """Run the Bridge MCP handlers over its real HTTP client and gateway endpoint."""
+            list_tools = server.request_handlers[types.ListToolsRequest]
+            call_tool = server.request_handlers[types.CallToolRequest]
+
+            async def schema_type():
+                """Read the current value type advertised through the Bridge."""
+                response = await list_tools(types.ListToolsRequest())
+                return response.root.tools[0].outputSchema["properties"]["value"]["type"]
+
+            def request(arguments):
+                """Construct one call to the same tool name in both generations."""
+                return types.CallToolRequest(params=types.CallToolRequestParams(name="local.read", arguments=arguments))
+
+            assert await schema_type() == "string"
+            held = asyncio.create_task(call_tool(request({"hold": True})))
+            try:
+                async with asyncio.timeout(3):
+                    await entered.wait()
+                    assert await router.connections.reconnect("local")
+                    assert await schema_type() == "integer"
+                    assert (await call_tool(request({}))).root.structuredContent == {"value": 7}
+            finally:
+                release.set()
+                response = (await held).root
+            assert not response.isError and response.structuredContent == {"value": "old-result"}
+
+        monkeypatch.setattr("gateway.bridge.local_client", local_http)
+        monkeypatch.setattr("gateway.bridge.serve_stdio", exercise_bridge)
+        async with app.app.router.lifespan_context(app.app) as state:
+            await bridge(ORIGIN, "test", None, 4)
 
     asyncio.run(scenario())

@@ -3,9 +3,9 @@
 from datetime import timedelta
 
 import httpx
-from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
+from .mcp_client import CatalogSession
 from .mcp_server import make_server, serve_stdio
 from .router import tool_error
 from .session_context import SESSION_META, SessionContext
@@ -23,20 +23,20 @@ async def bridge(origin: str, profile: str, token: str | None, timeout: float,
     surface = "manage" if management else "mcp"
     async with local_client(token, timeout) as http:
         async with streamable_http_client(f"{origin}/{surface}/{profile}", http_client=http) as streams:
-            async with ClientSession(*streams[:2], read_timeout_seconds=timedelta(seconds=timeout)) as client:
+            async with CatalogSession(*streams[:2], read_timeout_seconds=timedelta(seconds=timeout)) as client:
                 await client.initialize()
 
                 async def tools(cursor):
                     """Pass pagination through to the gateway without flattening the catalog."""
-                    return await client.list_tools(cursor=cursor)
+                    return await client.catalog_page(cursor)
 
                 async def call(params):
-                    """Preserve the tool result and prevent sharing for metadata-bearing calls."""
+                    """Forward metadata and return the result already validated by the gateway."""
                     try:
                         meta = params.meta.model_dump(by_alias=True, exclude_none=True) if params.meta else None
                         if session is not None:
                             meta = {**(meta or {}), SESSION_META: session.values}
-                        return await client.call_tool(params.name, params.arguments, meta=meta)
+                        return await client.request_tool(params.name, params.arguments, meta)
                     except Exception:
                         return tool_error("Gateway transport failed")
 

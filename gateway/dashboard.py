@@ -171,12 +171,15 @@ def backend_card(backend: dict, can_manage: bool, tools_href: str | None, csrf: 
                        f'<button type="submit" aria-label="{tr("Переподключить")} {name}">{tr("Переподключить")}</button></form>')
     links = f'<div class="backend-actions">{"".join(actions)}</div>' if actions else ""
     feedback = f'<p role="status">{escape(notice)}</p>' if notice else ""
+    address = backend.get("mcp_url")
+    endpoint = (f'<p class="muted">{tr("Адрес MCP")} <code>{escape(address)}</code></p>'
+                if address else "")
     return (
         f'<li id="backend-{name}"><div class="backend-heading"><h3>{name}</h3>'
         f'{connection_status(state, auth != "none")}</div>'
         f'<p class="muted">{tr(transport)} · {tr(auth_label)}</p>'
         f'<p>{tr("Доступных инструментов")} {display(backend["tools"])}</p>'
-        f'{feedback}{last_call_line(backend.get("last_call_at"))}{links}</li>'
+        f'{endpoint}{feedback}{last_call_line(backend.get("last_call_at"))}{links}</li>'
     )
 
 

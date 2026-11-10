@@ -81,6 +81,7 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--allow-unauthenticated", action="store_true", help="permit local clients without a token")
     stdio = commands.add_parser("stdio", help="attach an MCP stdio client to the running gateway")
     add_session_options(stdio)
+    stdio.add_argument("--backend", help="expose only one configured MCP backend")
     commands.add_parser("mcp-bridge", help="attach the authenticated management MCP over stdio")
     token_set = commands.add_parser("token-set", help="save one token in macOS Keychain using hidden input")
     token_set.add_argument("key", help="symbolic Keychain reference")
@@ -102,7 +103,9 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("demo-backend", help="run the synthetic stdio MCP backend")
     config = commands.add_parser("config", help="print a client configuration fragment")
     add_session_options(config)
-    config.add_argument("--management", action="store_true", help="print a separate management MCP entry")
+    config_scope = config.add_mutually_exclusive_group()
+    config_scope.add_argument("--management", action="store_true", help="print a separate management MCP entry")
+    config_scope.add_argument("--backend", help="generate an entry for one configured MCP backend")
     config.add_argument("client", choices=["codex", "cursor", "claude", "opencode", "deepseek", "acp"])
     return root
 
@@ -269,6 +272,11 @@ def config_fragment(args, profile: Profile, session: SessionContext | None = Non
     """Generate a client example that references environment secrets by name."""
     command, *leading = executable()
     management = getattr(args, "management", False)
+    backend = getattr(args, "backend", None)
+    if backend is not None and backend not in profile.backends:
+        raise ValueError("unknown backend for this profile")
+    if backend is not None and management:
+        raise ValueError("management and backend MCP scopes are mutually exclusive")
     if management and not profile.management_bridge:
         raise ValueError("management_bridge is disabled for this profile")
     if management and session is not None:
@@ -279,6 +287,11 @@ def config_fragment(args, profile: Profile, session: SessionContext | None = Non
     if session is not None:
         argv.extend(session.cli_arguments())
     name = profile.client_name
+    if backend is not None:
+        argv.extend(["--backend", backend])
+        identity = f"{profile.endpoint_key}/{backend}"
+        suffix = sha256(identity.encode("ascii")).hexdigest()[:8]
+        name = f"amg-proxy-{backend[:13]}-{suffix}"
     if management:
         environment = profile.environment or "legacy"
         name = f"amg-mgmt-{environment}-{profile.name}"
@@ -364,8 +377,11 @@ def main(argv=None) -> int:
                 status = asyncio.run(read_status(origin, profile.endpoint_key, token, profile.timeout_seconds))
                 print(json.dumps(status, ensure_ascii=False, indent=2))
             else:
+                backend = getattr(args, "backend", None)
+                if backend is not None and backend not in profile.backends:
+                    raise ValueError("unknown backend for this profile")
                 asyncio.run(bridge(origin, profile.endpoint_key, token, profile.timeout_seconds + 5, session,
-                                   management=args.command == "mcp-bridge",
+                                   backend=backend, management=args.command == "mcp-bridge",
                                    hook_session=os.environ.get(HOOK_ENV) if args.command == "stdio" else None))
         return 0
     except Timeout:

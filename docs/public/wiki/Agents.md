@@ -11,3 +11,17 @@
 Use `gateway_skill_search` when skills are enabled. Prefer an approved, usable result and check the current policy before replaying the approach. Drafts require explicit review. Persist only neutral summaries and ordered tool names. Module hooks transform JSON locally. Only explicitly allowed read-only tools may run inside manual chains.
 
 The stdio adapter owns MCP protocol stdout. Run service logs in a separate terminal or read them with `logs`. Never paste an Authorization value, password, session key or raw sensitive result into an incident note.
+
+## Connect to one MCP server
+
+Copy the Streamable HTTP address from the MCP card or read `connections[].mcp_url` in the `status` output. For the synthetic `docs` backend in profile `company-test` with environment `test`, use `http://127.0.0.1:18793/mcp/test/company-test/docs`. The profile key is `test/company-test`, and `docs` is the key in the profile's `backends` object. A profile without an environment uses its name alone as the profile key.
+
+Use the gateway profile token as Bearer authentication if the profile is protected. The gateway handles upstream credentials and applies the same policies, hooks and journaling on both addresses. The per-backend catalog and tool calls use the original upstream names, such as `read_page`. Policies and journal entries still identify the tool as `docs.read_page`. At `/mcp/test/company-test`, the aggregate catalog also uses `docs.read_page`.
+
+Use this command to generate a stdio entry for that server.
+
+```sh
+ag-mcp-gateway --profile company-test config --backend docs codex
+```
+
+The same generator targets listed above are available with `--backend`. Generate an administrative MCP Bridge entry separately with `--management`. The token applies to the whole profile. An address selects a catalog and a destination, while authorization still follows the profile and its tool policies.

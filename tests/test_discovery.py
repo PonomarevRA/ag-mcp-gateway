@@ -171,3 +171,7 @@ def test_mcp_discovery_hides_denied_and_decorates_allowed_catalog(tmp_path, monk
         assert read["_meta"][DISCOVERY_META] == {"latency": tool["latency"],
                                                  "usefulness": {"helpful": 1, "votes": 1, "score": 1}}
         assert all(entry["name"] != "demo.blocked" for entry in catalog)
+        scoped = mcp("tools/list", target="/mcp/test/demo")["tools"]
+        assert {entry["name"] for entry in scoped} == {"read", "other"}
+        scoped_read = next(entry for entry in scoped if entry["name"] == "read")
+        assert scoped_read["_meta"][DISCOVERY_META] == read["_meta"][DISCOVERY_META]

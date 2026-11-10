@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import tomllib
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -108,6 +109,36 @@ async def exercise(command, origin):
         assert (await guest.get(f"{origin}/")).status_code == 401
 
 
+async def exercise_scoped(command, origin, environment):
+    """Attach a real SDK client and an independently generated scoped stdio entry."""
+    path = f"{origin}/mcp/company/local"
+    headers = {"Authorization": f"Bearer {_TOKEN}"}
+    async with httpx.AsyncClient(trust_env=False, headers=headers) as http:
+        async with streamable_http_client(path, http_client=http) as streams:
+            async with ClientSession(*streams[:2]) as client:
+                await client.initialize()
+                assert [tool.name for tool in (await client.list_tools()).tools] == ["echo"]
+                assert (await client.call_tool("blocked", {})).isError
+        async with streamable_http_client(f"{origin}/mcp/company/remote", http_client=http) as streams:
+            async with ClientSession(*streams[:2]) as client:
+                await client.initialize()
+                assert [tool.name for tool in (await client.list_tools()).tools] == ["demo.echo"]
+                result = await client.call_tool("demo.echo", {"text": "scoped HTTP"})
+                assert result.structuredContent == {"echo": "scoped HTTP"}
+        page = await http.get(f"{origin}/")
+        assert page.is_success and path in page.text
+
+    config = subprocess.check_output([*command, "config", "--backend", "local", "codex"], env=environment)
+    entry, = tomllib.loads(config.decode())["mcp_servers"].values()
+    parameters = StdioServerParameters(command=entry["command"], args=entry["args"], env={"AG_SMOKE_TOKEN": _TOKEN})
+    async with stdio_client(parameters) as (read, write):
+        async with ClientSession(read, write) as client:
+            await client.initialize()
+            assert [tool.name for tool in (await client.list_tools()).tools] == ["echo"]
+            result = await client.call_tool("echo", {"text": "scoped stdio"})
+            assert result.structuredContent == {"echo": "scoped stdio"}
+
+
 def main():
     """Run two isolated daemons and validate CLI JSON and payload-free logs."""
     binary = str(Path(sys.argv[1]).resolve())
@@ -148,7 +179,8 @@ def main():
         assert "synthetic metadata" not in logs
         filtered_logs = subprocess.check_output([*command, "logs", "--backend", "remote"], env=environment)
         assert [json.loads(line)["tool"] for line in filtered_logs.splitlines()] == ["remote.demo.echo"]
-        print("PASS: executable, upstream stdio + HTTP, two clients, policy, singleflight, dashboard and CLI")
+        asyncio.run(exercise_scoped(command, gateway, environment))
+        print("PASS: executable, aggregate and scoped MCP, upstream HTTP/stdio, policy, singleflight, dashboard and CLI")
 
 
 if __name__ == "__main__":

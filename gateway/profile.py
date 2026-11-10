@@ -96,6 +96,12 @@ class HttpBackend(BackendOptions):
 Backend = Annotated[StdioBackend | HttpBackend, Field(discriminator="transport")]
 
 
+def mcp_path(profile_key: str, backend: str | None = None) -> str:
+    """Build the MCP path from an already validated profile key and optional backend."""
+    path = f"/mcp/{profile_key}"
+    return f"{path}/{backend}" if backend is not None else path
+
+
 class Profile(BaseModel):
     """Bind server identities, policies and journal limits to one local profile."""
 

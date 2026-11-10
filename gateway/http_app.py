@@ -25,6 +25,7 @@ from .management import Management
 from .mcp_server import make_server
 from .module_data import ModuleError
 from .module_page import ModulePage
+from .profile import mcp_path
 from .skill_tools import maintain_skill_cache
 from .telemetry import LOG_RETENTION_INTERVAL_SECONDS
 from .telemetry_api import TelemetryAPI
@@ -121,23 +122,32 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
 
     modules = ModulePage(management.modules, origin, credentials.csrf) if management and management.modules else None
 
-    async def catalog(cursor):
-        """List one page of the currently visible gateway catalog."""
-        page = router.visible_page(cursor)
-        if management is not None and management.discovery is not None:
-            management.discovery.decorate(page.tools)
-        return page
+    def mcp_surface(backend: str | None = None):
+        """Bind one stateless MCP server to the whole profile or one configured backend."""
+        async def catalog(cursor):
+            """List current tools without allowing a cursor to cross scopes."""
+            page = router.visible_page(cursor) if backend is None else router.backend_page(backend, cursor)
+            if management is not None and management.discovery is not None:
+                management.discovery.decorate(page.tools, backend=backend)
+            return page
 
-    async def call(params):
-        """Pass per-request HTTP trace and MCP metadata to the router."""
-        metadata = params.meta.model_dump(by_alias=True, exclude_none=True) if params.meta is not None else None
-        request = mcp.request_context.request
-        if isinstance(request, Request):
-            metadata = with_http_trace(metadata, request.headers)
-        return await router.call(params.name, params.arguments or {}, metadata=metadata)
+        async def call(params):
+            """Preserve request metadata and delegate to the shared policy and transport."""
+            metadata = params.meta.model_dump(by_alias=True, exclude_none=True) if params.meta is not None else None
+            request = server.request_context.request
+            if isinstance(request, Request):
+                metadata = with_http_trace(metadata, request.headers)
+            arguments = params.arguments or {}
+            if backend is not None:
+                return await router.call_backend(backend, params.name, arguments, metadata=metadata)
+            return await router.call(params.name, arguments, metadata=metadata)
 
-    mcp = make_server(catalog, call)
-    servers = {"mcp_manager": mcp}
+        server = make_server(catalog, call)
+        return server
+
+    servers = {"mcp_manager": mcp_surface()}
+    for backend in router.profile.backends:
+        servers[f"backend:{backend}"] = mcp_surface(backend)
     if management is not None:
         servers["management_manager"] = management.server()
 
@@ -188,11 +198,17 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
                 return
             await manager.handle_request(scope, receive, send)
 
+    def add_backend_addresses(snapshot):
+        """Advertise configured loopback addresses even while a backend reconnects."""
+        for item in snapshot["connections"]:
+            item["mcp_url"] = origin + mcp_path(router.profile.endpoint_key, item["name"])
+        return snapshot
+
     def dashboard(query: str = "", *, offset: int = 0, backend: str | None = None,
                   notice: str = "", notice_backend: str | None = None, status_code: int = 200):
         """Render a single catalog page and the authorized browser controls."""
         snapshot = router.dashboard_snapshot(query, offset, backend, page_size=CATALOG_PAGE_SIZE)
-        page = render(snapshot, query, credentials=credentials.enabled, management=management is not None,
+        page = render(add_backend_addresses(snapshot), query, credentials=credentials.enabled, management=management is not None,
                       reconnect_csrf=credentials.csrf if token else None, notice=notice,
                       notice_backend=notice_backend, modules=modules is not None,
                       diagnostics=diagnostics is not None)
@@ -251,14 +267,14 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
 
     async def status(_request):
         """Return profile status and metrics as machine-readable JSON."""
-        return JSONResponse(router.snapshot(), headers={"Cache-Control": "no-store"})
+        return JSONResponse(add_backend_addresses(router.snapshot()), headers={"Cache-Control": "no-store"})
 
     async def stylesheet(_request):
         """Serve the fixed local dashboard stylesheet."""
         return Response(STYLE, media_type="text/css", headers={"X-Content-Type-Options": "nosniff"})
 
     routes = [
-        Route(f"/mcp/{router.profile.endpoint_key}", McpEndpoint("mcp_manager")),
+        Route(mcp_path(router.profile.endpoint_key), McpEndpoint("mcp_manager")),
         Route("/", overview),
         Route("/reconnect/{backend}", reconnect, methods=["POST"]),
         Route("/credentials", credentials.overview),
@@ -266,6 +282,8 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
         Route(f"/api/status/{router.profile.endpoint_key}", status),
         Route("/dashboard.css", stylesheet),
     ]
+    for backend in router.profile.backends:
+        routes.append(Route(mcp_path(router.profile.endpoint_key, backend), McpEndpoint(f"backend:{backend}")))
     if management is not None:
         routes.extend([Route("/settings", management.overview),
                        Route("/settings", management.submit, methods=["POST"]),

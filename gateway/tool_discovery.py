@@ -70,11 +70,12 @@ class Discovery:
                 "usefulness": {"score": round(helpful / votes, 3) if votes else None,
                                "helpful": helpful, "votes": votes}}
 
-    def decorate(self, tools):
-        """Add namespaced observations without modifying upstream descriptors."""
+    def decorate(self, tools, *, backend: str | None = None):
+        """Attach the same namespaced observations to aggregate and scoped descriptors."""
         for tool in tools:
-            if self.available(tool.name) is not None:
-                tool.meta = {**(tool.meta or {}), DISCOVERY_META: self.signals(tool.name)}
+            name = tool.name if backend is None else f"{backend}.{tool.name}"
+            if self.available(name) is not None:
+                tool.meta = {**(tool.meta or {}), DISCOVERY_META: self.signals(name)}
 
     def summary(self, name: str, route) -> dict:
         """Build a compact tool card without its schema or private route details."""

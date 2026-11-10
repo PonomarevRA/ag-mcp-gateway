@@ -4,7 +4,7 @@ from mcp import McpError, types
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 _PAGE_SIZE = 100
 
 
@@ -29,11 +29,12 @@ def make_server(list_tools, call_tool) -> Server:
     return server
 
 
-def catalog_window(total: int, cursor: str | None, revision: int) -> tuple[slice, str | None]:
-    """Validate the revision and select a page before materializing its descriptors."""
+def catalog_window(total: int, cursor: str | None, revision: int, *,
+                   scope: str | None = None) -> tuple[slice, str | None]:
+    """Select a page and reject cursors from a different revision or catalog scope."""
+    prefix = f"{revision}:" if scope is None else f"{scope}:{revision}:"
     start = 0
     if cursor is not None:
-        prefix = f"{revision}:"
         offset = cursor[len(prefix):]
         if not cursor.startswith(prefix) or not offset.isascii() or not offset.isdecimal() or len(offset) > 8:
             raise McpError(types.ErrorData(code=types.INVALID_PARAMS, message="Invalid catalog cursor"))
@@ -41,7 +42,7 @@ def catalog_window(total: int, cursor: str | None, revision: int) -> tuple[slice
         if start % _PAGE_SIZE or not 0 < start < total:
             raise McpError(types.ErrorData(code=types.INVALID_PARAMS, message="Invalid catalog cursor"))
     end = start + _PAGE_SIZE
-    next_cursor = f"{revision}:{end}" if end < total else None
+    next_cursor = f"{prefix}{end}" if end < total else None
     return slice(start, end), next_cursor
 
 

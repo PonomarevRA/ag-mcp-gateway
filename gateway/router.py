@@ -2,12 +2,13 @@
 
 import asyncio
 import json
+from bisect import bisect_left
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import cached_property
 from time import monotonic
 
-from mcp import ClientSession, types
+from mcp import ClientSession, McpError, types
 
 from .connections import BackendConnections, Connection
 from .credentials import SecretStore
@@ -128,11 +129,11 @@ class Router:
             self._visible_revision = self.catalog_revision
         return self._visible_names
 
-    def _visible_descriptor(self, name: str) -> types.Tool:
-        """Create a fresh public descriptor without upstream UI or task metadata."""
+    def _visible_descriptor(self, name: str, *, original_name: bool = False) -> types.Tool:
+        """Create a public descriptor using the name expected by its catalog scope."""
         tool = self.routes[name].tool
-        return types.Tool(name=name, title=tool.title, description=tool.description, inputSchema=tool.inputSchema,
-                          outputSchema=tool.outputSchema, annotations=tool.annotations)
+        return types.Tool(name=tool.name if original_name else name, title=tool.title, description=tool.description,
+                          inputSchema=tool.inputSchema, outputSchema=tool.outputSchema, annotations=tool.annotations)
 
     def visible_tools(self) -> list[types.Tool]:
         """Return all public descriptors for callers that explicitly need the complete list."""
@@ -144,6 +145,28 @@ class Router:
         window, next_cursor = catalog_window(len(names), cursor, self.catalog_revision)
         return types.ListToolsResult(tools=[self._visible_descriptor(name) for name in names[window]],
                                      nextCursor=next_cursor)
+
+    def backend_page(self, backend: str, cursor: str | None) -> types.ListToolsResult:
+        """List tools in a configured backend scope using their original MCP names."""
+        if backend not in self.profile.backends:
+            raise McpError(types.ErrorData(code=types.INVALID_PARAMS, message="Unknown MCP backend"))
+        names = self._catalog_names()
+        # '/' immediately follows the '.' namespace separator in the sorted names.
+        start = bisect_left(names, f"{backend}.")
+        end = bisect_left(names, f"{backend}/", lo=start)
+        scope = f"{self.profile.endpoint_key}/{backend}"
+        window, next_cursor = catalog_window(end - start, cursor, self.catalog_revision, scope=scope)
+        page_end = min(end, start + window.stop)
+        tools = [self._visible_descriptor(name, original_name=True)
+                 for name in names[start + window.start:page_end]]
+        return types.ListToolsResult(tools=tools, nextCursor=next_cursor)
+
+    async def call_backend(self, backend: str, name: str, arguments: dict, *,
+                           metadata: dict | None = None) -> types.CallToolResult:
+        """Dispatch the original tool name only inside its configured backend namespace."""
+        if backend not in self.profile.backends:
+            return tool_error("Unknown MCP backend")
+        return await self.call(f"{backend}.{name}", arguments, metadata=metadata)
 
     def singleflight_active(self, name: str, route: Route) -> bool:
         """Require live read-only metadata for management opt-ins, even after rediscovery."""

@@ -8,6 +8,7 @@ from mcp.client.streamable_http import streamable_http_client
 from .hook_lifecycle import HOOK_META
 from .mcp_client import CatalogSession
 from .mcp_server import make_server, serve_stdio
+from .profile import mcp_path
 from .router import tool_error
 from .session_context import SESSION_META, SessionContext
 
@@ -19,11 +20,14 @@ def local_client(token: str | None, timeout: float) -> httpx.AsyncClient:
 
 
 async def bridge(origin: str, profile: str, token: str | None, timeout: float,
-                 session: SessionContext | None = None, *, management: bool = False, hook_session: str | None = None):
+                 session: SessionContext | None = None, *, management: bool = False, hook_session: str | None = None,
+                 backend: str | None = None):
     """Present the selected local daemon surface as a standard MCP stdio client."""
-    surface = "manage" if management else "mcp"
+    if management and backend is not None:
+        raise ValueError("management and backend MCP scopes are mutually exclusive")
+    path = f"/manage/{profile}" if management else mcp_path(profile, backend)
     async with local_client(token, timeout) as http:
-        async with streamable_http_client(f"{origin}/{surface}/{profile}", http_client=http) as streams:
+        async with streamable_http_client(f"{origin}{path}", http_client=http) as streams:
             async with CatalogSession(*streams[:2], read_timeout_seconds=timedelta(seconds=timeout)) as client:
                 await client.initialize()
 

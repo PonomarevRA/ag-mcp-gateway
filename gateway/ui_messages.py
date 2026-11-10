@@ -1,6 +1,7 @@
 """Owned browser copy and safe module-error translations."""
 
 ENGLISH = {
+    "Адрес MCP": "MCP address",
     "Диагностика": "Diagnostics",
     "Ошибки и предупреждения": "Errors and warnings",
     "Сбросить фильтры": "Clear filters",

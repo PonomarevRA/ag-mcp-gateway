@@ -71,30 +71,38 @@ class SkillTools:
             "gateway_skill_cache_save": (CachedApproach, "Cache a sanitized approach summary and ordered tool names only. Never include secrets, private identifiers, arguments or results.", False, self.save),
         }
 
-    def _with_availability(self, record: dict) -> dict:
+    def _availability(self) -> tuple[set[str], set[str]]:
+        """Capture live tools and denied names from one event-loop catalog generation."""
+        live = set()
+        for name, route in self.router.routes.items():
+            if route.worker is None or route.worker.live:
+                live.add(name)
+        return live, set(self.router.profile.denied)
+
+    @staticmethod
+    def _with_availability(record: dict, live: set[str], denied: set[str]) -> dict:
         """Report removed, disconnected and blocked tools without executing the steps."""
         missing, blocked = [], []
-        profile = self.router.profile
         for name in dict.fromkeys(record["tools"]):
-            if name in profile.denied:
+            if name in denied:
                 blocked.append(name)
-            route = self.router.routes.get(name)
-            if route is None or (route.worker is not None and not route.worker.live):
+            if name not in live:
                 missing.append(name)
         return {**record, "missing_tools": missing, "blocked_tools": blocked, "usable": not (missing or blocked)}
 
     async def search(self, request: SkillSearch) -> dict:
-        """Find relevant records and tell the agent when to suggest a skill."""
-        result = await asyncio.to_thread(self.store.find, request.query, request.limit)
+        """Find relevant usable records first and offer a draft when there are none."""
+        live, denied = self._availability()
+        result = await asyncio.to_thread(self.store.find, request.query, request.limit, live - denied)
         for category in ("skills", "cache"):
-            result[category] = [self._with_availability(row) for row in result[category]]
+            result[category] = [self._with_availability(row, live, denied) for row in result[category]]
         result["suggest_skill_draft"] = not any(row["usable"] for row in result["skills"])
         return result
 
     async def load(self, request: SkillReference) -> dict:
         """Return the stored instructions only after approval."""
         row = await asyncio.to_thread(self.store.get, request.id, "approved")
-        return self._with_availability(row)
+        return self._with_availability(row, *self._availability())
 
     async def save(self, request: CachedApproach) -> dict:
         """Validate the profile namespace before storing the explicit submission."""

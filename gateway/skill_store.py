@@ -181,19 +181,35 @@ class SkillStore:
 
         return self._retry_with_eviction(insert)
 
-    def find(self, query: str, limit: int) -> dict:
+    def _approved_matches(self, connection: sqlite3.Connection, match: str,
+                          limit: int, available: set[str] | None) -> list[sqlite3.Row]:
+        """Fill the result with usable matches before returning stale ones for reference."""
+        rows = connection.execute("""
+            SELECT a.id,a.kind,a.title,a.summary,a.steps,a.expires,a.helpful,a.votes
+            FROM approved_search JOIN approaches AS a ON a.rowid=approved_search.rowid
+            WHERE approved_search MATCH ?
+            ORDER BY bm25(approved_search, 3.0, 1.0)*(1.0+0.5*(a.helpful+1.0)/(a.votes+2)), a.id
+        """, (match,))
+        if available is None:
+            return rows.fetchmany(limit)
+        usable, stale = [], []
+        for row in rows:
+            if set(json.loads(row["steps"])) <= available:
+                usable.append(row)
+                if len(usable) == limit:
+                    return usable
+            elif len(stale) < limit:
+                stale.append(row)
+        return usable + stale[:limit - len(usable)]
+
+    def find(self, query: str, limit: int, available: set[str] | None = None) -> dict:
         """Rank approved skills with FTS5 and cached approaches by token overlap."""
         terms = query_words(query)
         if not terms:
             return {"skills": [], "cache": []}
         match = " OR ".join(f'"{term}"' for term in sorted(terms))
         with closing(self._connect()) as connection:
-            approved = connection.execute("""
-                SELECT a.* FROM approved_search JOIN approaches AS a ON a.rowid=approved_search.rowid
-                WHERE approved_search MATCH ?
-                ORDER BY bm25(approved_search, 3.0, 1.0)*(1.0+0.5*(a.helpful+1.0)/(a.votes+2)),
-                         a.id LIMIT ?
-            """, (match, limit)).fetchall()
+            approved = self._approved_matches(connection, match, limit, available)
             cached = connection.execute("""
                 SELECT * FROM approaches WHERE kind='cache' AND expires>?
                 ORDER BY created DESC, rowid DESC LIMIT ?

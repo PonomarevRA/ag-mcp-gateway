@@ -1,10 +1,12 @@
 """Check SQLite retention, ranking and the management/approval boundary."""
 
+import asyncio
 import json
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from types import SimpleNamespace
 
 import pytest
 from starlette.testclient import TestClient
@@ -15,6 +17,7 @@ from gateway.policy_settings import ToolPolicySettings
 from gateway.profile import Profile
 from gateway.router import Router
 from gateway.skill_store import SkillSettings, SkillStore, SkillStoreError
+from gateway.skill_tools import SkillSearch, SkillTools
 from gateway.telemetry import Journal, Telemetry
 
 TOOL = "demo.echo"
@@ -157,3 +160,23 @@ def test_management_and_cli_share_one_profile_store(tmp_path, monkeypatch, capsy
     other = SkillStore(state / prod.state_path / "skills.sqlite3", prod.skill_router)
     with pytest.raises(SkillStoreError):
         other.get(identity, "approved")
+
+
+def test_skill_search_surfaces_usable_match_before_limit(tmp_path):
+    """A higher ranked stale match cannot hide a usable approved skill."""
+    store = SkillStore(tmp_path / "skills.sqlite3", SkillSettings())
+    stale = store.save("logs", "logs", ["demo.offline"], "stale")["id"]
+    usable = store.save("backend", "logs", ["demo.online"], "usable")["id"]
+    store.approve(stale)
+    store.approve(usable)
+    assert store.find("logs", 1)["skills"][0]["id"] == stale
+    router = SimpleNamespace(routes={"demo.online": SimpleNamespace(worker=None)},
+                             profile=SimpleNamespace(denied=set()))
+    tools = SkillTools(store, router)
+    result = asyncio.run(tools.search(SkillSearch(query="logs", limit=1)))
+    assert [row["id"] for row in result["skills"]] == [usable]
+    assert not result["suggest_skill_draft"]
+    router.profile.denied = {"demo.online"}
+    result = asyncio.run(tools.search(SkillSearch(query="logs", limit=1)))
+    assert result["skills"][0]["id"] == stale
+    assert result["suggest_skill_draft"]

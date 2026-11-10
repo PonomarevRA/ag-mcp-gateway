@@ -111,7 +111,7 @@ def test_management_policy_cas_auth_and_restart(tmp_path, monkeypatch):
         assert rpc(client, manage_path, "tools/list", headers={**HEADERS, "Authorization": basic}).status_code == 401
         assert rpc(client, manage_path, "tools/list", headers={**HEADERS, "Origin": "https://outside.invalid"}).status_code == 403
         names = {tool["name"] for tool in rpc(client, manage_path, "tools/list").json()["result"]["tools"]}
-        assert names == {"gateway_inspect", "gateway_set_tool_policy", "gateway_reconnect_basic"}
+        assert names == {"gateway_inspect", "gateway_set_tool_policy", "gateway_reconnect_basic", "gateway_reconnect_mcp"}
         proxy = rpc(client, proxy_path, "tools/list").json()["result"]["tools"]
         assert {tool["name"] for tool in proxy} == {"local.read", "local.write"}
         initial = call(client, manage_path, "gateway_inspect", {"limit": 1})["structuredContent"]

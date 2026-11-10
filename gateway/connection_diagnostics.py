@@ -4,6 +4,7 @@ from asyncio import Event
 from dataclasses import dataclass, field
 
 import httpx
+from mcp import types
 from mcp.shared.exceptions import McpError
 
 HTTP_FAILURES = {
@@ -36,6 +37,7 @@ class ConnectionProbe:
     invalid_message: bool = False
     terminal_http: int | None = None
     closed: Event = field(default_factory=Event)
+    tools_changed: Event = field(default_factory=Event)
 
     async def response(self, response: httpx.Response):
         """Capture only the status of MCP POSTs, ignoring event-stream polling and cleanup."""
@@ -49,9 +51,11 @@ class ConnectionProbe:
             self.closed.set()
 
     async def message(self, item):
-        """Note SDK parsing failures without retaining the response or exception text."""
+        """Record parser failures and coalesce SDK catalog notifications."""
         if isinstance(item, ValueError):
             self.invalid_message = True
+        elif isinstance(item, types.ServerNotification) and isinstance(item.root, types.ToolListChangedNotification):
+            self.tools_changed.set()
 
     def failure(self, error: BaseException | None) -> str:
         """Choose a stable reason from real transport facts, with a safe generic fallback."""

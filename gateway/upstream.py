@@ -1,6 +1,7 @@
 """Own one MCP session per configured upstream and discover its tool catalog."""
 
 import asyncio
+import logging
 import os
 import re
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -9,15 +10,41 @@ from datetime import timedelta
 import httpx
 from anyio import ClosedResourceError, EndOfStream
 from anyio.abc import ObjectReceiveStream
-from mcp import ClientSession, StdioServerParameters
+from jsonschema import validate
+from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
+from referencing import Registry
 
 from .connection_diagnostics import ConnectionProbe
 from .profile import HttpBackend, StdioBackend, secret
 from .trace_context import inject_http_trace
 
+_LOG = logging.getLogger("gateway")
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_.-]+")
+
+
+class CatalogSession(ClientSession):
+    """Keep discovery and call validation tied to immutable published tool descriptors."""
+
+    async def catalog_page(self, cursor: str | None) -> types.ListToolsResult:
+        """Read a page without changing the SDK's per-tool output schema cache."""
+        params = types.PaginatedRequestParams(cursor=cursor) if cursor is not None else None
+        request = types.ClientRequest(types.ListToolsRequest(params=params))
+        return await self.send_request(request, types.ListToolsResult)
+
+    async def call_published_tool(self, tool: types.Tool, arguments: dict, meta: dict | None):
+        """Validate a successful response against the schema captured before dispatch."""
+        metadata = types.RequestParams.Meta(**meta) if meta is not None else None
+        params = types.CallToolRequestParams(name=tool.name, arguments=arguments, _meta=metadata)
+        request = types.ClientRequest(types.CallToolRequest(params=params))
+        result = await self.send_request(request, types.CallToolResult)
+        if not result.isError and tool.outputSchema is not None:
+            if result.structuredContent is None:
+                raise ValueError("tool output schema requires structured content")
+            # As in the SDK, a remote JSON Schema reference must never trigger network I/O.
+            validate(result.structuredContent, tool.outputSchema, registry=Registry())
+        return result
 
 
 class ObservedReceiveStream(ObjectReceiveStream):
@@ -72,19 +99,19 @@ async def open_session(config, timeout: float, authorization: str | None = None,
             ))
             streams = await stack.enter_async_context(streamable_http_client(config.url, http_client=client))
         incoming = ObservedReceiveStream(streams[0], probe.closed)
-        session = ClientSession(incoming, streams[1], read_timeout_seconds=timedelta(seconds=timeout),
+        session = CatalogSession(incoming, streams[1], read_timeout_seconds=timedelta(seconds=timeout),
                                 message_handler=probe.message)
         await stack.enter_async_context(session)
         yield session, incoming.closed
 
 
-async def discover(session: ClientSession, prefix: str):
+async def discover(session: CatalogSession, prefix: str):
     """Read paginated tools and reject ambiguous names or an unbounded catalog."""
     tools = {}
     cursor = None
     seen_cursors = set()
     for _ in range(64):
-        page = await session.list_tools(cursor=cursor)
+        page = await session.catalog_page(cursor)
         for tool in page.tools:
             name = f"{prefix}.{tool.name}"
             if len(name) > 128 or not _TOOL_NAME.fullmatch(tool.name):
@@ -103,6 +130,28 @@ async def discover(session: ClientSession, prefix: str):
     raise ValueError("upstream catalog exceeds 64 pages")
 
 
+async def refresh_catalog(session, prefix, timeout, publish, tools, changed, closed):
+    """Publish only complete changed catalogs and retain the old one on discovery failure."""
+    while not closed.is_set():
+        await changed.wait()
+        # Fold notification bursts into one discovery without blocking the SDK reader.
+        await asyncio.sleep(0.1)
+        changed.clear()
+        if closed.is_set():
+            return
+        try:
+            async with asyncio.timeout(timeout):
+                updated = await discover(session, prefix)
+        except Exception:
+            if not closed.is_set():
+                _LOG.warning("Catalog refresh failed for %s; retaining existing tools", prefix)
+            continue
+        if not closed.is_set() and updated != tools:
+            publish(prefix, session, updated, "ready")
+            tools = updated
+
+
+
 async def run_backend(prefix, config, timeout, publish, authorization: str | None = None, *,
                       probe: ConnectionProbe | None = None):
     """Keep the discovered session alive and publish a sanitized failure on exit."""
@@ -116,7 +165,14 @@ async def run_backend(prefix, config, timeout, publish, authorization: str | Non
                     tools = await discover(session, prefix)
                 if not closed.is_set():
                     publish(prefix, session, tools, "ready")
-                    await closed.wait()
+                    watcher = asyncio.create_task(
+                        refresh_catalog(session, prefix, timeout, publish, tools, probe.tools_changed, closed)
+                    )
+                    try:
+                        await closed.wait()
+                    finally:
+                        watcher.cancel()
+                        await asyncio.gather(watcher, return_exceptions=True)
             except Exception as error:
                 status = probe.failure(error)
             else:

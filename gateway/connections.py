@@ -157,28 +157,39 @@ class BackendConnections:
             raise ReauthorizationError("not-enabled")
         if self.store is None:
             raise ReauthorizationError("keychain-unavailable")
+        return await self._replace(name, authorization)
+
+    async def reconnect(self, name: str) -> bool:
+        """Open the configured transport again with its current saved authentication."""
+        return await self._replace(name, None)
+
+    async def _replace(self, name: str, authorization: str | None) -> bool:
+        """Serialize replacements per backend while keeping the active connection serving."""
+        if self.closing or name not in self.active:
+            raise ReauthorizationError("not-enabled")
         if name in self.rotations:
             raise ReauthorizationError("busy")
-        task = asyncio.create_task(self._rotate(name, authorization))
+        task = asyncio.create_task(self._activate_candidate(name, authorization))
         self.rotations[name] = task
-        # A disconnected browser must not lose an already verified Keychain write.
+        # A disconnected caller must not interrupt a verified replacement or Keychain write.
         task.add_done_callback(lambda completed: completed.exception() if not completed.cancelled() else None)
         return await asyncio.shield(task)
 
-    async def _rotate(self, name: str, authorization: str | None) -> bool:
+    async def _activate_candidate(self, name: str, authorization: str | None) -> bool:
         """Verify, optionally save, then swap routes; discard failures without disturbing the old worker."""
         candidate = None
         activated = False
         try:
-            header = authorization if authorization is not None else await self._read(name)
-            candidate = self._start(name, header)
+            candidate = self._start(name, authorization)
             await candidate.ready.wait()
             if not candidate.live:
-                reason = candidate.status if candidate.status in FAILURE_LABELS else "connection-failed"
+                reason = candidate.status
+                if reason not in FAILURE_LABELS or reason == "starting":
+                    reason = "connection-failed"
                 raise ReauthorizationError(reason)
             if authorization is not None:
                 try:
-                    await asyncio.to_thread(self.store.write, self.accounts[name], header)
+                    await asyncio.to_thread(self.store.write, self.accounts[name], authorization)
                 except SecretStoreError as error:
                     raise ReauthorizationError("keychain-unavailable") from error
             # The candidate can close while the system credential write is pending.

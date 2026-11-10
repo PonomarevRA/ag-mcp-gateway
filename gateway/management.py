@@ -23,7 +23,7 @@ class InspectQuery(BaseModel):
 
 
 class ReconnectRequest(BaseModel):
-    """Reconnect exactly one configured Basic backend using its saved item."""
+    """Select exactly one configured MCP by name."""
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     backend: Identifier
@@ -101,6 +101,7 @@ class Management:
             "gateway_inspect": (InspectQuery, "Inspect gateway views, connections and paged tool policies."),
             "gateway_set_tool_policy": (PolicyChange, "Set one tool to allow, deny or singleflight using the current revision."),
             "gateway_reconnect_basic": (ReconnectRequest, "Verify and reconnect one MCP with its stored Basic credential."),
+            "gateway_reconnect_mcp": (ReconnectRequest, "Reconnect one configured MCP and refresh its tool catalog."),
         }
         tools = []
         for name, (model, description) in schemas.items():
@@ -124,9 +125,13 @@ class Management:
                 elif isinstance(query, PolicyChange):
                     revision = self.settings.change(query)
                     result = {"revision": revision, "tool": query.tool, "policy": query.policy}
-                else:
+                elif params.name == "gateway_reconnect_basic":
                     result = {"backend": query.backend,
                               "connected": await self.router.connections.rotate(query.backend, None)}
+                else:
+                    connected = await self.router.connections.reconnect(query.backend)
+                    result = {"backend": query.backend, "connected": connected,
+                              "catalog_revision": self.router.catalog_revision}
             except ValidationError:
                 return tool_error("Invalid management arguments")
             except (ValueError, ReauthorizationError) as error:

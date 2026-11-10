@@ -65,7 +65,7 @@ class CredentialsUI:
         if request.headers.get("origin") != self.origin:
             return PlainTextResponse("Invalid form origin", status_code=403, headers=SECURE_HTML)
         try:
-            fields = await _form(request)
+            fields = await read_form(request)
             csrf = fields.pop("csrf", "")
             if not compare_digest(csrf.encode(), self.csrf.encode()):
                 return PlainTextResponse("Invalid form token", status_code=403, headers=SECURE_HTML)
@@ -173,7 +173,7 @@ class CredentialsUI:
 <button type="submit">Подключиться с сохранёнными данными</button></form></li>"""
 
 
-async def _form(request: Request) -> dict[str, str]:
+async def read_form(request: Request) -> dict[str, str]:
     """Read one bounded URL-encoded form and reject repeated or malformed fields."""
     content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
     if content_type != "application/x-www-form-urlencoded":

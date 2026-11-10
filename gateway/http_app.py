@@ -8,10 +8,12 @@ from hmac import compare_digest
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from .credential_ui import CredentialsUI, SECURE_HTML
+from .connection_diagnostics import FAILURE_LABELS
+from .connections import ReauthorizationError
+from .credential_ui import CredentialsUI, SECURE_HTML, read_form
 from .dashboard import STYLE, render
 from .management import Management
 from .mcp_server import catalog_page, make_server
@@ -55,9 +57,9 @@ class LocalBoundary:
             return
         path = request.url.path
         mcp = path.startswith(("/mcp/", "/manage/"))
-        credentials = path == "/credentials" or path.startswith("/credentials/")
+        browser_action = path == "/credentials" or path.startswith(("/credentials/", "/reconnect/"))
         header = request.headers.get("authorization", "")
-        if self.token and not authorized(header, self.token, basic=not mcp, bearer=not credentials):
+        if self.token and not authorized(header, self.token, basic=not mcp, bearer=not browser_action):
             challenge = "Bearer" if mcp else 'Basic realm="ag-mcp-gateway"'
             response = PlainTextResponse("Authorization required", status_code=401,
                                          headers={"WWW-Authenticate": challenge})
@@ -119,11 +121,42 @@ def create_app(router, port: int, token: str | None, *, settings=None):
                 return
             await manager.handle_request(scope, receive, send)
 
+    def dashboard(query: str = "", *, notice: str = "", status_code: int = 200):
+        """Render one current, sanitized view and the authorized browser controls."""
+        page = render(router.snapshot(), query, credentials=credentials.enabled, management=management is not None,
+                      reconnect_csrf=credentials.csrf if token else None, notice=notice)
+        return HTMLResponse(page, status_code=status_code, headers=SECURE_HTML)
+
     async def overview(request):
-        """Render a current sanitized snapshot and bound the text filter."""
-        query = request.query_params.get("q", "")[:200]
-        page = render(router.snapshot(), query, credentials=credentials.enabled, management=management is not None)
-        return HTMLResponse(page, headers=SECURE_HTML)
+        """Render the catalog with a bounded search filter."""
+        return dashboard(request.query_params.get("q", "")[:200])
+
+    async def reconnect(request):
+        """Replace one selected MCP after local browser authentication and CSRF checks."""
+        name = request.path_params["backend"]
+        if not token or name not in router.profile.backends:
+            return PlainTextResponse("Not found", status_code=404, headers=SECURE_HTML)
+        if request.headers.get("origin") != origin:
+            return PlainTextResponse("Invalid form origin", status_code=403, headers=SECURE_HTML)
+        try:
+            fields = await read_form(request)
+        except ValueError:
+            fields = {}
+        if set(fields) != {"csrf"} or not compare_digest(fields["csrf"].encode(), credentials.csrf.encode()):
+            return PlainTextResponse("Invalid form token", status_code=403, headers=SECURE_HTML)
+        try:
+            if await router.connections.reconnect(name):
+                return RedirectResponse(f"/#backend-{name}", status_code=303, headers=SECURE_HTML)
+        except ReauthorizationError as error:
+            code = str(error)
+        else:
+            code = "connection-failed"
+        if code == "busy":
+            return dashboard(notice=f"{name}: переподключение уже выполняется.", status_code=409)
+        title, _tone = FAILURE_LABELS.get(code, ("Новое подключение не подтвердилось", "error"))
+        worker = router.connections.active.get(name)
+        suffix = " Действующее подключение сохранено." if worker is not None and worker.live else ""
+        return dashboard(notice=f"{name}: {title}.{suffix}", status_code=502)
 
     async def status(_request):
         """Return profile status and metrics as machine-readable JSON."""
@@ -142,6 +175,7 @@ def create_app(router, port: int, token: str | None, *, settings=None):
     routes = [
         Route(f"/mcp/{router.profile.endpoint_key}", McpEndpoint("mcp_manager")),
         Route("/", overview),
+        Route("/reconnect/{backend}", reconnect, methods=["POST"]),
         Route("/credentials", credentials.overview),
         Route("/credentials/{backend}", credentials.update, methods=["POST"]),
         Route(f"/api/status/{router.profile.endpoint_key}", status),

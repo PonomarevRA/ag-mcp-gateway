@@ -14,6 +14,7 @@ from .profile import HttpBackend, Profile
 from .session_context import SESSION_META, SessionContext
 from .telemetry import Telemetry
 from .trace_context import TraceContext, without_trace_fields
+from .upstream import CatalogSession
 
 
 def tool_error(message: str) -> types.CallToolResult:
@@ -204,8 +205,8 @@ class Router:
         return arguments, forwarded or None
 
     def _shared(self, name, encoded, route, arguments):
-        """Join one flight in this session, or start a flight with no completed-result cache."""
-        key = (name, encoded, id(route.session))
+        """Join only calls on the same published route and tool definition."""
+        key = (name, encoded, id(route))
         existing = self.pending.get(key)
         if existing is not None:
             return existing, True
@@ -225,12 +226,14 @@ class Router:
         """Forward to upstream once and convert transport faults to safe tool errors."""
         worker = route.worker
         if worker is not None:
-            if self.routes.get(name) is not route:
+            if self.routes.get(name) is not route or not worker.live:
                 return tool_error("Upstream connection changed before dispatch")
             worker.acquire()
         self.telemetry.upstream_started(name)
         try:
             async with asyncio.timeout(self.profile.timeout_seconds):
+                if isinstance(route.session, CatalogSession):
+                    return await route.session.call_published_tool(route.tool, arguments, metadata)
                 return await route.session.call_tool(route.tool.name, arguments, meta=metadata)
         except TimeoutError:
             return tool_error("Upstream call timed out")

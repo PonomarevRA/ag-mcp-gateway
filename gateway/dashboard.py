@@ -119,7 +119,7 @@ def last_call_line(timestamp: str | None) -> str:
     return f'<p class="muted">Последний вызов: {value}</p>'
 
 
-def backend_card(backend: dict, can_manage: bool, has_tool_group: bool) -> str:
+def backend_card(backend: dict, can_manage: bool, has_tool_group: bool, csrf: str | None) -> str:
     """Show confirmed transport readiness and relevant actions for one backend."""
     name = escape(backend["name"])
     state = backend["status"]
@@ -132,9 +132,13 @@ def backend_card(backend: dict, can_manage: bool, has_tool_group: bool) -> str:
     if auth == "basic" and can_manage:
         action = "Переавторизоваться" if state == "ready" else "Настроить подключение"
         actions.append(f'<a href="/credentials?backend={name}">{action}</a>')
+    if csrf is not None:
+        actions.append(f'<form method="post" action="/reconnect/{name}">'
+                       f'<input type="hidden" name="csrf" value="{escape(csrf, quote=True)}">'
+                       f'<button type="submit" aria-label="Переподключить {name}">Переподключить</button></form>')
     links = f'<div class="backend-actions">{"".join(actions)}</div>' if actions else ""
     return (
-        f'<li><div class="backend-heading"><h3>{name}</h3>'
+        f'<li id="backend-{name}"><div class="backend-heading"><h3>{name}</h3>'
         f'{connection_status(state, auth != "none")}</div>'
         f'<p class="muted">{transport} · {auth_label}</p>'
         f'<p>Доступных инструментов {display(backend["tools"])}</p>'
@@ -157,7 +161,8 @@ def tool_groups(tools: list[dict], query: str, metrics: dict) -> tuple[dict[str,
     return groups, count
 
 
-def render(status: dict, query: str, *, credentials: bool = False, management: bool = False) -> str:
+def render(status: dict, query: str, *, credentials: bool = False, management: bool = False,
+           reconnect_csrf: str | None = None, notice: str = "") -> str:
     """Render one dashboard snapshot without executing upstream text or links."""
     label = _ENVIRONMENTS.get(status.get("environment"))
     environment = f" · {label}" if label else ""
@@ -171,12 +176,13 @@ def render(status: dict, query: str, *, credentials: bool = False, management: b
     )
     groups, count = tool_groups(status["catalog"], query, metrics["tools"])
     backends = "".join(
-        backend_card(item, credentials, item["name"] in groups) for item in status["connections"]
+        backend_card(item, credentials, item["name"] in groups, reconnect_csrf) for item in status["connections"]
     )
     catalog = "".join(
         f'<div><h3 id="tools-{escape(prefix)}">{escape(prefix)}</h3><ul class="tools">{"".join(rows)}</ul></div>'
         for prefix, rows in groups.items()
     ) or '<ul class="tools"><li>Инструменты не найдены.</li></ul>'
+    message = f'<p role="status">{escape(notice)}</p>' if notice else ""
     return f"""<!doctype html>
 <html lang="ru">
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -185,7 +191,7 @@ def render(status: dict, query: str, *, credentials: bool = False, management: b
 <header><div><h1>ag-mcp-gateway</h1><p>Профиль {escape(status['profile'])}{environment}</p></div>
 <nav aria-label="Действия обзора"><a href="/">Обновить обзор</a>{controls}</nav></header>
 <section aria-labelledby="backends"><h2 id="backends">Каталог MCP-серверов</h2>
-<ul class="backends">{backends}</ul></section>
+{message}<ul class="backends">{backends}</ul></section>
 <section aria-labelledby="metrics"><h2 id="metrics">Вызовы с момента запуска</h2>
 <dl class="metrics">{cards}</dl>
 <p class="muted">Оценка токенов по размеру JSON. Ошибки записи журнала {metrics["journal_errors"]}.</p>

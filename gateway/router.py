@@ -10,7 +10,10 @@ from mcp import ClientSession, types
 
 from .connections import BackendConnections, Connection
 from .credentials import SecretStore
+from .hook_lifecycle import HOOK_META
 from .mcp_client import CatalogSession
+from .module_data import ModuleError, object_required
+from .module_runtime import check_schema, run_local, transform_result
 from .profile import HttpBackend, Profile
 from .session_context import SESSION_META, SessionContext
 from .telemetry import Telemetry
@@ -43,6 +46,7 @@ class Router:
         self.catalog_revision = 0
         self.statuses = dict.fromkeys(profile.backends, "starting")
         self.pending: dict[tuple[str, bytes, int], asyncio.Task] = {}
+        self.modules = None
         self.management_singleflight: set[str] = set()
         self.connections = BackendConnections(profile, self._publish, store, profile_file)
 
@@ -137,7 +141,8 @@ class Router:
             })
         return items
 
-    async def call(self, name: str, arguments: dict, *, metadata: dict | None = None) -> types.CallToolResult:
+    async def call(self, name: str, arguments: dict, *, metadata: dict | None = None,
+                   require_read_only: bool = False) -> types.CallToolResult:
         """Check deny policy before routing, then observe one inbound tool call."""
         start = monotonic()
         denied = name in self.profile.denied
@@ -147,6 +152,15 @@ class Router:
         joined = False
         input_bytes = output_bytes = 0
         context = None
+        hook_usage = None
+        modules = self.modules
+        hook_token = None
+        if metadata is not None and HOOK_META in metadata:
+            metadata = metadata.copy()
+            hook_token = metadata.pop(HOOK_META)
+            if hook_token is None:
+                hook_token = ""
+            metadata = metadata or None
         trace = TraceContext.from_metadata(metadata)
         metadata = without_trace_fields(metadata)
         try:
@@ -162,10 +176,24 @@ class Router:
             if route is None:
                 outcome = "unknown"
                 return tool_error("This tool is unavailable in the gateway catalog")
+            annotations = route.tool.annotations
+            if require_read_only and (name not in self.profile.module_chain_tools or
+                                      annotations is None or annotations.readOnlyHint is not True):
+                return tool_error("Module steps require a read-only tool")
+            if modules is None:
+                if hook_token is not None:
+                    return tool_error("Hook sessions are disabled for this profile")
+                before, after = None, None
+            else:
+                before, after, hook_usage = modules.for_tool(name, route, hook_token)
+            if before is not None:
+                arguments = object_required(run_local(before, arguments))
             encoded = json.dumps(arguments, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
                                  allow_nan=False).encode("utf-8")
             input_bytes = len(encoded)
             if metadata is None and trace is None and self.singleflight_active(name, route):
+                if before is not None:
+                    check_schema(arguments, route.tool.inputSchema)
                 task, joined = self._shared(name, encoded, route, arguments)
                 result = await asyncio.shield(task)
             else:
@@ -173,16 +201,29 @@ class Router:
                     arguments, forwarded = self._contextual_call(name, route, arguments, metadata, context, trace)
                 except ValueError:
                     return tool_error("Configured session parameter is absent from the upstream schema")
+                if before is not None:
+                    check_schema(arguments, route.tool.inputSchema)
                 result = await self._dispatch(name, route, arguments, forwarded)
+            if after is not None and not result.isError:
+                try:
+                    result = transform_result(after, result, route.tool.outputSchema)
+                except ModuleError:
+                    return tool_error("Response hook failed after the upstream call completed")
+            if hook_usage is not None and not result.isError:
+                modules.succeeded(hook_usage)
             outcome = "error" if result.isError else "ok"
             output_bytes = len(result.model_dump_json(by_alias=True, exclude_none=True).encode())
             return result
+        except ModuleError as error:
+            return tool_error(str(error))
         except ValueError:
             return tool_error("Arguments must be valid JSON")
         except asyncio.CancelledError:
             outcome = "cancelled"
             raise
         finally:
+            if hook_usage is not None:
+                modules.release(hook_usage)
             elapsed_ms = (monotonic() - start) * 1000
             session_tag = context.tag if context else None
             self.telemetry.completed(metric_name, outcome, elapsed_ms, joined, input_bytes, output_bytes,

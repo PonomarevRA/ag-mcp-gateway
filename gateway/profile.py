@@ -106,6 +106,8 @@ class Profile(BaseModel):
     access_token_env: EnvName | None = None
     access_token_keychain: SecretKey | None = None
     management_bridge: bool = Field(default=False, strict=True)
+    modules_enabled: bool = Field(default=False, strict=True)
+    module_chain_tools: set[ToolName] = Field(default_factory=set, max_length=256)
     skill_router: SkillSettings | None = None
     log_max_bytes: int = Field(default=100_000_000, ge=4096, le=1_000_000_000, strict=True)
     timeout_seconds: float = Field(default=30, gt=0, le=300)
@@ -151,11 +153,15 @@ class Profile(BaseModel):
             raise ValueError("basic_keychain requires a gateway access_token_env or access_token_keychain")
         if self.management_bridge and not has_token:
             raise ValueError("management_bridge requires a gateway token reference")
+        if self.module_chain_tools and not self.modules_enabled:
+            raise ValueError("module_chain_tools requires modules_enabled")
+        if self.modules_enabled and not self.management_bridge:
+            raise ValueError("modules_enabled requires management_bridge")
         if self.skill_router is not None and not self.management_bridge:
             raise ValueError("skill_router requires management_bridge")
         if self.denied & self.singleflight:
             raise ValueError("denied and singleflight tool names overlap")
-        for name in self.denied | self.singleflight:
+        for name in self.denied | self.singleflight | self.module_chain_tools:
             namespace, separator, raw_name = name.partition(".")
             if not separator or not raw_name or namespace not in self.backends:
                 raise ValueError("policy tool names require a configured backend prefix")

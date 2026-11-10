@@ -15,6 +15,25 @@ h2 { margin-bottom: .75rem; font-size: 1.2rem; }
 section { margin-top: 1.75rem; }
 header, form { display: flex; align-items: end; justify-content: space-between;
   gap: .75rem; flex-wrap: wrap; }
+.module-layout { display: grid; grid-template-columns: minmax(9rem, 12rem) minmax(0, 1fr); gap: 2rem; }
+.module-nav { display: grid; align-content: start; gap: .2rem; min-width: 0; }
+.module-nav a { padding: .5rem .65rem; overflow-wrap: anywhere; }
+.module-nav [aria-current] { font-weight: 680; border-inline-start: 3px solid currentColor; }
+.module-main, .module-form { min-width: 0; }
+.module-form { display: grid; align-items: start; grid-template-columns: minmax(0, 1fr); gap: .45rem; margin-block: .75rem; }
+.module-field { display: grid; gap: .25rem; min-width: 0; }
+.module-main code { overflow-wrap: anywhere; }
+.module-form button { justify-self: start; min-width: 0; overflow-wrap: anywhere; }
+.module-form :is(textarea, select, input:not([type=hidden])) { box-sizing: border-box; width: 100%; min-width: 0; color: inherit;
+  font: inherit; border: 1px solid #64768b; background: transparent; border-radius: .45rem; padding: .5rem; }
+.module-form textarea { font-family: ui-monospace, monospace; resize: vertical; }
+.module-form :is(textarea, select):focus-visible { outline: 3px solid #3174c2; }
+.module-preview pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.module-message { margin-block: 1rem; padding: .6rem; border-inline-start: 3px solid currentColor; }
+@media (max-width: 52rem) {
+  .module-layout { grid-template-columns: minmax(0, 1fr); gap: 1rem; }
+  .module-nav { display: flex; flex-wrap: wrap; gap: .3rem; }
+}
 header nav { display: flex; flex-wrap: wrap; gap: .75rem; }
 a, input, button { color: inherit; }
 a:focus-visible, input:focus-visible, button:focus-visible { outline: 3px solid #3174c2; }
@@ -162,11 +181,13 @@ def tool_groups(tools: list[dict], query: str, metrics: dict) -> tuple[dict[str,
 
 
 def render(status: dict, query: str, *, credentials: bool = False, management: bool = False,
-           reconnect_csrf: str | None = None, notice: str = "") -> str:
+           reconnect_csrf: str | None = None, notice: str = "", modules: bool = False) -> str:
     """Render one dashboard snapshot without executing upstream text or links."""
     label = _ENVIRONMENTS.get(status.get("environment"))
     environment = f" · {label}" if label else ""
     controls = '<a href="/credentials">Учётные данные MCP</a>' if credentials else ""
+    if modules:
+        controls += '<a href="/modules">Модули</a>'
     if management:
         controls += '<a href="/settings">Настройки</a>'
     metrics = status["metrics"]

@@ -9,6 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from .connections import ReauthorizationError
 from .dashboard import connection_status, last_call_line
 from .mcp_server import catalog_page, make_server
+from .module_data import ModuleError
+from .module_runtime import ModuleService
 from .policy_settings import PolicyChange
 from .profile import HttpBackend, Identifier
 from .router import tool_error
@@ -42,6 +44,7 @@ class Management:
         self.origin = origin
         self.credentials = credentials
         self.skills = SkillTools(skill_store, router) if skill_store is not None else None
+        self.modules = ModuleService(router.modules, router) if router.modules is not None else None
 
     def inspect(self, query: InspectQuery) -> dict:
         """Expose current policy revision, connection state and browser destinations."""
@@ -49,6 +52,8 @@ class Management:
         if query.backend is not None and query.backend not in profile.backends:
             raise ValueError("backend is not in this profile")
         views = {"catalog": f"{self.origin}/", "settings": f"{self.origin}/settings"}
+        if self.modules is not None:
+            views["modules"] = f"{self.origin}/modules"
         if self.credentials:
             views["credentials"] = f"{self.origin}/credentials"
         names = set(self.router.routes) | profile.denied | profile.singleflight
@@ -108,13 +113,14 @@ class Management:
             "gateway_reconnect_mcp": (ReconnectRequest, "Reconnect one configured MCP and refresh its tool catalog."),
         }
         skill_commands = self.skills.commands if self.skills is not None else {}
+        module_commands = self.modules.commands if self.modules is not None else {}
         tools = []
         for name, (model, description) in schemas.items():
             read_only = name == "gateway_inspect"
             tools.append(types.Tool(name=name, description=description, inputSchema=model.model_json_schema(),
                                     annotations=types.ToolAnnotations(readOnlyHint=read_only, openWorldHint=False)))
 
-        for name, (model, description, read_only, _) in skill_commands.items():
+        for name, (model, description, read_only, _) in {**skill_commands, **module_commands}.items():
             tools.append(types.Tool(name=name, description=description, inputSchema=model.model_json_schema(),
                                     annotations=types.ToolAnnotations(readOnlyHint=read_only, openWorldHint=False)))
 
@@ -124,6 +130,19 @@ class Management:
 
         async def call(params):
             """Validate and execute an explicitly supported operation."""
+            if params.name in module_commands:
+                model, _, _, execute = module_commands[params.name]
+                try:
+                    query = model.model_validate(params.arguments or {})
+                    meta = params.meta.model_dump(by_alias=True, exclude_none=True) if params.meta else None
+                    result = await execute(query, meta)
+                except ValidationError:
+                    return tool_error("Invalid module arguments")
+                except ModuleError as error:
+                    return tool_error(str(error))
+                except OSError:
+                    return tool_error("Unable to save module settings")
+                return types.CallToolResult(content=[], structuredContent=result)
             if params.name in skill_commands:
                 model, _, _, execute = skill_commands[params.name]
                 try:

@@ -5,6 +5,7 @@ from datetime import timedelta
 import httpx
 from mcp.client.streamable_http import streamable_http_client
 
+from .hook_lifecycle import HOOK_META
 from .mcp_client import CatalogSession
 from .mcp_server import make_server, serve_stdio
 from .router import tool_error
@@ -18,7 +19,7 @@ def local_client(token: str | None, timeout: float) -> httpx.AsyncClient:
 
 
 async def bridge(origin: str, profile: str, token: str | None, timeout: float,
-                 session: SessionContext | None = None, *, management: bool = False):
+                 session: SessionContext | None = None, *, management: bool = False, hook_session: str | None = None):
     """Present the selected local daemon surface as a standard MCP stdio client."""
     surface = "manage" if management else "mcp"
     async with local_client(token, timeout) as http:
@@ -36,6 +37,8 @@ async def bridge(origin: str, profile: str, token: str | None, timeout: float,
                         meta = params.meta.model_dump(by_alias=True, exclude_none=True) if params.meta else None
                         if session is not None:
                             meta = {**(meta or {}), SESSION_META: session.values}
+                        if hook_session is not None:
+                            meta = {**(meta or {}), HOOK_META: hook_session}
                         return await client.request_tool(params.name, params.arguments, meta)
                     except Exception:
                         return tool_error("Gateway transport failed")

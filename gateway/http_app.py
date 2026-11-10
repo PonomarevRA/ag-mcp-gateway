@@ -1,6 +1,7 @@
 """Serve MCP Streamable HTTP and the local dashboard behind one boundary."""
 
 import asyncio
+import logging
 from base64 import b64decode
 from binascii import Error as Base64Error
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -18,8 +19,13 @@ from .credential_ui import CredentialsUI, SECURE_HTML, read_form
 from .dashboard import STYLE, render
 from .management import Management
 from .mcp_server import catalog_page, make_server
+from .module_data import ModuleError
+from .module_page import ModulePage
 from .skill_tools import maintain_skill_cache
 from .trace_context import with_http_trace
+
+
+_LOG = logging.getLogger("gateway")
 
 
 def authorized(header: str, token: str, *, basic: bool, bearer: bool = True) -> bool:
@@ -59,7 +65,7 @@ class LocalBoundary:
             return
         path = request.url.path
         mcp = path.startswith(("/mcp/", "/manage/"))
-        browser_action = path == "/credentials" or path.startswith(("/credentials/", "/reconnect/"))
+        browser_action = path == "/credentials" or path.startswith(("/credentials/", "/reconnect/")) or path == "/modules"
         header = request.headers.get("authorization", "")
         if self.token and not authorized(header, self.token, basic=not mcp, bearer=not browser_action):
             challenge = "Bearer" if mcp else 'Basic realm="ag-mcp-gateway"'
@@ -70,10 +76,20 @@ class LocalBoundary:
         await self.app(scope, receive, send)
 
 
-async def stop_skill_maintenance(task: asyncio.Task) -> None:
-    """Stop this lifespan's cache maintenance loop."""
+async def stop_maintenance(task: asyncio.Task) -> None:
+    """Stop one maintenance loop owned by this lifespan."""
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
+
+
+async def maintain_hooks(registry):
+    """Expire short-lived capabilities and unused definitions during idle periods."""
+    while True:
+        try:
+            registry.sweep()
+        except (OSError, ModuleError):
+            _LOG.warning("Hook retention sweep failed")
+        await asyncio.sleep(60)
 
 
 def create_app(router, port: int, token: str | None, *, settings=None, skill_store=None):
@@ -83,6 +99,8 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
     management = None
     if router.profile.management_bridge and token and settings is not None:
         management = Management(router, settings, origin, credentials.enabled, skill_store)
+
+    modules = ModulePage(management.modules, origin, credentials.csrf) if management and management.modules else None
 
     async def catalog(cursor):
         """List one page of the currently visible gateway catalog."""
@@ -108,7 +126,10 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
             await stack.enter_async_context(router.running())
             if management is not None and skill_store is not None:
                 maintenance = asyncio.create_task(maintain_skill_cache(skill_store))
-                stack.push_async_callback(stop_skill_maintenance, maintenance)
+                stack.push_async_callback(stop_maintenance, maintenance)
+            if modules is not None:
+                maintenance = asyncio.create_task(maintain_hooks(router.modules))
+                stack.push_async_callback(stop_maintenance, maintenance)
             state = {}
             for key, server in servers.items():
                 manager = StreamableHTTPSessionManager(server, json_response=True, stateless=True)
@@ -135,7 +156,7 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
     def dashboard(query: str = "", *, notice: str = "", status_code: int = 200):
         """Render one current, sanitized view and the authorized browser controls."""
         page = render(router.snapshot(), query, credentials=credentials.enabled, management=management is not None,
-                      reconnect_csrf=credentials.csrf if token else None, notice=notice)
+                      reconnect_csrf=credentials.csrf if token else None, notice=notice, modules=modules is not None)
         return HTMLResponse(page, status_code=status_code, headers=SECURE_HTML)
 
     async def overview(request):
@@ -195,5 +216,7 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
     if management is not None:
         routes.extend([Route("/settings", settings_page),
                        Route(f"/manage/{router.profile.endpoint_key}", McpEndpoint("management_manager"))])
+    if modules is not None:
+        routes.extend([Route("/modules", modules.overview), Route("/modules", modules.submit, methods=["POST"])])
     app = Starlette(routes=routes, lifespan=lifespan)
     return LocalBoundary(app, port, token)

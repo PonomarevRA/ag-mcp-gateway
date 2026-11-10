@@ -173,18 +173,18 @@ class CredentialsUI:
 <button type="submit">Подключиться с сохранёнными данными</button></form></li>"""
 
 
-async def read_form(request: Request) -> dict[str, str]:
+async def read_form(request: Request, *, limit: int = _LIMIT, max_fields: int = 4) -> dict[str, str]:
     """Read one bounded URL-encoded form and reject repeated or malformed fields."""
     content_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
     if content_type != "application/x-www-form-urlencoded":
         raise ValueError("invalid content type")
     body = bytearray()
     async for chunk in request.stream():
-        if len(body) + len(chunk) > _LIMIT:
+        if len(body) + len(chunk) > limit:
             raise ValueError("form exceeds size limit")
         body.extend(chunk)
     fields = parse_qs(body.decode("ascii"), keep_blank_values=True, strict_parsing=True,
-                      errors="strict", max_num_fields=4)
+                      errors="strict", max_num_fields=max_fields)
     if any(len(values) != 1 for values in fields.values()):
         raise ValueError("duplicate form field")
     return {key: values[0] for key, values in fields.items()}

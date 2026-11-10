@@ -105,13 +105,19 @@ class ToolPolicySettings:
         return state.revision
 
     def _write(self, state: PolicyState) -> None:
-        """Replace the private settings file only after the new document has been flushed."""
-        descriptor, filename = tempfile.mkstemp(prefix=".tool-policy-", dir=self.path.parent)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as sink:
-                json.dump(state.model_dump(), sink, separators=(",", ":"))
-                sink.flush()
-                os.fsync(sink.fileno())
-            os.replace(filename, self.path)
-        finally:
-            Path(filename).unlink(missing_ok=True)
+        """Serialize the bounded tool policy snapshot for atomic replacement."""
+        data = json.dumps(state.model_dump(), separators=(",", ":")).encode()
+        write_state(self.path, data)
+
+
+def write_state(path: Path, data: bytes) -> None:
+    """Replace one private profile document after flushing its new content."""
+    descriptor, filename = tempfile.mkstemp(prefix=f".{path.stem}-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as sink:
+            sink.write(data)
+            sink.flush()
+            os.fsync(sink.fileno())
+        os.replace(filename, path)
+    finally:
+        Path(filename).unlink(missing_ok=True)

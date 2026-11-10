@@ -5,6 +5,7 @@ import asyncio
 import getpass
 import json
 import logging
+import os
 import sqlite3
 import sys
 import warnings
@@ -19,9 +20,11 @@ from filelock import FileLock, Timeout
 from .bridge import bridge, read_status
 from .credentials import SecretStoreError
 from .demo import demo_server
+from .hook_lifecycle import HOOK_ENV
 from .http_app import create_app
 from .keychain import MacKeychain
 from .mcp_server import VERSION, serve_stdio
+from .module_registry import ModuleRegistry
 from .policy_settings import ToolPolicySettings
 from .profile import HttpBackend, Profile, SecretKey, load_profile
 from .router import Router
@@ -114,6 +117,8 @@ def serve(args, profile: Profile, token: str | None, store: MacKeychain | None):
         router = Router(profile, Telemetry(journal), store=store, profile_file=str(profile_file.resolve()))
         settings = ToolPolicySettings(router, directory / "tool-policy.json")
         skill_store = open_skills(args, profile) if profile.skill_router is not None and token else None
+        if profile.modules_enabled and token:
+            router.modules = ModuleRegistry(router, directory / "modules.json")
         app = create_app(router, args.port, token, settings=settings, skill_store=skill_store)
         _LOG.info("Profile %s · http://127.0.0.1:%s/", profile.name, args.port)
         uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False, proxy_headers=False,
@@ -307,7 +312,8 @@ def main(argv=None) -> int:
                 print(json.dumps(status, ensure_ascii=False, indent=2))
             else:
                 asyncio.run(bridge(origin, profile.endpoint_key, token, profile.timeout_seconds + 5, session,
-                                   management=args.command == "mcp-bridge"))
+                                   management=args.command == "mcp-bridge",
+                                   hook_session=os.environ.get(HOOK_ENV) if args.command == "stdio" else None))
         return 0
     except Timeout:
         _LOG.error("Profile state is already owned by another gateway process")

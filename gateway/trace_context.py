@@ -27,10 +27,10 @@ class TraceContext:
         if metadata is None:
             return None
         parent = metadata.get("traceparent")
-        match = _PARENT.fullmatch(parent) if isinstance(parent, str) else None
-        if match is None or match[1] == "0" * 32 or match[2] == "0" * 16:
+        trace_id = _valid_parent_id(parent) if isinstance(parent, str) else None
+        if trace_id is None:
             return None
-        return cls(parent, match[1], _valid_state(metadata.get("tracestate")))
+        return cls(parent, trace_id, _valid_state(metadata.get("tracestate")))
 
     def carrier(self) -> dict[str, str]:
         """Return only validated W3C fields for this one call."""
@@ -38,6 +38,14 @@ class TraceContext:
         if self.state is not None:
             result["tracestate"] = self.state
         return result
+
+
+def _valid_parent_id(parent: str) -> str | None:
+    """Extract the trace ID only when both version-00 identifiers are valid."""
+    match = _PARENT.fullmatch(parent)
+    if match is None or match[1] == "0" * 32 or match[2] == "0" * 16:
+        return None
+    return match[1]
 
 
 def _valid_state(value) -> str | None:
@@ -74,8 +82,11 @@ def with_http_trace(metadata: dict | None, headers: Headers) -> dict | None:
     other = without_trace_fields(metadata)
     if len(parents) != 1:
         return other
+    parent = parents[0].strip(" \t")
+    if _valid_parent_id(parent) is None:
+        return other
     result = dict(other or {})
-    result["traceparent"] = parents[0].strip(" \t")
+    result["traceparent"] = parent
     states = headers.getlist("tracestate")
     if states and sum(map(len, states)) + len(states) - 1 <= 512:
         result["tracestate"] = ",".join(states)

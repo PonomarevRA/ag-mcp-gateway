@@ -39,8 +39,9 @@ def test_headers_replace_metadata_without_mixing_vendor_state():
     assert TraceContext.from_metadata(merged).carrier() == {
         "traceparent": PARENT, "tracestate": "vendor=one,system=two",
     }
-    invalid = with_http_trace(metadata, Headers({"traceparent": "invalid"}))
-    assert TraceContext.from_metadata(invalid) is None
+    invalid = Headers({"traceparent": "invalid"})
+    assert with_http_trace(metadata, invalid) == {"custom": "retained"}
+    assert with_http_trace({}, invalid) == {}
     duplicate = Headers(raw=[(b"traceparent", PARENT.encode()), (b"traceparent", OTHER_PARENT.encode())])
     assert with_http_trace(metadata, duplicate) == {"custom": "retained"}
     assert with_http_trace(None, duplicate) is None

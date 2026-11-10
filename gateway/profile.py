@@ -1,0 +1,101 @@
+"""Portable profile schema and runtime secret resolution."""
+
+import json
+import os
+from pathlib import Path
+from typing import Annotated, Literal
+from urllib.parse import urlsplit
+
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
+
+Identifier = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,32}$")]
+EnvName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]
+ToolName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]{1,128}$")]
+
+
+class StdioBackend(BaseModel):
+    """Describe a trusted local command and explicit environment forwarding."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    transport: Literal["stdio"]
+    command: str = Field(min_length=1)
+    args: list[str] = Field(default_factory=list)
+    env_from: dict[EnvName, EnvName] = Field(default_factory=dict)
+
+
+class HttpBackend(BaseModel):
+    """Describe a remote endpoint and an optional bearer-token variable."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    transport: Literal["http"]
+    url: str
+    bearer_token_env: EnvName | None = None
+
+    @field_validator("url")
+    @classmethod
+    def validate_endpoint(cls, value: str) -> str:
+        """Require HTTPS except for literal loopback and reject embedded credentials."""
+        url = urlsplit(value)
+        loopback = url.hostname in {"127.0.0.1", "::1", "localhost"}
+        if url.scheme != "https" and not (url.scheme == "http" and loopback):
+            raise ValueError("upstream requires HTTPS or loopback HTTP")
+        if not url.hostname or url.username is not None or url.password is not None:
+            raise ValueError("upstream requires a host and no embedded credentials")
+        if url.query or url.fragment:
+            raise ValueError("upstream URL must not contain query or fragment")
+        return value
+
+
+Backend = Annotated[StdioBackend | HttpBackend, Field(discriminator="transport")]
+
+
+class Profile(BaseModel):
+    """Bind server identities, policies and journal limits to one local profile."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    version: Literal[1] = 1
+    name: Identifier
+    access_token_env: EnvName | None = None
+    log_max_bytes: int = Field(default=100_000_000, ge=4096, le=1_000_000_000, strict=True)
+    timeout_seconds: float = Field(default=30, gt=0, le=300)
+    backends: dict[Identifier, Backend] = Field(min_length=1, max_length=32)
+    denied: set[ToolName] = Field(default_factory=set)
+    singleflight: set[ToolName] = Field(default_factory=set)
+
+    @model_validator(mode="after")
+    def validate_policy(self):
+        """Catch misspelled namespaces and contradictory access rules at startup."""
+        if self.denied & self.singleflight:
+            raise ValueError("denied and singleflight tool names overlap")
+        for name in self.denied | self.singleflight:
+            namespace, separator, raw_name = name.partition(".")
+            if not separator or not raw_name or namespace not in self.backends:
+                raise ValueError("policy tool names require a configured backend prefix")
+        return self
+
+
+def load_profile(folder: Path, name: str) -> Profile:
+    """Load one selected JSON profile without accepting a path as its name."""
+    if not name or len(name) > 32 or any(c not in _PROFILE_CHARS for c in name):
+        raise ValueError("invalid profile name")
+    with (folder / f"{name}.json").open("rb") as source:
+        body = source.read(262_145)
+    if len(body) > 262_144:
+        raise ValueError("profile exceeds 256 KiB")
+    profile = Profile.model_validate(json.loads(body))
+    if profile.name != name:
+        raise ValueError("profile name must match the file name")
+    return profile
+
+
+def secret(name: str | None) -> str | None:
+    """Resolve an optional environment reference and reject missing or unsafe values."""
+    if name is None:
+        return None
+    value = os.environ.get(name)
+    if not value or any(not 33 <= ord(char) <= 126 for char in value):
+        raise ValueError(f"missing or invalid environment variable {name}")
+    return value
+
+
+_PROFILE_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"

@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "name": "company",
+  "access_token_env": "AG_GATEWAY_ACCESS_TOKEN",
+  "log_max_bytes": 100000000,
+  "timeout_seconds": 30,
+  "backends": {
+    "docs": {
+      "transport": "http",
+      "url": "https://mcp.example.com/mcp",
+      "bearer_token_env": "DOCS_MCP_TOKEN"
+    },
+    "local": {
+      "transport": "stdio",
+      "command": "/absolute/path/to/approved-mcp",
+      "args": [],
+      "env_from": { "MCP_TOKEN": "LOCAL_MCP_TOKEN" }
+    }
+  },
+  "denied": ["docs.delete_page"],
+  "singleflight": ["docs.read_page"]
+}

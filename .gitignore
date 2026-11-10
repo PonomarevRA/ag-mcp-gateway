@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+build/
+dist/
+*.spec
+.env
+.env.*
+*.local.json
+
+# Operator data stays outside the public sample directory.
+/profiles/*
+!/profiles/company.example.json
+/private/runtime/
+/state/
+/logs/
+/secrets/
+/credentials/
+*.jsonl
+*.log

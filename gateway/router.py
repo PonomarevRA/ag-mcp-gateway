@@ -44,6 +44,12 @@ class FlightResult:
     """Hold the shared response and lazily size it for callers using its original JSON."""
 
     result: types.CallToolResult
+    error_code: str | None = None
+
+    @classmethod
+    def failed(cls, message: str, error_code: str):
+        """Preserve the client-facing error and a separate gateway-owned code."""
+        return cls(tool_error(message), error_code)
 
     @cached_property
     def output_bytes(self) -> int:
@@ -68,11 +74,15 @@ class Router:
         self.schema_checks = SchemaChecks()
         self.modules = None
         self.management_singleflight: set[str] = set()
-        self.connections = BackendConnections(profile, self._publish, store, profile_file)
+        self.connections = BackendConnections(profile, self._publish, store, profile_file,
+                                              technical=telemetry.technical)
 
     def _publish(self, prefix: str, worker: Connection):
         """Replace only this backend's catalog with the selected generation."""
+        previous_status = self.statuses[prefix]
         self.statuses[prefix] = worker.status
+        if self.telemetry.technical is not None and worker.status not in {previous_status, "starting"}:
+            self.telemetry.technical.connection(prefix, worker.status)
         self.catalog_revision += 1
         old_routes = {name: route for name, route in self.routes.items() if name.startswith(prefix + ".")}
         for name in old_routes:
@@ -187,6 +197,7 @@ class Router:
         route = self.routes.get(name)
         metric_name = name if denied or route else "(unknown)"
         outcome = "error"
+        error_code = "internal_error"
         joined = False
         input_bytes = output_bytes = 0
         context = None
@@ -208,19 +219,24 @@ class Router:
                     context = SessionContext.parse(metadata[SESSION_META])
                 except ValueError:
                     if not denied:
+                        error_code = "invalid_session"
                         return tool_error("Invalid gateway session context")
             if denied:
                 outcome = "denied"
+                error_code = "policy_denied"
                 return tool_error("This tool is disabled by the gateway profile")
             if route is None:
                 outcome = "unknown"
+                error_code = "unknown_tool"
                 return tool_error("This tool is unavailable in the gateway catalog")
             annotations = route.tool.annotations
             if require_read_only and (name not in self.profile.module_chain_tools or
                                       annotations is None or annotations.readOnlyHint is not True):
+                error_code = "read_only_required"
                 return tool_error("Module steps require a read-only tool")
             if modules is None:
                 if hook_token is not None:
+                    error_code = "hooks_disabled"
                     return tool_error("Hook sessions are disabled for this profile")
                 before, after = None, None
             else:
@@ -235,34 +251,41 @@ class Router:
                     check_schema(arguments, route.tool.inputSchema, self.schema_checks)
                 task, joined = self._shared(name, encoded, route, arguments)
                 flight = await asyncio.shield(task)
-                result = flight.result
+                dispatch = flight
             else:
                 try:
                     arguments, forwarded = self._contextual_call(name, route, arguments, metadata, context, trace)
                 except ValueError:
+                    error_code = "invalid_session_mapping"
                     return tool_error("Configured session parameter is absent from the upstream schema")
                 if before is not None:
                     check_schema(arguments, route.tool.inputSchema, self.schema_checks)
-                result = await self._dispatch(name, route, arguments, forwarded)
+                dispatch = await self._dispatch(name, route, arguments, forwarded)
+            result = dispatch.result
             if after is not None and not result.isError:
                 try:
                     result = transform_result(after, result, route.tool.outputSchema, self.schema_checks)
                 except ModuleError:
+                    error_code = "response_hook_failed"
                     return tool_error("Response hook failed after the upstream call completed")
             if hook_usage is not None and not result.isError:
                 modules.succeeded(hook_usage)
-            outcome = "error" if result.isError else "ok"
             if flight is not None and result is flight.result:
                 output_bytes = flight.output_bytes
             else:
                 output_bytes = len(result.model_dump_json(by_alias=True, exclude_none=True).encode())
+            outcome = "error" if result.isError else "ok"
+            error_code = (dispatch.error_code or "upstream_tool_error") if result.isError else None
             return result
         except ModuleError as error:
+            error_code = "request_hook_failed"
             return tool_error(str(error))
         except ValueError:
+            error_code = "invalid_arguments"
             return tool_error("Arguments must be valid JSON")
         except asyncio.CancelledError:
             outcome = "cancelled"
+            error_code = None
             raise
         finally:
             if hook_usage is not None:
@@ -270,7 +293,8 @@ class Router:
             elapsed_ms = (monotonic() - start) * 1000
             session_tag = context.tag if context else None
             self.telemetry.completed(metric_name, outcome, elapsed_ms, joined, input_bytes, output_bytes,
-                                     session_tag=session_tag, trace_id=trace.trace_id if trace else None)
+                                     session_tag=session_tag, trace_id=trace.trace_id if trace else None,
+                                     error_code=error_code)
 
     def _contextual_call(self, name, route, arguments, metadata, context, trace):
         """Apply the selected backend's forwarding rules to request metadata and identity."""
@@ -298,7 +322,7 @@ class Router:
         async def run():
             """Forget the flight after success, failure or shutdown cancellation."""
             try:
-                return FlightResult(await self._dispatch(name, route, arguments))
+                return await self._dispatch(name, route, arguments)
             finally:
                 self.pending.pop(key, None)
 
@@ -306,23 +330,25 @@ class Router:
         self.pending[key] = task
         return task, False
 
-    async def _dispatch(self, name, route, arguments, metadata: dict | None = None) -> types.CallToolResult:
+    async def _dispatch(self, name, route, arguments, metadata: dict | None = None) -> FlightResult:
         """Forward to upstream once and convert transport faults to safe tool errors."""
         worker = route.worker
         if worker is not None:
             if self.routes.get(name) is not route or not worker.live:
-                return tool_error("Upstream connection changed before dispatch")
+                return FlightResult.failed("Upstream connection changed before dispatch", "connection_changed")
             worker.acquire()
         self.telemetry.upstream_started(name)
         try:
             async with asyncio.timeout(self.profile.timeout_seconds):
                 if isinstance(route.session, CatalogSession):
-                    return await route.session.call_published_tool(route.tool, arguments, metadata, self.schema_checks)
-                return await route.session.call_tool(route.tool.name, arguments, meta=metadata)
+                    result = await route.session.call_published_tool(route.tool, arguments, metadata, self.schema_checks)
+                else:
+                    result = await route.session.call_tool(route.tool.name, arguments, meta=metadata)
+            return FlightResult(result)
         except TimeoutError:
-            return tool_error("Upstream call timed out")
+            return FlightResult.failed("Upstream call timed out", "upstream_timeout")
         except Exception:
-            return tool_error("Upstream transport failed")
+            return FlightResult.failed("Upstream transport failed", "upstream_transport")
         finally:
             if worker is not None:
                 worker.release()

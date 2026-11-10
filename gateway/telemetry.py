@@ -157,9 +157,10 @@ class Counts:
 class Telemetry:
     """Record bounded tool identities and avoid storing arguments or results."""
 
-    def __init__(self, journal: Journal, *, with_history: bool = False):
+    def __init__(self, journal: Journal, *, with_history: bool = False, technical=None):
         """Start empty counters and append new request completions to the supplied journal."""
         self.journal = journal
+        self.technical = technical
         self.total = Counts()
         self.tools: dict[str, Counts] = {}
         self.journal_errors = 0
@@ -181,7 +182,7 @@ class Telemetry:
         return self.history.mean(tool) if self.history is not None else (None, 0)
 
     def completed(self, tool, outcome, elapsed_ms, merged, input_bytes, output_bytes, *,
-                  session_tag=None, trace_id=None):
+                  session_tag=None, trace_id=None, error_code=None):
         """Update rollups and append one sanitized event per inbound request."""
         duration = round(elapsed_ms, 2)
         if self.history is not None and outcome == "ok" and not merged:
@@ -197,6 +198,8 @@ class Telemetry:
             "request_argument_bytes": input_bytes,
             "result_bytes": output_bytes,
         }
+        if error_code is not None:
+            event["error_code"] = error_code
         if session_tag is not None:
             event["session_tag"] = session_tag
         if trace_id is not None:
@@ -207,7 +210,10 @@ class Telemetry:
             self.journal_errors += 1
             if self.journal_errors == 1:
                 _LOG.warning("Unable to append the gateway call journal")
-        _LOG.info("%s %s %.1fms%s", tool, outcome, elapsed_ms, " joined" if merged else "")
+        if self.technical is not None and error_code is not None:
+            self.technical.call_error(tool, outcome, error_code, duration, trace_id, session_tag, joined=merged)
+        else:
+            _LOG.info("%s %s %.1fms%s", tool, outcome, elapsed_ms, " joined" if merged else "")
 
     def snapshot(self) -> dict:
         """Return rollups for the CLI and dashboard without reading the journal."""

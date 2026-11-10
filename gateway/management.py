@@ -7,6 +7,7 @@ from html import escape
 from mcp import types
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .agent_diagnostics import AgentDiagnostics
 from .connections import ReauthorizationError
 from .dashboard import connection_status, last_call_line
 from .mcp_server import catalog_page, make_server
@@ -40,7 +41,7 @@ class ReconnectRequest(BaseModel):
 class Management:
     """Keep management commands separate from proxied tools and secret values."""
 
-    def __init__(self, router, settings, origin: str, credentials: bool, skill_store: SkillStore | None = None, feedback: ToolFeedback | None = None):
+    def __init__(self, router, settings, origin: str, credentials: bool, skill_store: SkillStore | None = None, feedback: ToolFeedback | None = None, telemetry_api=None):
         """Bind this management surface to the selected profile and loopback origin."""
         self.router = router
         self.settings = settings
@@ -50,6 +51,7 @@ class Management:
         self._policy_names: tuple[str, ...] = ()
         self.skills = SkillTools(skill_store, router) if skill_store is not None else None
         self.discovery = Discovery(router, feedback, self.skills) if feedback is not None else None
+        self.diagnostics = AgentDiagnostics(telemetry_api) if telemetry_api is not None else None
         self.modules = ModuleService(router.modules, router) if router.modules is not None else None
 
     def policy_names(self) -> tuple[str, ...]:
@@ -137,7 +139,8 @@ class Management:
         skill_commands = self.skills.commands if self.skills is not None else {}
         discovery_commands = self.discovery.commands if self.discovery is not None else {}
         module_commands = self.modules.commands if self.modules is not None else {}
-        data_commands = {**skill_commands, **discovery_commands}
+        diagnostic_commands = self.diagnostics.commands if self.diagnostics is not None else {}
+        data_commands = {**skill_commands, **discovery_commands, **diagnostic_commands}
         tools = []
         for name, (model, description) in schemas.items():
             read_only = name == "gateway_inspect"
@@ -169,7 +172,11 @@ class Management:
                 return types.CallToolResult(content=[], structuredContent=result)
             if params.name in data_commands:
                 model, _, _, execute = data_commands[params.name]
-                scope = "discovery" if params.name in discovery_commands else "skill"
+                scope = "skill"
+                if params.name in diagnostic_commands:
+                    scope = "diagnostic"
+                elif params.name in discovery_commands:
+                    scope = "discovery"
                 try:
                     query = model.model_validate(params.arguments or {})
                     result = await execute(query)

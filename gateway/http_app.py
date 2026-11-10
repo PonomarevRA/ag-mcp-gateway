@@ -22,6 +22,7 @@ from .mcp_server import make_server
 from .module_data import ModuleError
 from .module_page import ModulePage
 from .skill_tools import maintain_skill_cache
+from .telemetry_api import TelemetryAPI
 from .trace_context import with_http_trace
 
 
@@ -92,14 +93,15 @@ async def maintain_hooks(registry):
         await asyncio.sleep(60)
 
 
-def create_app(router, port: int, token: str | None, *, settings=None, skill_store=None, feedback=None):
+def create_app(router, port: int, token: str | None, *, settings=None, skill_store=None, feedback=None, technical=None):
     """Attach MCP, status JSON and credential management to one local profile."""
     origin = f"http://127.0.0.1:{port}"
     credentials = CredentialsUI(router.connections, origin, bool(token))
     management = None
+    telemetry_api = TelemetryAPI(router.telemetry, technical) if technical is not None else None
     if router.profile.management_bridge and token and settings is not None:
         management = Management(router, settings, origin, credentials.enabled, skill_store,
-                                feedback if router.profile.agent_discovery else None)
+                                feedback if router.profile.agent_discovery else None, telemetry_api)
 
     modules = ModulePage(management.modules, origin, credentials.csrf) if management and management.modules else None
 
@@ -126,6 +128,9 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
     @asynccontextmanager
     async def lifespan(_app):
         """Publish a fresh SDK manager for each ASGI lifecycle."""
+        events = router.telemetry.technical
+        if events is not None:
+            events.emit("INFO", "service", "service.starting", "Gateway profile is starting.")
         async with AsyncExitStack() as stack:
             await stack.enter_async_context(router.running())
             if management is not None and skill_store is not None:
@@ -139,7 +144,13 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
                 manager = StreamableHTTPSessionManager(server, json_response=True, stateless=True)
                 await stack.enter_async_context(manager.run())
                 state[key] = manager
-            yield state
+            if events is not None:
+                events.emit("INFO", "service", "service.ready", "Gateway profile is ready.")
+            try:
+                yield state
+            finally:
+                if events is not None:
+                    events.emit("INFO", "service", "service.stopping", "Gateway profile is stopping.")
 
     class McpEndpoint:
         """Expose a raw ASGI endpoint without Starlette request coercion."""
@@ -222,5 +233,7 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
                        Route(f"/manage/{router.profile.endpoint_key}", McpEndpoint("management_manager"))])
     if modules is not None:
         routes.extend([Route("/modules", modules.overview), Route("/modules", modules.submit, methods=["POST"])])
+    if telemetry_api is not None:
+        routes.extend(telemetry_api.routes())
     app = Starlette(routes=routes, lifespan=lifespan)
     return LocalBoundary(app, port, token)

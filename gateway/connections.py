@@ -54,11 +54,12 @@ class Connection:
 class BackendConnections:
     """Load configured sessions, verify candidates and publish only active generations."""
 
-    def __init__(self, profile: Profile, publish, store: SecretStore | None, profile_file: str):
+    def __init__(self, profile: Profile, publish, store: SecretStore | None, profile_file: str, *, technical=None):
         """Bind credential identities and generation state to one immutable profile."""
         self.profile = profile
         self.publish = publish
         self.store = store
+        self.technical = technical
         self.accounts = {}
         for name, backend in profile.backends.items():
             if isinstance(backend, HttpBackend) and backend.basic_keychain:
@@ -195,13 +196,21 @@ class BackendConnections:
             # The candidate can close while the system credential write is pending.
             # Keep the old routes and leave the verified secret available for a new connection.
             if not candidate.live:
+                if self.technical is not None:
+                    self.technical.connection(name, candidate.status, replacement=True)
                 return False
             old = self.active[name]
             self.active[name] = candidate
             activated = True
             self.publish(name, candidate)
             self._track(self._retire(old))
+            if self.technical is not None:
+                self.technical.connection(name, "ready", replacement=True)
             return True
+        except ReauthorizationError as error:
+            if self.technical is not None:
+                self.technical.connection(name, str(error), replacement=True)
+            raise
         finally:
             if candidate is not None and not activated:
                 await self._stop(candidate)

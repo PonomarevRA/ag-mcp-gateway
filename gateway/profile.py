@@ -111,6 +111,7 @@ class Profile(BaseModel):
     module_chain_tools: set[ToolName] = Field(default_factory=set, max_length=256)
     skill_router: SkillSettings | None = None
     log_max_bytes: int = Field(default=100_000_000, ge=4096, le=1_000_000_000, strict=True)
+    technical_log_max_bytes: int = Field(default=100_000_000, ge=65_536, le=1_000_000_000, strict=True)
     timeout_seconds: float = Field(default=30, gt=0, le=300)
     backends: dict[Identifier, Backend] = Field(min_length=1, max_length=32)
     denied: set[ToolName] = Field(default_factory=set)

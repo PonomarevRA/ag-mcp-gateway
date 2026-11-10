@@ -31,6 +31,8 @@ from .router import Router
 from .session_context import SessionContext, add_session_options, session_from_cli
 from .skill_store import SkillStore
 from .skill_tools import SkillReference
+from .technical_events import TechnicalEvents
+from .technical_journal import TechnicalJournal
 from .telemetry import Journal, Telemetry
 from .token_secrets import resolve_token, valid_token
 from .tool_feedback import ToolFeedback
@@ -116,17 +118,22 @@ def serve(args, profile: Profile, token: str | None, store: MacKeychain | None):
         journal = Journal(directory / "logs", profile.log_max_bytes)
         profile_file = args.profiles.expanduser() / f"{profile.name}.json"
         discovery_enabled = profile.agent_discovery and bool(token)
-        telemetry = Telemetry(journal, with_history=discovery_enabled)
-        router = Router(profile, telemetry, store=store, profile_file=str(profile_file.resolve()))
-        settings = ToolPolicySettings(router, directory / "tool-policy.json")
-        skill_store = open_skills(args, profile) if profile.skill_router is not None and token else None
-        if profile.modules_enabled and token:
-            router.modules = ModuleRegistry(router, directory / "modules.json")
-        feedback = ToolFeedback(directory / "tool-feedback.sqlite3") if discovery_enabled else None
-        app = create_app(router, args.port, token, settings=settings, skill_store=skill_store, feedback=feedback)
-        _LOG.info("Profile %s · http://127.0.0.1:%s/", profile.name, args.port)
-        uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False, proxy_headers=False,
-                    ws="none", log_level="warning", timeout_graceful_shutdown=10)
+        technical = TechnicalJournal(directory / "logs" / "technical.sqlite3", profile.technical_log_max_bytes)
+        events = TechnicalEvents(technical, profile.endpoint_key)
+        try:
+            telemetry = Telemetry(journal, with_history=discovery_enabled, technical=events)
+            router = Router(profile, telemetry, store=store, profile_file=str(profile_file.resolve()))
+            settings = ToolPolicySettings(router, directory / "tool-policy.json")
+            skill_store = open_skills(args, profile) if profile.skill_router is not None and token else None
+            if profile.modules_enabled and token:
+                router.modules = ModuleRegistry(router, directory / "modules.json")
+            feedback = ToolFeedback(directory / "tool-feedback.sqlite3") if discovery_enabled else None
+            app = create_app(router, args.port, token, settings=settings, skill_store=skill_store, feedback=feedback, technical=technical)
+            _LOG.info("Profile %s · http://127.0.0.1:%s/", profile.name, args.port)
+            uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False, proxy_headers=False,
+                        ws="none", log_level="warning", timeout_graceful_shutdown=10)
+        finally:
+            technical.close()
 
 
 def open_skills(args, profile: Profile) -> SkillStore:

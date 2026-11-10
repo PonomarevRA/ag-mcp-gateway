@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 from mcp import ClientSession, types
 
-from .connection_diagnostics import FAILURE_LABELS
+from .connection_diagnostics import ConnectionProbe, FAILURE_LABELS
 from .credentials import SecretStore, SecretStoreError, credential_account
 from .profile import HttpBackend, Profile
 from .upstream import run_backend
@@ -20,6 +20,7 @@ class ReauthorizationError(RuntimeError):
 class Connection:
     """Hold one worker, its latest catalog and the drain state of its tool calls."""
 
+    closed: asyncio.Event
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     idle: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task | None = None
@@ -31,6 +32,11 @@ class Connection:
     def __post_init__(self):
         """Mark a newly allocated connection idle until it dispatches a tool."""
         self.idle.set()
+
+    @property
+    def live(self) -> bool:
+        """Read transport liveness even before its worker handles the close notification."""
+        return self.session is not None and not self.closed.is_set()
 
     def acquire(self):
         """Hold the worker alive through one in-flight dispatch."""
@@ -88,7 +94,8 @@ class BackendConnections:
 
     def _start(self, name: str, authorization: str | None = None) -> Connection:
         """Start a candidate without changing active routes or stored credentials."""
-        worker = Connection()
+        probe = ConnectionProbe()
+        worker = Connection(closed=probe.closed)
 
         def update(_name, session, tools, status):
             """Settle discovery and apply later events only for this active worker."""
@@ -108,7 +115,7 @@ class BackendConnections:
                 except ReauthorizationError as error:
                     update(name, None, {}, str(error))
                     return
-            await run_backend(name, self.profile.backends[name], self.profile.timeout_seconds, update, header)
+            await run_backend(name, self.profile.backends[name], self.profile.timeout_seconds, update, header, probe=probe)
 
         worker.task = self._track(run())
         return worker
@@ -147,7 +154,7 @@ class BackendConnections:
             header = authorization if authorization is not None else await self._read(name)
             candidate = self._start(name, header)
             await candidate.ready.wait()
-            if candidate.session is None:
+            if not candidate.live:
                 reason = candidate.status if candidate.status in FAILURE_LABELS else "connection-failed"
                 raise ReauthorizationError(reason)
             if authorization is not None:
@@ -157,7 +164,7 @@ class BackendConnections:
                     raise ReauthorizationError("keychain-unavailable") from error
             # The candidate can close while the system credential write is pending.
             # Keep the old routes and leave the verified secret available for a new connection.
-            if candidate.session is None:
+            if not candidate.live:
                 return False
             old = self.active[name]
             self.active[name] = candidate

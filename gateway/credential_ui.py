@@ -104,7 +104,7 @@ class CredentialsUI:
             return ""
         result = confirmation[1]
         worker = self.connections.active.get(selected)
-        if worker is None or worker.status != "ready":
+        if worker is None or not worker.live:
             if result == "connected":
                 return ""
             if result == "saved":
@@ -120,7 +120,7 @@ class CredentialsUI:
             status = 502
             message += "."
             worker = self.connections.active.get(selected)
-            if worker is not None and worker.status == "ready":
+            if worker is not None and worker.live:
                 message += " Действующее подключение сохранено."
         else:
             status, message = _ERRORS["connection-failed"]
@@ -148,7 +148,7 @@ class CredentialsUI:
         action = f"/credentials/{label}"
         csrf = f'<input type="hidden" name="csrf" value="{self.csrf}">'
         worker = self.connections.active.get(name)
-        if worker is not None and worker.status == "ready":
+        if worker is not None and worker.live:
             state = '<p class="status-badge status-ready"><span aria-hidden="true">✓</span> MCP подключён</p>'
         else:
             code = worker.status if worker is not None else "starting"

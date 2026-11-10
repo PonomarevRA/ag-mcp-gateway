@@ -99,9 +99,10 @@ async def discover(session: ClientSession, prefix: str):
     raise ValueError("upstream catalog exceeds 64 pages")
 
 
-async def run_backend(prefix, config, timeout, publish, authorization: str | None = None):
+async def run_backend(prefix, config, timeout, publish, authorization: str | None = None, *,
+                      probe: ConnectionProbe | None = None):
     """Keep the discovered session alive and publish a sanitized failure on exit."""
-    probe = ConnectionProbe()
+    probe = probe or ConnectionProbe()
     failure_published = False
     try:
         async with open_session(config, timeout, authorization, probe) as (session, closed):

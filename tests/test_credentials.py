@@ -44,13 +44,14 @@ class MemoryStore:
 class FixtureSession:
     """Return a generation marker and optionally block an in-flight tool call."""
 
-    def __init__(self, label):
+    def __init__(self, label, transport_closed):
         """Give each worker a public fixture label and per-call events."""
         self.label = label
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.closed = asyncio.Event()
         self.disconnect = asyncio.Event()
+        self.transport_closed = transport_closed
 
     async def call_tool(self, name, arguments, *, meta=None):
         """Hold a deliberate long-running fixture call until the test releases it."""
@@ -66,17 +67,18 @@ def gateway(tmp_path, monkeypatch):
     sessions = {}
     tool = types.Tool(name="read", inputSchema={"type": "object"})
 
-    async def run_backend(name, config, timeout, publish, authorization=None):
+    async def run_backend(name, config, timeout, publish, authorization=None, *, probe):
         """Validate the Basic fixture header before publishing the tool catalog."""
         label = {_OLD: "old", _NEW: "new"}.get(authorization)
         if label is None:
             publish(name, None, {}, "unavailable")
             return
-        session = FixtureSession(label)
+        session = FixtureSession(label, probe.closed)
         sessions[label] = session
         publish(name, session, {f"{name}.read": tool}, "ready")
         try:
             await session.disconnect.wait()
+            probe.closed.set()
             publish(name, None, {}, "unavailable")
         finally:
             session.closed.set()
@@ -187,7 +189,8 @@ def test_rotation_drains_already_dispatched_tool(gateway):
     asyncio.run(scenario())
 
 
-def test_candidate_eof_during_keychain_write_keeps_live_routes(gateway, monkeypatch):
+@pytest.mark.parametrize("worker_observed_close", [True, False])
+def test_candidate_eof_during_keychain_write_keeps_live_routes(gateway, monkeypatch, worker_observed_close):
     """A verified secret may be saved while a disconnected candidate is discarded."""
     router, store, account, sessions = gateway
     writing = Event()
@@ -210,8 +213,10 @@ def test_candidate_eof_during_keychain_write_keeps_live_routes(gateway, monkeypa
             try:
                 assert await asyncio.to_thread(writing.wait, 2)
                 candidate = sessions["new"]
-                candidate.disconnect.set()
-                await asyncio.wait_for(candidate.closed.wait(), 1)
+                candidate.transport_closed.set()
+                if worker_observed_close:
+                    candidate.disconnect.set()
+                    await asyncio.wait_for(candidate.closed.wait(), 1)
             finally:
                 finish_write.set()
             assert await rotation is False

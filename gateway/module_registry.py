@@ -18,7 +18,8 @@ from .profile import Identifier, ToolName
 Pointer = Annotated[str, StringConstraints(max_length=256, pattern=r"^(?:/(?:[^~]|~[01])*)?$")]
 JsonKey = Annotated[str, StringConstraints(max_length=128)]
 Phase = Literal["before", "after"]
-MAX_STATE = 262_144
+MAX_STATE = 393_216
+MAX_DEFINITIONS = 131_072
 _LOG = logging.getLogger("gateway")
 
 
@@ -228,7 +229,7 @@ class ModuleRegistry:
 
     def _write(self, state: ModuleState) -> None:
         """Persist a bounded snapshot before publishing it to the event loop."""
-        data = bounded_json(state.model_dump(exclude_none=True), MAX_STATE)
+        data = bounded_json(state.model_dump(exclude_none=True), MAX_STATE, node_limit=32_000)
         write_state(self.path, data)
         self.state = state
 
@@ -258,7 +259,11 @@ class ModuleRegistry:
         elif module.id not in history or (before is not None and before.steps != module.steps):
             prior = history.get(module.id)
             history[module.id] = HookLife(created_at=int(time.time()), pinned=bool(prior and prior.pinned))
-        return self._edit(change, modules={**self.state.modules, module.id: module}, lifecycle=history)
+        modules = {**self.state.modules, module.id: module}
+        definitions = {key: value.model_dump(exclude_none=True) for key, value in modules.items()}
+        # Reserve file capacity for bounded session histories and profile bindings.
+        bounded_json(definitions, MAX_DEFINITIONS, node_limit=24_000)
+        return self._edit(change, modules=modules, lifecycle=history)
 
     def delete(self, change: Delete) -> dict:
         """Remove a definition only after all profile and session references end."""

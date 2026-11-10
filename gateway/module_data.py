@@ -16,19 +16,19 @@ class ModuleError(ValueError):
     """An operator-readable failure that contains no request or response data."""
 
 
-def bounded_json(value, limit: int = MAX_DATA) -> bytes:
+def bounded_json(value, limit: int = MAX_DATA, *, node_limit: int = 12_000) -> bytes:
     """Reject deep, large or non-JSON data before using or returning it."""
     pending = [(value, 0)]
     nodes = 0
     while pending:
         item, depth = pending.pop()
         nodes += 1
-        if depth > 32 or nodes + len(pending) > 12_000:
+        if depth > 32 or nodes + len(pending) > node_limit:
             raise ModuleError("Module JSON exceeds its structural limit")
         if isinstance(item, str) and len(item) > limit:
             raise ModuleError("Module JSON exceeds its byte limit")
         if isinstance(item, (dict, list)):
-            if nodes + len(pending) + len(item) > 12_000:
+            if nodes + len(pending) + len(item) > node_limit:
                 raise ModuleError("Module JSON exceeds its structural limit")
             children = item.values() if isinstance(item, dict) else item
             pending.extend((child, depth + 1) for child in children)

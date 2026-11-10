@@ -229,9 +229,9 @@ def test_module_page_preserves_operator_work(fixture_gateway):
         page = client.get("/modules?lang=en")
         csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
 
-        def post(action, revision, **fields):
+        def post(action, revision, *, path="/modules", **fields):
             """Submit the same bounded form the authenticated browser sends."""
-            return client.post("/modules", data={"csrf": csrf, "action": action, "revision": str(revision), **fields},
+            return client.post(path, data={"csrf": csrf, "action": action, "revision": str(revision), **fields},
                                follow_redirects=False)
 
         draft = '{ "title": "<fixture>"'
@@ -247,10 +247,19 @@ def test_module_page_preserves_operator_work(fixture_gateway):
         assert "Module saved." not in client.get(saved.headers["Location"]).text
         assert "Module saved." not in client.get("/modules?confirmation=forged").text
 
-        stale = post("save", 0, data=body)
+        changed = json.dumps({**json.loads(body), "title": "Preserved unsaved draft"})
+        stale = post("save", 0, path="/modules?edit=projection&tool=demo.read", data=changed)
         assert stale.status_code == 400 and "Module revision changed." in stale.text
         editor = stale.text.split('<h2 id="editor">', 1)[1].split("</form>", 1)[0]
         assert 'name="revision" value="0"' in editor
+        assert "Preserved unsaved draft" in editor
+        link = re.search(r'<a href="([^"]+)">Open the current form</a>', editor).group(1)
+        fresh_location = unescape(link)
+        assert fresh_location == "/modules?edit=projection&tool=demo.read&view=current#editor"
+        fresh = client.get(fresh_location)
+        assert fresh.status_code == 200
+        assert 'name="revision" value="1"' in fresh.text and 'id="tool" name="tool" value="demo.read"' in fresh.text
+        assert "Preserved unsaved draft" not in fresh.text
         assert registry.state.revision == 1
 
         data = '{"value": null}'
@@ -271,6 +280,8 @@ def test_module_page_preserves_operator_work(fixture_gateway):
         assert closed.status_code == 303
         confirmation = client.get(closed.headers["Location"]).text
         assert "Session closed." in confirmation and capability not in confirmation and grant["session_id"] not in confirmation
+        assert post("save", 1, path=fresh_location, data=changed).status_code == 303
+        assert registry.state.modules["projection"].title == "Preserved unsaved draft"
 
 
 def test_hook_sessions_promote_once_and_remain_isolated(fixture_gateway):

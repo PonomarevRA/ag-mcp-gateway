@@ -35,6 +35,7 @@ _RETAINED_FIELDS = {
     "bind": {"tool": 128, "phase": 6, "module": 32},
 }
 _FORM_SECTIONS = {"save": "editor", "run": "run", "bind": "hooks"}
+_RECOVERY_SECTIONS = {**_FORM_SECTIONS, "delete": "editor"}
 
 
 def encoded(value) -> str:
@@ -50,6 +51,15 @@ def empty_row(message: str) -> str:
 def result_panel(result) -> str:
     """Render the explicit operation's escaped JSON result beside its form."""
     return f'<div class="module-preview"><h3>{tr("Результат")}</h3><pre>{encoded(result)}</pre></div>'
+
+
+def module_location(edit: str, tool: str, *, fresh: bool = False) -> str:
+    """Keep selected context and distinguish a reload from the preceding POST URL."""
+    values = {key: value for key, value in (("edit", edit), ("tool", tool)) if value}
+    if fresh:
+        values["view"] = "current"
+    query = urlencode(values)
+    return f"/modules?{query}" if query else "/modules"
 
 
 def options(values, *, blank: str | None = None, selected: str | None = None) -> str:
@@ -135,7 +145,8 @@ class ModulePage:
 <button>{tr("Закрыть сессию")}</button></form></details></section>"""
 
     def render(self, edit: str = "", *, tool_hint: str = "", notice: str = "", result: dict | None = None,
-               status: int = 200, form: dict[str, str] | None = None, opened_session: dict | None = None):
+               status: int = 200, form: dict[str, str] | None = None, opened_session: dict | None = None,
+               recovery_action: str | None = None):
         """Render bounded definitions, form actions and the last explicit run result."""
         current = self.service.registry.catalog()
         modules = current["modules"]
@@ -150,7 +161,6 @@ class ModulePage:
 
         selected = modules.get(edit, {**EXAMPLE, "title": tr(EXAMPLE["title"])})
         definition = escape(form["data"]) if action == "save" else encoded(selected)
-        edit_action = "/modules?" + urlencode({"edit": edit}) if edit in modules else "/modules"
         local = []
         items = []
         for identity, module in sorted(modules.items()):
@@ -174,18 +184,27 @@ class ModulePage:
         hook_options = options(local, blank=tr("Снять привязку"), selected=hook_module)
         if action == "bind":
             tool_hint = form["tool"]
+        edit_action = module_location(edit if edit in modules else "", tool_hint)
         after_selected = " selected" if action == "bind" and form.get("phase") == "after" else ""
         bind_disabled = "" if routes else " disabled"
         role = "alert" if status >= 400 else "status"
-        alert = f'<p id="module-feedback" role="{role}" class="module-message">{escape(tr(notice))}</p>' if notice else ""
-        feedback_section = "lifecycle" if opened_session is not None else _FORM_SECTIONS.get(action)
+        feedback_section = _FORM_SECTIONS.get(action)
+        recovery = ""
+        if recovery_action is not None:
+            feedback_section = _RECOVERY_SECTIONS.get(recovery_action, "lifecycle")
+            url = f"{module_location(edit, tool_hint, fresh=True)}#{feedback_section}"
+            recovery = f' <a href="{escape(url)}">{tr("Открыть актуальную форму")}</a>'
+        alert = (f'<p id="module-feedback" role="{role}" class="module-message">{escape(tr(notice))}{recovery}</p>'
+                 if notice else "")
+        if opened_session is not None:
+            feedback_section = "lifecycle"
         preview = result_panel(result["result"]) if result is not None else ""
         session_preview = result_panel(opened_session) if opened_session is not None else ""
         lifecycle = self.lifecycle(current, local, feedback=alert if feedback_section == "lifecycle" else "",
                                    preview=session_preview)
         delete = ""
         if edit in modules:
-            delete = (f'<form method="post" action="/modules">{self.hidden("delete", revision)}'
+            delete = (f'<form method="post" action="{escape(edit_action)}#editor">{self.hidden("delete", revision)}'
                       f'<input type="hidden" name="id" value="{edit}"><button>{tr("Удалить модуль")}</button></form>')
         disabled = "" if modules else " disabled"
         html = f"""<!doctype html>
@@ -274,11 +293,17 @@ class ModulePage:
         except ValidationError:
             return self.render(edit, notice="Проверьте поля и определение модуля.", status=400, form=form)
         except ModuleError as error:
+            if str(error) == "Module revision changed. Refresh and retry.":
+                selection = edit or (form.get("id", "") if action == "run" else "")
+                tool = request.query_params.get("tool", "")[:128]
+                return self.render(selection, tool_hint=tool, status=400, form=form, recovery_action=action,
+                                   notice="Ревизия модуля изменилась. Скопируйте несохранённый ввод и проверьте актуальные данные перед повтором.")
             return self.render(edit, notice=module_error(str(error)), status=400, form=form)
         except OSError:
             return self.render(edit, notice="Не удалось сохранить настройки.", status=503, form=form)
         tool = fields.get("tool", "") if action == "bind" else ""
-        return self.confirmation(action, saved or edit, tool)
+        selection = "" if action == "delete" else saved or edit
+        return self.confirmation(action, selection, tool)
 
     @staticmethod
     def revision(value: str) -> int:

@@ -200,6 +200,8 @@ ENGLISH = {
     "Сессия открыта. Сохраните ключ для клиента.": "Session opened. Save the key for the client.",
     "Модуль выполнен.": "Module completed.",
     "Модуль сохранён.": "Module saved.",
+    "Ревизия модуля изменилась. Скопируйте несохранённый ввод и проверьте актуальные данные перед повтором.": "Module revision changed. Copy any unsaved input and review the current values before trying again.",
+    "Открыть актуальную форму": "Open the current form",
     "Привязка обновлена.": "Binding updated.",
     "Пороги сохранены.": "Thresholds saved.",
     "Закрепление обновлено.": "Pin updated.",

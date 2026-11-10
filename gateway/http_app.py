@@ -189,11 +189,12 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
             await manager.handle_request(scope, receive, send)
 
     def dashboard(query: str = "", *, offset: int = 0, backend: str | None = None,
-                  notice: str = "", status_code: int = 200):
+                  notice: str = "", notice_backend: str | None = None, status_code: int = 200):
         """Render a single catalog page and the authorized browser controls."""
         snapshot = router.dashboard_snapshot(query, offset, backend, page_size=CATALOG_PAGE_SIZE)
         page = render(snapshot, query, credentials=credentials.enabled, management=management is not None,
-                      reconnect_csrf=credentials.csrf if token else None, notice=notice, modules=modules is not None,
+                      reconnect_csrf=credentials.csrf if token else None, notice=notice,
+                      notice_backend=notice_backend, modules=modules is not None,
                       diagnostics=diagnostics is not None)
         return HTMLResponse(page, status_code=status_code, headers=SECURE_HTML)
 
@@ -212,7 +213,7 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
         notice = ""
         if receipt and name in reconnect_receipts and reconnect_receipts[name] == receipt:
             notice = f"{name}: {tr('Подключение проверено и заменено.')}"
-        return dashboard(**catalog_filters(request), notice=notice)
+        return dashboard(**catalog_filters(request), notice=notice, notice_backend=name if notice else None)
 
     async def reconnect(request):
         """Replace one selected MCP after local browser authentication and CSRF checks."""
@@ -242,11 +243,11 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
         else:
             code = "connection-failed"
         if code == "busy":
-            return dashboard(**filters, notice=f"{name}: {tr('переподключение уже выполняется.')}", status_code=409)
+            return dashboard(**filters, notice=f"{name}: {tr('переподключение уже выполняется.')}", notice_backend=name, status_code=409)
         title, _tone = FAILURE_LABELS.get(code, ("Новое подключение не подтвердилось", "error"))
         worker = router.connections.active.get(name)
         suffix = " " + tr("Действующее подключение сохранено.") if worker is not None and worker.live else ""
-        return dashboard(**filters, notice=f"{name}: {tr(title)}.{suffix}", status_code=502)
+        return dashboard(**filters, notice=f"{name}: {tr(title)}.{suffix}", notice_backend=name, status_code=502)
 
     async def status(_request):
         """Return profile status and metrics as machine-readable JSON."""

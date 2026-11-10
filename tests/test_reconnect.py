@@ -55,7 +55,7 @@ def test_browser_and_bridge_replace_only_a_verified_catalog(tmp_path, monkeypatc
         assert listed(client) == {"local.old", "other.old"}
         assert "gateway_reconnect_mcp" in listed(client, "/manage/test")
         root = client.get("/", headers=browser)
-        assert 'action="/reconnect/local"' in root.text
+        assert 'action="/reconnect/local#backend-local"' in root.text
         csrf = re.search(r'name="csrf" value="([^"]+)"', root.text).group(1)
         url = "/reconnect/local"
         headers = {**browser, "Origin": ORIGIN}
@@ -70,7 +70,8 @@ def test_browser_and_bridge_replace_only_a_verified_catalog(tmp_path, monkeypatc
         ok = client.post(url + "?q=old&backend=local", headers=headers, data={"csrf": csrf}, follow_redirects=False)
         assert ok.status_code == 303 and ok.headers["location"].endswith("#backend-local")
         confirmed = client.get(ok.headers["location"], headers=browser)
-        assert "local: Подключение проверено и заменено." in confirmed.text
+        card = confirmed.text.split('<li id="backend-local">', 1)[1].split("</li>", 1)[0]
+        assert '<p role="status">local: Подключение проверено и заменено.</p>' in card
         assert 'name="backend" value="local"' in confirmed.text and 'value="old"' in confirmed.text
         fabricated = client.get("/?reconnected=local&confirmation=fake", headers=browser)
         assert "Подключение проверено и заменено." not in fabricated.text

@@ -59,7 +59,7 @@ input, select, button { font: inherit; border: 1px solid #64768b; border-radius:
 dt { font-size: .88rem; }
 dd { margin: 0; font-weight: 680; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 ul { padding: 0; margin: .7rem 0; list-style: none; display: grid; gap: .45rem; }
-li, h1, header p { overflow-wrap: anywhere; }
+li, h1, h2, header p { overflow-wrap: anywhere; }
 .tools li p { white-space: pre-wrap; margin-top: .2rem; }
 small, .muted { color: #445770; }
 .backends { grid-template-columns: repeat(auto-fit,minmax(min(100%,17rem),1fr)); }
@@ -149,7 +149,7 @@ def last_call_line(timestamp: str | None) -> str:
 
 
 def backend_card(backend: dict, can_manage: bool, tools_href: str | None, csrf: str | None,
-                 *, reconnect_context: str = "", diagnostics: bool = False) -> str:
+                 *, reconnect_context: str = "", diagnostics: bool = False, notice: str = "") -> str:
     """Show confirmed transport readiness and relevant actions for one backend."""
     name = escape(backend["name"])
     state = backend["status"]
@@ -166,16 +166,17 @@ def backend_card(backend: dict, can_manage: bool, tools_href: str | None, csrf: 
         actions.append(f'<a href="/diagnostics?backend={name}">{tr("Диагностика")}</a>')
     if csrf is not None:
         context = escape(reconnect_context, quote=True)
-        actions.append(f'<form method="post" action="/reconnect/{name}{context}">'
+        actions.append(f'<form method="post" action="/reconnect/{name}{context}#backend-{name}">'
                        f'<input type="hidden" name="csrf" value="{escape(csrf, quote=True)}">'
                        f'<button type="submit" aria-label="{tr("Переподключить")} {name}">{tr("Переподключить")}</button></form>')
     links = f'<div class="backend-actions">{"".join(actions)}</div>' if actions else ""
+    feedback = f'<p role="status">{escape(notice)}</p>' if notice else ""
     return (
         f'<li id="backend-{name}"><div class="backend-heading"><h3>{name}</h3>'
         f'{connection_status(state, auth != "none")}</div>'
         f'<p class="muted">{tr(transport)} · {tr(auth_label)}</p>'
         f'<p>{tr("Доступных инструментов")} {display(backend["tools"])}</p>'
-        f'{last_call_line(backend.get("last_call_at"))}{links}</li>'
+        f'{feedback}{last_call_line(backend.get("last_call_at"))}{links}</li>'
     )
 
 
@@ -223,7 +224,8 @@ def catalog_navigation(page: dict | None, query: str) -> str:
 
 
 def render(status: dict, query: str, *, credentials: bool = False, management: bool = False,
-           reconnect_csrf: str | None = None, notice: str = "", modules: bool = False, diagnostics: bool = False) -> str:
+           reconnect_csrf: str | None = None, notice: str = "", notice_backend: str | None = None,
+           modules: bool = False, diagnostics: bool = False) -> str:
     """Render one dashboard snapshot without executing upstream text or links."""
     label = _ENVIRONMENTS.get(status.get("environment"))
     environment = f" · {tr(label)}" if label else ""
@@ -261,13 +263,14 @@ def render(status: dict, query: str, *, credentials: bool = False, management: b
         elif page is not None and (name in page["groups"] or (page["backend"] and item["tools"])):
             href = catalog_url(query, name) + "#catalog"
         cards_html.append(backend_card(item, credentials, href, reconnect_csrf,
-                                       reconnect_context=context.removeprefix("/"), diagnostics=diagnostics))
+                                       reconnect_context=context.removeprefix("/"), diagnostics=diagnostics,
+                                       notice=notice if name == notice_backend else ""))
     backends = "".join(cards_html)
     catalog = "".join(
         f'<div><h3 id="tools-{escape(prefix)}">{escape(prefix)}</h3><ul class="tools">{"".join(rows)}</ul></div>'
         for prefix, rows in groups.items()
     ) or f'<ul class="tools"><li>{tr("Инструменты не найдены.")}</li></ul>'
-    message = f'<p role="status">{escape(notice)}</p>' if notice else ""
+    message = f'<p role="status">{escape(notice)}</p>' if notice and notice_backend is None else ""
     return f"""<!doctype html>
 <html lang="{language()}">
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">

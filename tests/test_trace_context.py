@@ -42,7 +42,8 @@ def test_headers_replace_metadata_without_mixing_vendor_state():
     invalid = with_http_trace(metadata, Headers({"traceparent": "invalid"}))
     assert TraceContext.from_metadata(invalid) is None
     duplicate = Headers(raw=[(b"traceparent", PARENT.encode()), (b"traceparent", OTHER_PARENT.encode())])
-    assert TraceContext.from_metadata(with_http_trace(metadata, duplicate)) is None
+    assert with_http_trace(metadata, duplicate) == {"custom": "retained"}
+    assert with_http_trace(None, duplicate) is None
     assert with_http_trace(metadata, Headers({"tracestate": "ignore=unpaired"})) == metadata
 
 
@@ -114,3 +115,32 @@ def test_router_scopes_trace_and_retains_only_ids(tmp_path, capsys):
     show_logs(directory, 30, "on", tag, TRACE_ID)
     entries = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert len(entries) == 1 and entries[0]["trace_id"] == TRACE_ID and entries[0]["session_tag"] == tag
+
+
+
+def test_rejected_trace_only_carriers_leave_singleflight_enabled(tmp_path):
+    """Invalid HTTP or MCP trace fields cannot disable ordinary call coalescing."""
+    class SlowSession:
+        async def call_tool(self, name, arguments, *, meta=None):
+            """Hold the flight briefly and expose any forwarded metadata."""
+            await asyncio.sleep(0.01)
+            return types.CallToolResult(content=[], structuredContent=meta or {})
+
+    profile = Profile.model_validate({"name": "test", "backends": {
+        "on": {"transport": "stdio", "command": "fixture", "forward_trace_context": True},
+    }, "singleflight": ["on.read"]})
+    router = Router(profile, Telemetry(Journal(tmp_path, 4096)))
+    router.routes["on.read"] = Route(types.Tool(name="read", inputSchema={"type": "object"}), SlowSession())
+
+    async def scenario():
+        """Compare rejected HTTP trace context with an invalid MCP-only carrier."""
+        header = with_http_trace({"traceparent": PARENT}, Headers({"traceparent": "invalid"}))
+        direct = {"traceparent": "invalid", "tracestate": "vendor=discarded"}
+        results = await asyncio.gather(router.call("on.read", {}, metadata=header),
+                                       router.call("on.read", {}, metadata=direct))
+        assert [result.structuredContent for result in results] == [{}, {}]
+        totals = router.telemetry.snapshot()["total"]
+        assert totals["upstream"] == 1 and totals["merged"] == 1
+        assert "trace_id" not in (tmp_path / "calls.0.jsonl").read_text()
+
+    asyncio.run(scenario())

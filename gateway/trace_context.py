@@ -59,17 +59,26 @@ def _valid_state(value) -> str | None:
     return ",".join(f"{key}={state}" for key, state in entries.items()) or None
 
 
+def without_trace_fields(metadata: dict | None) -> dict | None:
+    """Remove the trace carrier and keep the original distinction for explicit empty metadata."""
+    if not metadata or not any(key.lower() in TRACE_FIELDS for key in metadata):
+        return metadata
+    return {key: value for key, value in metadata.items() if key.lower() not in TRACE_FIELDS} or None
+
+
 def with_http_trace(metadata: dict | None, headers: Headers) -> dict | None:
     """Prefer an explicit HTTP carrier as a pair, never mixing header and MCP state."""
     parents = headers.getlist("traceparent")
     if not parents:
         return metadata
-    result = {key: value for key, value in (metadata or {}).items() if key.lower() not in TRACE_FIELDS}
-    if len(parents) == 1:
-        result["traceparent"] = parents[0].strip(" \t")
-        states = headers.getlist("tracestate")
-        if sum(map(len, states)) + len(states) <= 513:
-            result["tracestate"] = ",".join(states)
+    other = without_trace_fields(metadata)
+    if len(parents) != 1:
+        return other
+    result = dict(other or {})
+    result["traceparent"] = parents[0].strip(" \t")
+    states = headers.getlist("tracestate")
+    if states and sum(map(len, states)) + len(states) - 1 <= 512:
+        result["tracestate"] = ",".join(states)
     return result
 
 

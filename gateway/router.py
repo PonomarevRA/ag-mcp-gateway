@@ -13,7 +13,7 @@ from .credentials import SecretStore
 from .profile import HttpBackend, Profile
 from .session_context import SESSION_META, SessionContext
 from .telemetry import Telemetry
-from .trace_context import TRACE_FIELDS, TraceContext
+from .trace_context import TraceContext, without_trace_fields
 
 
 def tool_error(message: str) -> types.CallToolResult:
@@ -136,6 +136,7 @@ class Router:
         input_bytes = output_bytes = 0
         context = None
         trace = TraceContext.from_metadata(metadata)
+        metadata = without_trace_fields(metadata)
         try:
             if metadata is not None and SESSION_META in metadata:
                 try:
@@ -152,7 +153,7 @@ class Router:
             encoded = json.dumps(arguments, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
                                  allow_nan=False).encode("utf-8")
             input_bytes = len(encoded)
-            if metadata is None and name in self.profile.singleflight:
+            if metadata is None and trace is None and name in self.profile.singleflight:
                 task, joined = self._shared(name, encoded, route, arguments)
                 result = await asyncio.shield(task)
             else:
@@ -180,7 +181,7 @@ class Router:
         backend = self.profile.backends[name.partition(".")[0]]
         # Progress tokens belong to the inbound session. Gateway identity requires local opt-in.
         forwarded = {key: value for key, value in (metadata or {}).items()
-                     if key not in {"progressToken", SESSION_META} and key.lower() not in TRACE_FIELDS}
+                     if key not in {"progressToken", SESSION_META}}
         if trace is not None and backend.forward_trace_context:
             forwarded.update(trace.carrier())
         if context is not None:

@@ -109,9 +109,9 @@ def create_app(router, port: int, token: str | None):
         return Response(STYLE, media_type="text/css", headers={"X-Content-Type-Options": "nosniff"})
 
     app = Starlette(routes=[
-        Route(f"/mcp/{router.profile.name}", McpEndpoint()),
+        Route(f"/mcp/{router.profile.endpoint_key}", McpEndpoint()),
         Route("/", overview),
-        Route(f"/api/status/{router.profile.name}", status),
+        Route(f"/api/status/{router.profile.endpoint_key}", status),
         Route("/dashboard.css", stylesheet),
     ], lifespan=lifespan)
     return LocalBoundary(app, port, token)

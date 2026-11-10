@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "name": "company-test",
+  "environment": "test",
+  "listen_port": 18793,
+  "access_token_env": "AG_GATEWAY_TEST_TOKEN",
+  "backends": {
+    "docs": {
+      "transport": "http",
+      "url": "https://mcp-test.example.com/mcp",
+      "bearer_token_env": "DOCS_TEST_MCP_TOKEN"
+    }
+  },
+  "denied": ["docs.delete_page"],
+  "singleflight": ["docs.read_page"]
+}

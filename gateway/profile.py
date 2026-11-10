@@ -2,6 +2,7 @@
 
 import json
 import os
+from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
@@ -11,6 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_vali
 Identifier = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,32}$")]
 EnvName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]
 ToolName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]{1,128}$")]
+Environment = Literal["test", "production"]
+_DEFAULT_PORTS = {None: 18792, "test": 18793, "production": 18794}
 
 
 class StdioBackend(BaseModel):
@@ -55,6 +58,8 @@ class Profile(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     version: Literal[1] = 1
     name: Identifier
+    environment: Environment | None = None
+    listen_port: int | None = Field(default=None, ge=1, le=65535, strict=True)
     access_token_env: EnvName | None = None
     log_max_bytes: int = Field(default=100_000_000, ge=4096, le=1_000_000_000, strict=True)
     timeout_seconds: float = Field(default=30, gt=0, le=300)
@@ -62,9 +67,38 @@ class Profile(BaseModel):
     denied: set[ToolName] = Field(default_factory=set)
     singleflight: set[ToolName] = Field(default_factory=set)
 
+    @property
+    def endpoint_key(self) -> str:
+        """Return the loopback path suffix, preserving legacy profile URLs."""
+        return f"{self.environment}/{self.name}" if self.environment else self.name
+
+    @property
+    def state_path(self) -> Path:
+        """Return a relative path disjoint from the legacy profile name namespace."""
+        return Path(".environments", self.endpoint_key) if self.environment else Path(self.name)
+
+    @property
+    def client_name(self) -> str:
+        """Give labelled profiles distinct names within the clients' 32-character limit."""
+        if self.environment is None:
+            return "ag-mcp-gateway"
+        label = f"amg-{self.environment}-{self.name}"
+        if len(label) <= 32:
+            return label
+        suffix = sha256(label.encode("ascii")).hexdigest()[:8]
+        return f"{label[:23]}-{suffix}"
+
+    def resolve_port(self, override: int | None) -> int:
+        """Select the CLI override, profile port or environment default in that order."""
+        if override is not None:
+            return override
+        return self.listen_port or _DEFAULT_PORTS[self.environment]
+
     @model_validator(mode="after")
     def validate_policy(self):
-        """Catch misspelled namespaces and contradictory access rules at startup."""
+        """Require production authentication and validate configured tool policies."""
+        if self.environment == "production" and self.access_token_env is None:
+            raise ValueError("production profile requires access_token_env")
         if self.denied & self.singleflight:
             raise ValueError("denied and singleflight tool names overlap")
         for name in self.denied | self.singleflight:

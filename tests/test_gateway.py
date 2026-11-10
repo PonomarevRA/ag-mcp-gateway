@@ -148,3 +148,55 @@ def test_clean_stdio_exit_withdraws_published_routes(tmp_path):
             assert router.visible_tools() == []
 
     asyncio.run(scenario())
+
+
+def test_environment_defaults_and_identifiers():
+    """Same-named profiles get disjoint endpoints, state and client names."""
+    data = {
+        "name": "company-" + "x" * 24,
+        "backends": {"docs": {"transport": "stdio", "command": "unused"}},
+    }
+    legacy = Profile.model_validate(data)
+    test = Profile.model_validate({**data, "environment": "test"})
+    prod = Profile.model_validate({
+        **data, "environment": "production", "access_token_env": "PROD_TOKEN",
+    })
+    assert [profile.resolve_port(None) for profile in (legacy, test, prod)] == [18792, 18793, 18794]
+    assert prod.model_copy(update={"listen_port": 19042}).resolve_port(None) == 19042
+    assert prod.resolve_port(19222) == 19222
+    assert legacy.client_name == "ag-mcp-gateway"
+    assert len({profile.client_name for profile in (legacy, test, prod)}) == 3
+    assert len(test.client_name) <= 32 and len(prod.client_name) <= 32
+    assert len({profile.state_path for profile in (legacy, test, prod)}) == 3
+    assert len({profile.endpoint_key for profile in (legacy, test, prod)}) == 3
+
+
+def test_production_requires_authentication(tmp_path, monkeypatch):
+    """Production needs a token reference and refuses the unauthenticated switch."""
+    from gateway.cli import main
+
+    data = {
+        "name": "company", "environment": "production",
+        "backends": {"docs": {"transport": "stdio", "command": "unused"}},
+    }
+    with pytest.raises(ValueError, match="production profile requires access_token_env"):
+        Profile.model_validate(data)
+    data["access_token_env"] = "GATEWAY_PROD_TEST_TOKEN"
+    (tmp_path / "company.json").write_text(json.dumps(data))
+    state = tmp_path / "state"
+    command = ["--profiles", str(tmp_path), "--state", str(state), "--profile", "company", "serve"]
+    monkeypatch.delenv(data["access_token_env"], raising=False)
+    assert main(command) == 1
+    monkeypatch.setenv(data["access_token_env"], "synthetic-value")
+    assert main([*command, "--allow-unauthenticated"]) == 1
+    assert not state.exists()
+
+
+@pytest.mark.parametrize("port", [0, 65536, True, "18793"])
+def test_profile_rejects_invalid_ports(port):
+    """Profile ports are integers in the bindable port range."""
+    with pytest.raises(ValueError):
+        Profile.model_validate({
+            "name": "company", "environment": "test", "listen_port": port,
+            "backends": {"docs": {"transport": "stdio", "command": "unused"}},
+        })

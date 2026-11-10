@@ -15,7 +15,7 @@ from .bridge import bridge, read_status
 from .demo import demo_server
 from .http_app import create_app
 from .mcp_server import VERSION, serve_stdio
-from .profile import load_profile, secret
+from .profile import Profile, load_profile, secret
 from .router import Router
 from .telemetry import Journal, Telemetry
 
@@ -56,7 +56,7 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("--profiles", type=Path, default=base / "profiles")
     root.add_argument("--state", type=Path, default=base / "state")
     root.add_argument("--profile", default="demo")
-    root.add_argument("--port", type=int, default=18792)
+    root.add_argument("--port", type=int, help="override the profile or environment port")
     commands = root.add_subparsers(dest="command", required=True)
     serve = commands.add_parser("serve", help="run the loopback gateway and dashboard")
     serve.add_argument("--allow-unauthenticated", action="store_true", help="permit local clients without a token")
@@ -72,11 +72,13 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def serve(args, profile, token):
+def serve(args, profile: Profile, token: str | None):
     """Lock the profile state and run the single local gateway process."""
+    if profile.environment == "production" and args.allow_unauthenticated:
+        raise ValueError("production profiles cannot use --allow-unauthenticated")
     if not token and not args.allow_unauthenticated:
         raise ValueError("set access_token_env in the profile or opt in with --allow-unauthenticated")
-    directory = args.state.expanduser() / profile.name
+    directory = args.state.expanduser() / profile.state_path
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     with FileLock(str(directory / "gateway.lock"), timeout=0):
         journal = Journal(directory / "logs", profile.log_max_bytes)
@@ -108,12 +110,13 @@ def show_logs(directory: Path, limit: int, backend: str | None):
     sys.stdout.writelines(recent)
 
 
-def config_fragment(args, token_env: str | None) -> str:
+def config_fragment(args, profile: Profile) -> str:
     """Generate a client example that references environment secrets by name."""
     command, *leading = executable()
     argv = [*leading, "--profiles", str(args.profiles.expanduser().resolve()),
             "--profile", args.profile, "--port", str(args.port), "stdio"]
-    name = "ag-mcp-gateway"
+    name = profile.client_name
+    token_env = profile.access_token_env
     stdio = {"command": command, "args": argv}
     if args.client == "codex":
         lines = [f"[mcp_servers.{name}]", f"command = {json.dumps(command, ensure_ascii=False)}",
@@ -152,7 +155,7 @@ def main(argv=None) -> int:
     for library in ("mcp", "httpx", "httpcore"):
         logging.getLogger(library).setLevel(logging.CRITICAL)
     try:
-        if not 1 <= args.port <= 65535:
+        if args.port is not None and not 1 <= args.port <= 65535:
             raise ValueError("port must be in 1..65535")
         if args.command == "demo-profile":
             demo_profile(args.profiles.expanduser())
@@ -161,22 +164,23 @@ def main(argv=None) -> int:
             asyncio.run(serve_stdio(demo_server()))
             return 0
         profile = load_profile(args.profiles.expanduser(), args.profile)
+        args.port = profile.resolve_port(args.port)
         origin = f"http://127.0.0.1:{args.port}"
         if args.command == "config":
-            print(config_fragment(args, profile.access_token_env))
+            print(config_fragment(args, profile))
         elif args.command == "logs":
             if args.backend and args.backend not in profile.backends:
                 raise ValueError("unknown backend for this profile")
-            show_logs(args.state.expanduser() / profile.name, args.limit, args.backend)
+            show_logs(args.state.expanduser() / profile.state_path, args.limit, args.backend)
         else:
             token = secret(profile.access_token_env)
             if args.command == "serve":
                 serve(args, profile, token)
             elif args.command == "status":
-                status = asyncio.run(read_status(origin, profile.name, token, profile.timeout_seconds))
+                status = asyncio.run(read_status(origin, profile.endpoint_key, token, profile.timeout_seconds))
                 print(json.dumps(status, ensure_ascii=False, indent=2))
             else:
-                asyncio.run(bridge(origin, profile.name, token, profile.timeout_seconds + 5))
+                asyncio.run(bridge(origin, profile.endpoint_key, token, profile.timeout_seconds + 5))
         return 0
     except Timeout:
         _LOG.error("Profile state is already owned by another gateway process")

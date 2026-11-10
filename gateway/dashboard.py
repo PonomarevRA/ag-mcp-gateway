@@ -35,6 +35,8 @@ small, .muted { color: #445770; }
 }
 """
 
+_ENVIRONMENTS = {"test": "Тестовая среда", "production": "Production"}
+
 _METRICS = {
     "received": "Запросы",
     "upstream": "Вызовы MCP",
@@ -72,6 +74,8 @@ def tool_row(tool: dict, metrics: dict) -> str:
 
 def render(status: dict, query: str) -> str:
     """Render one dashboard snapshot without executing upstream text or links."""
+    label = _ENVIRONMENTS.get(status.get("environment"))
+    environment = f" · {label}" if label else ""
     metrics = status["metrics"]
     cards = "".join(
         f"<div><dt>{label}</dt><dd>{display(metrics['total'][key])}</dd></div>"
@@ -92,7 +96,7 @@ def render(status: dict, query: str) -> str:
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ag-mcp-gateway</title><link rel="stylesheet" href="/dashboard.css">
 <main>
-<header><div><h1>ag-mcp-gateway</h1><p>Профиль {escape(status['profile'])}</p></div>
+<header><div><h1>ag-mcp-gateway</h1><p>Профиль {escape(status['profile'])}{environment}</p></div>
 <a href="/">Обновить обзор</a></header>
 <section aria-labelledby="metrics"><h2 id="metrics">Вызовы с момента запуска</h2>
 <dl class="metrics">{cards}</dl>

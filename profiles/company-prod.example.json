@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "name": "company-prod",
+  "environment": "production",
+  "listen_port": 18794,
+  "access_token_env": "AG_GATEWAY_PROD_TOKEN",
+  "backends": {
+    "docs": {
+      "transport": "http",
+      "url": "https://mcp-prod.example.com/mcp",
+      "bearer_token_env": "DOCS_PROD_MCP_TOKEN"
+    }
+  },
+  "denied": ["docs.delete_page"],
+  "singleflight": []
+}

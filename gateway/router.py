@@ -97,6 +97,7 @@ class Router:
             })
         return {
             "profile": self.profile.name,
+            "environment": self.profile.environment,
             "backends": self.statuses.copy(),
             "catalog": catalog,
             "metrics": self.telemetry.snapshot(),

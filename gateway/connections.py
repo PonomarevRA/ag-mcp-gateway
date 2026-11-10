@@ -153,12 +153,16 @@ class BackendConnections:
                     await asyncio.to_thread(self.store.write, self.accounts[name], header)
                 except SecretStoreError as error:
                     raise ReauthorizationError("keychain-unavailable") from error
+            # The candidate can close while the system credential write is pending.
+            # Keep the old routes and leave the verified secret available for a new connection.
+            if candidate.session is None:
+                return False
             old = self.active[name]
             self.active[name] = candidate
             activated = True
             self.publish(name, candidate)
             self._track(self._retire(old))
-            return candidate.session is not None
+            return True
         finally:
             if candidate is not None and not activated:
                 await self._stop(candidate)

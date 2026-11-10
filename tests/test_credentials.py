@@ -3,6 +3,7 @@
 import asyncio
 import re
 from base64 import b64decode, b64encode
+from threading import Event
 
 import pytest
 from mcp import types
@@ -49,6 +50,7 @@ class FixtureSession:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.closed = asyncio.Event()
+        self.disconnect = asyncio.Event()
 
     async def call_tool(self, name, arguments, *, meta=None):
         """Hold a deliberate long-running fixture call until the test releases it."""
@@ -74,7 +76,8 @@ def gateway(tmp_path, monkeypatch):
         sessions[label] = session
         publish(name, session, {f"{name}.read": tool}, "ready")
         try:
-            await asyncio.Future()
+            await session.disconnect.wait()
+            publish(name, None, {}, "unavailable")
         finally:
             session.closed.set()
 
@@ -147,6 +150,42 @@ def test_rotation_drains_already_dispatched_tool(gateway):
             old.release.set()
             assert (await task).structuredContent == {"worker": "old"}
             await asyncio.wait_for(old.closed.wait(), 1)
+
+    asyncio.run(scenario())
+
+
+def test_candidate_eof_during_keychain_write_keeps_live_routes(gateway, monkeypatch):
+    """A verified secret may be saved while a disconnected candidate is discarded."""
+    router, store, account, sessions = gateway
+    writing = Event()
+    finish_write = Event()
+    write = store.write
+
+    def delayed_write(key, header):
+        """Hold the synthetic write long enough to close the candidate deterministically."""
+        writing.set()
+        assert finish_write.wait(3)
+        write(key, header)
+
+    monkeypatch.setattr(store, "write", delayed_write)
+
+    async def scenario():
+        """Force a transport EOF between verification and completion of the write."""
+        async with router.running():
+            old = sessions["old"]
+            rotation = asyncio.create_task(router.connections.rotate("grafana", _NEW))
+            try:
+                assert await asyncio.to_thread(writing.wait, 2)
+                candidate = sessions["new"]
+                candidate.disconnect.set()
+                await asyncio.wait_for(candidate.closed.wait(), 1)
+            finally:
+                finish_write.set()
+            assert await rotation is False
+            assert not old.closed.is_set()
+            assert store.values[account] == _NEW
+            result = await router.call("grafana.read", {})
+            assert result.structuredContent == {"worker": "old"}
 
     asyncio.run(scenario())
 

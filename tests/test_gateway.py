@@ -2,10 +2,13 @@
 
 import asyncio
 import json
+from threading import Event
 
 import pytest
 from mcp import types
+from starlette.testclient import TestClient
 
+from gateway.http_app import create_app
 from gateway.profile import Profile
 from gateway.router import Route, Router
 from gateway.telemetry import Journal, Telemetry
@@ -275,42 +278,51 @@ def test_background_startup_rejects_string_booleans():
 
 
 def test_background_lifespan_clears_stale_routes_and_cancels_pending_startup(tmp_path, monkeypatch):
-    """On lifespan restart, clear the old catalog and close a worker still discovering."""
-    async def scenario():
-        """Let the first worker discover and keep the second worker pending until shutdown."""
-        profile = Profile.model_validate({"name": "test", "backends": {
-            "slow": {"transport": "stdio", "command": "unused", "background_startup": True},
-        }})
-        router = Router(profile, Telemetry(Journal(tmp_path, 4096)))
-        first_ready = asyncio.Event()
-        second_started = asyncio.Event()
-        second_stopped = asyncio.Event()
+    """Restart the same HTTP app while keeping the second discovery pending."""
+    profile = Profile.model_validate({"name": "test", "backends": {
+        "slow": {"transport": "stdio", "command": "unused", "background_startup": True},
+    }})
+    router = Router(profile, Telemetry(Journal(tmp_path, 4096)))
+    first_ready = Event()
+    second_started = Event()
+    second_stopped = Event()
+
+    async def run_backend(name, config, timeout, publish, authorization, *, probe):
+        """Publish only the first generation and record cancellation of the second."""
         pending = asyncio.Event()
+        if not first_ready.is_set():
+            tool = types.Tool(name="read", inputSchema={"type": "object"})
+            publish(name, SlowSession(), {f"{name}.read": tool}, "ready")
+            first_ready.set()
+            await pending.wait()
+            return
+        try:
+            second_started.set()
+            await pending.wait()
+        finally:
+            second_stopped.set()
 
-        async def run_backend(name, config, timeout, publish, authorization, *, probe):
-            """Publish only the first generation and record cancellation of the second."""
-            if not first_ready.is_set():
-                tool = types.Tool(name="read", inputSchema={"type": "object"})
-                publish(name, SlowSession(), {f"{name}.read": tool}, "ready")
-                first_ready.set()
-                await pending.wait()
-                return
-            try:
-                second_started.set()
-                await pending.wait()
-            finally:
-                second_stopped.set()
+    def list_tools(client):
+        """Initialize and read the catalog over the actual stateless MCP endpoint."""
+        headers = {"Accept": "application/json, text/event-stream"}
+        request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-11-25", "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1"},
+        }}
+        initialized = client.post("/mcp/test", json=request, headers=headers).json()["result"]
+        headers["MCP-Protocol-Version"] = initialized["protocolVersion"]
+        reply = client.post("/mcp/test", json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                            headers=headers)
+        return [tool["name"] for tool in reply.json()["result"]["tools"]]
 
-        monkeypatch.setattr("gateway.connections.run_backend", run_backend)
-        async with router.running():
-            await asyncio.wait_for(first_ready.wait(), 1)
-            assert [tool.name for tool in router.visible_tools()] == ["slow.read"]
+    monkeypatch.setattr("gateway.connections.run_backend", run_backend)
+    app = create_app(router, 18792, None)
+    with TestClient(app, base_url="http://127.0.0.1:18792") as client:
+        assert first_ready.wait(2)
+        assert list_tools(client) == ["slow.read"]
 
-        async with asyncio.timeout(1):
-            async with router.running():
-                await second_started.wait()
-                assert router.statuses["slow"] == "starting"
-                assert router.visible_tools() == []
-        assert second_stopped.is_set()
-
-    asyncio.run(scenario())
+    with TestClient(app, base_url="http://127.0.0.1:18792") as client:
+        assert second_started.wait(2)
+        assert client.get("/api/status/test").json()["backends"] == {"slow": "starting"}
+        assert list_tools(client) == []
+    assert second_stopped.is_set()

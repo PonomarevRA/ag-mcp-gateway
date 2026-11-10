@@ -78,19 +78,24 @@ def create_app(router, port: int, token: str | None):
         return await router.call(params.name, params.arguments or {}, metadata=metadata)
 
     mcp = make_server(catalog, call)
-    manager = StreamableHTTPSessionManager(mcp, json_response=True, stateless=True)
 
     @asynccontextmanager
     async def lifespan(_app):
-        """Own router and SDK manager in the same ASGI lifecycle."""
+        """Publish a fresh SDK manager for each ASGI lifecycle."""
+        manager = StreamableHTTPSessionManager(mcp, json_response=True, stateless=True)
         async with router.running(), manager.run():
-            yield
+            yield {"mcp_manager": manager}
 
     class McpEndpoint:
         """Expose a raw ASGI endpoint without Starlette request coercion."""
 
         async def __call__(self, scope, receive, send):
-            """Preserve MCP method negotiation and streaming headers."""
+            """Dispatch through the SDK manager owned by this request's lifespan."""
+            manager = scope.get("state", {}).get("mcp_manager")
+            if manager is None:
+                response = PlainTextResponse("MCP gateway is unavailable", status_code=503)
+                await response(scope, receive, send)
+                return
             await manager.handle_request(scope, receive, send)
 
     async def overview(request):

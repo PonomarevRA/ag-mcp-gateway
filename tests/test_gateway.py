@@ -200,3 +200,117 @@ def test_profile_rejects_invalid_ports(port):
             "name": "company", "environment": "test", "listen_port": port,
             "backends": {"docs": {"transport": "stdio", "command": "unused"}},
         })
+
+
+@pytest.mark.parametrize("setting", [None, False, True])
+def test_startup_waits_only_for_required_backends(tmp_path, monkeypatch, setting):
+    """Expose the ready MCP while opt-in discovery runs and clean up all workers."""
+    async def scenario():
+        """Control discovery and route publication without relying on sleep durations."""
+        backend = {"transport": "stdio", "command": "unused"}
+        optional = backend.copy()
+        if setting is not None:
+            optional["background_startup"] = setting
+        profile = Profile.model_validate({"name": "test", "backends": {"fast": backend, "slow": optional}})
+        router = Router(profile, Telemetry(Journal(tmp_path, 4096)))
+        slow_started = asyncio.Event()
+        release_slow = asyncio.Event()
+        slow_published = asyncio.Event()
+        serving = asyncio.Event()
+        stop = asyncio.Event()
+        stopped = set()
+        session = SlowSession()
+        session.release.set()
+        tool = types.Tool(name="read", inputSchema={"type": "object"})
+
+        async def run_backend(name, config, timeout, publish, authorization, *, probe):
+            """Publish a real-looking catalog only when the test releases discovery."""
+            try:
+                if name == "slow":
+                    slow_started.set()
+                    await release_slow.wait()
+                publish(name, session, {f"{name}.read": tool}, "ready")
+                if name == "slow":
+                    slow_published.set()
+                await stop.wait()
+            finally:
+                stopped.add(name)
+
+        async def serve():
+            """Signal completion of the exact lifespan barrier used by the HTTP server."""
+            async with router.running():
+                serving.set()
+                await stop.wait()
+
+        monkeypatch.setattr("gateway.connections.run_backend", run_backend)
+        task = asyncio.create_task(serve())
+        try:
+            await asyncio.wait_for(slow_started.wait(), 1)
+            if setting:
+                await asyncio.wait_for(serving.wait(), 1)
+                assert router.snapshot()["backends"] == {"fast": "ready", "slow": "starting"}
+                assert [tool.name for tool in router.visible_tools()] == ["fast.read"]
+                assert not (await router.call("fast.read", {})).isError
+                assert (await router.call("slow.read", {})).isError
+            else:
+                assert not serving.is_set()
+            release_slow.set()
+            await asyncio.wait_for(slow_published.wait(), 1)
+            await asyncio.wait_for(serving.wait(), 1)
+            assert [tool.name for tool in router.visible_tools()] == ["fast.read", "slow.read"]
+        finally:
+            stop.set()
+            await asyncio.wait_for(task, 1)
+        assert stopped == {"fast", "slow"}
+
+    asyncio.run(scenario())
+
+
+def test_background_startup_rejects_string_booleans():
+    """Require explicit JSON booleans so a typo cannot change startup semantics."""
+    with pytest.raises(ValueError, match="background_startup"):
+        Profile.model_validate({"name": "test", "backends": {
+            "slow": {"transport": "http", "url": "https://example.com/mcp", "background_startup": "false"},
+        }})
+
+
+def test_background_lifespan_clears_stale_routes_and_cancels_pending_startup(tmp_path, monkeypatch):
+    """On lifespan restart, clear the old catalog and close a worker still discovering."""
+    async def scenario():
+        """Let the first worker discover and keep the second worker pending until shutdown."""
+        profile = Profile.model_validate({"name": "test", "backends": {
+            "slow": {"transport": "stdio", "command": "unused", "background_startup": True},
+        }})
+        router = Router(profile, Telemetry(Journal(tmp_path, 4096)))
+        first_ready = asyncio.Event()
+        second_started = asyncio.Event()
+        second_stopped = asyncio.Event()
+        pending = asyncio.Event()
+
+        async def run_backend(name, config, timeout, publish, authorization, *, probe):
+            """Publish only the first generation and record cancellation of the second."""
+            if not first_ready.is_set():
+                tool = types.Tool(name="read", inputSchema={"type": "object"})
+                publish(name, SlowSession(), {f"{name}.read": tool}, "ready")
+                first_ready.set()
+                await pending.wait()
+                return
+            try:
+                second_started.set()
+                await pending.wait()
+            finally:
+                second_stopped.set()
+
+        monkeypatch.setattr("gateway.connections.run_backend", run_backend)
+        async with router.running():
+            await asyncio.wait_for(first_ready.wait(), 1)
+            assert [tool.name for tool in router.visible_tools()] == ["slow.read"]
+
+        async with asyncio.timeout(1):
+            async with router.running():
+                await second_started.wait()
+                assert router.statuses["slow"] == "starting"
+                assert router.visible_tools() == []
+        assert second_stopped.is_set()
+
+    asyncio.run(scenario())

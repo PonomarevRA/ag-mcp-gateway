@@ -69,12 +69,18 @@ class BackendConnections:
 
     @asynccontextmanager
     async def running(self):
-        """Wait for initial discovery and finish credential transactions on shutdown."""
+        """Start all workers and wait only for MCPs required by profile startup."""
         self.closing = False
         try:
-            for name in self.profile.backends:
-                self.active[name] = self._start(name)
-            await asyncio.gather(*(worker.ready.wait() for worker in self.active.values()))
+            required = []
+            for name, config in self.profile.backends.items():
+                worker = self._start(name)
+                self.active[name] = worker
+                # A repeated ASGI lifespan must clear routes from the previous workers.
+                self.publish(name, worker)
+                if not config.background_startup:
+                    required.append(worker)
+            await asyncio.gather(*(worker.ready.wait() for worker in required))
             yield
         finally:
             self.closing = True

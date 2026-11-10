@@ -114,7 +114,7 @@ class Router:
             if isinstance(backend, HttpBackend):
                 if backend.basic_keychain:
                     auth = "basic"
-                elif backend.bearer_token_env:
+                elif backend.bearer_token_env or backend.bearer_token_keychain:
                     auth = "bearer"
             items.append({
                 "name": name,

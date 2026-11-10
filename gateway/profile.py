@@ -13,6 +13,7 @@ from .session_context import SessionField
 
 Identifier = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,32}$")]
 EnvName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]
+SecretKey = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")]
 ToolName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]{1,128}$")]
 Environment = Literal["test", "production"]
 _DEFAULT_PORTS = {None: 18792, "test": 18793, "production": 18794}
@@ -58,13 +59,14 @@ class HttpBackend(BackendOptions):
     transport: Literal["http"]
     url: str
     bearer_token_env: EnvName | None = None
+    bearer_token_keychain: SecretKey | None = None
     basic_keychain: bool = Field(default=False, strict=True)
 
     @model_validator(mode="after")
     def validate_authentication(self):
         """Choose at most one upstream authentication source."""
-        if self.basic_keychain and self.bearer_token_env:
-            raise ValueError("basic_keychain and bearer_token_env are mutually exclusive")
+        if self.basic_keychain and (self.bearer_token_env or self.bearer_token_keychain):
+            raise ValueError("basic_keychain and Bearer token references are mutually exclusive")
         if (self.forward_session_context or self.session_args) and not self.loopback:
             raise ValueError("session context forwarding requires a local MCP backend")
         return self
@@ -101,6 +103,8 @@ class Profile(BaseModel):
     environment: Environment | None = None
     listen_port: int | None = Field(default=None, ge=1, le=65535, strict=True)
     access_token_env: EnvName | None = None
+    access_token_keychain: SecretKey | None = None
+    management_bridge: bool = Field(default=False, strict=True)
     log_max_bytes: int = Field(default=100_000_000, ge=4096, le=1_000_000_000, strict=True)
     timeout_seconds: float = Field(default=30, gt=0, le=300)
     backends: dict[Identifier, Backend] = Field(min_length=1, max_length=32)
@@ -137,11 +141,14 @@ class Profile(BaseModel):
     @model_validator(mode="after")
     def validate_policy(self):
         """Require production authentication and validate configured tool policies."""
-        if self.environment == "production" and self.access_token_env is None:
-            raise ValueError("production profile requires access_token_env")
+        has_token = self.access_token_env is not None or self.access_token_keychain is not None
+        if self.environment == "production" and not has_token:
+            raise ValueError("production profile requires access_token_env or access_token_keychain")
         uses_keychain = any(isinstance(item, HttpBackend) and item.basic_keychain for item in self.backends.values())
-        if uses_keychain and self.access_token_env is None:
-            raise ValueError("basic_keychain requires a gateway access_token_env")
+        if uses_keychain and not has_token:
+            raise ValueError("basic_keychain requires a gateway access_token_env or access_token_keychain")
+        if self.management_bridge and not has_token:
+            raise ValueError("management_bridge requires a gateway token reference")
         if self.denied & self.singleflight:
             raise ValueError("denied and singleflight tool names overlap")
         for name in self.denied | self.singleflight:

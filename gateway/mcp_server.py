@@ -4,7 +4,7 @@ from mcp import McpError, types
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 _PAGE_SIZE = 100
 
 

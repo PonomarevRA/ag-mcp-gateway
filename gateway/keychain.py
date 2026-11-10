@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .credentials import SecretStoreError, valid_authorization
+from .token_secrets import valid_token
 
 _SERVICE = b"ag-mcp-gateway"
 _NOT_FOUND = -25300
@@ -50,7 +51,15 @@ class MacKeychain:
             self.release(ref)
 
     def read(self, account: str) -> str | None:
-        """Read one Basic header, releasing the Security-owned password buffer."""
+        """Read an existing Basic item using its original account namespace."""
+        return self._read(account, valid_authorization)
+
+    def read_token(self, key: str) -> str | None:
+        """Read a token in the namespace distinct from Basic accounts."""
+        return self._read(f"token/{key}", valid_token)
+
+    def _read(self, account: str, validate) -> str | None:
+        """Read and validate an ASCII value, then free the native password buffer."""
         name = account.encode("ascii")
         data = _POINTER()
         length = _SIZE()
@@ -64,7 +73,7 @@ class MacKeychain:
                 if not data or not 1 <= length.value <= 8192:
                     raise SecretStoreError("invalid Keychain item")
                 value = c.string_at(data, length.value).decode("ascii")
-                if not valid_authorization(value):
+                if not validate(value):
                     raise SecretStoreError("invalid Keychain item")
                 return value
             except UnicodeError as error:
@@ -74,11 +83,19 @@ class MacKeychain:
                     self.free_data(None, data)
 
     def write(self, account: str, authorization: str) -> None:
-        """Add or replace the generic password without passing its value to a subprocess."""
-        if not valid_authorization(authorization):
-            raise SecretStoreError("invalid credential header")
+        """Store Basic credentials under their existing account namespace."""
+        self._write(account, authorization, valid_authorization)
+
+    def write_token(self, key: str, value: str) -> None:
+        """Store a token without passing it through a subprocess."""
+        self._write(f"token/{key}", value, valid_token)
+
+    def _write(self, account: str, value: str, validate) -> None:
+        """Add or replace a validated generic password through Security.framework."""
+        if not validate(value):
+            raise SecretStoreError("invalid credential value")
         name = account.encode("ascii")
-        data = authorization.encode("ascii")
+        data = value.encode("ascii")
         item = _POINTER()
         with self._keychain() as keychain:
             status = self.find(keychain, len(_SERVICE), _SERVICE, len(name), name, None, None, c.byref(item))

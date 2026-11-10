@@ -140,11 +140,13 @@ def tool_groups(tools: list[dict], query: str, metrics: dict) -> tuple[dict[str,
     return groups, count
 
 
-def render(status: dict, query: str, *, credentials: bool = False) -> str:
+def render(status: dict, query: str, *, credentials: bool = False, management: bool = False) -> str:
     """Render one dashboard snapshot without executing upstream text or links."""
     label = _ENVIRONMENTS.get(status.get("environment"))
     environment = f" · {label}" if label else ""
-    management = '<a href="/credentials">Учётные данные MCP</a>' if credentials else ""
+    controls = '<a href="/credentials">Учётные данные MCP</a>' if credentials else ""
+    if management:
+        controls += '<a href="/settings">Настройки</a>'
     metrics = status["metrics"]
     cards = "".join(
         f"<div><dt>{label}</dt><dd>{display(metrics['total'][key])}</dd></div>"
@@ -164,7 +166,7 @@ def render(status: dict, query: str, *, credentials: bool = False) -> str:
 <title>ag-mcp-gateway</title><link rel="stylesheet" href="/dashboard.css">
 <main>
 <header><div><h1>ag-mcp-gateway</h1><p>Профиль {escape(status['profile'])}{environment}</p></div>
-<nav aria-label="Действия обзора"><a href="/">Обновить обзор</a>{management}</nav></header>
+<nav aria-label="Действия обзора"><a href="/">Обновить обзор</a>{controls}</nav></header>
 <section aria-labelledby="backends"><h2 id="backends">Каталог MCP-серверов</h2>
 <ul class="backends">{backends}</ul></section>
 <section aria-labelledby="metrics"><h2 id="metrics">Вызовы с момента запуска</h2>

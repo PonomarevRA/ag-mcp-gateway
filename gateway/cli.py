@@ -2,13 +2,17 @@
 
 import argparse
 import asyncio
+import getpass
 import json
 import logging
 import sys
+import warnings
 from collections import deque
+from hashlib import sha256
 from pathlib import Path
 
 import uvicorn
+from pydantic import TypeAdapter, ValidationError
 from filelock import FileLock, Timeout
 
 from .bridge import bridge, read_status
@@ -17,10 +21,12 @@ from .demo import demo_server
 from .http_app import create_app
 from .keychain import MacKeychain
 from .mcp_server import VERSION, serve_stdio
-from .profile import HttpBackend, Profile, load_profile, secret
+from .policy_settings import ToolPolicySettings
+from .profile import HttpBackend, Profile, SecretKey, load_profile
 from .router import Router
 from .session_context import SessionContext, add_session_options, session_from_cli
 from .telemetry import Journal, Telemetry
+from .token_secrets import resolve_token, valid_token
 
 _LOG = logging.getLogger("gateway")
 
@@ -65,6 +71,9 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--allow-unauthenticated", action="store_true", help="permit local clients without a token")
     stdio = commands.add_parser("stdio", help="attach an MCP stdio client to the running gateway")
     add_session_options(stdio)
+    commands.add_parser("mcp-bridge", help="attach the authenticated management MCP over stdio")
+    token_set = commands.add_parser("token-set", help="save one token in macOS Keychain using hidden input")
+    token_set.add_argument("key", help="symbolic Keychain reference")
     tag = commands.add_parser("session-tag", help="derive the journal tag for a declared session")
     add_session_options(tag)
     commands.add_parser("status", help="print status and metrics as JSON")
@@ -77,32 +86,36 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("demo-backend", help="run the synthetic stdio MCP backend")
     config = commands.add_parser("config", help="print a client configuration fragment")
     add_session_options(config)
+    config.add_argument("--management", action="store_true", help="print a separate management MCP entry")
     config.add_argument("client", choices=["codex", "cursor", "claude", "opencode", "deepseek", "acp"])
     return root
 
 
-def serve(args, profile: Profile, token: str | None):
+def serve(args, profile: Profile, token: str | None, store: MacKeychain | None):
     """Lock the profile state and run the single local gateway process."""
     if profile.environment == "production" and args.allow_unauthenticated:
         raise ValueError("production profiles cannot use --allow-unauthenticated")
     if not token and not args.allow_unauthenticated:
-        raise ValueError("set access_token_env in the profile or opt in with --allow-unauthenticated")
+        raise ValueError("configure a gateway token or opt in with --allow-unauthenticated")
     directory = args.state.expanduser() / profile.state_path
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     with FileLock(str(directory / "gateway.lock"), timeout=0):
         journal = Journal(directory / "logs", profile.log_max_bytes)
-        store = mac_keychain(profile)
         profile_file = args.profiles.expanduser() / f"{profile.name}.json"
         router = Router(profile, Telemetry(journal), store=store, profile_file=str(profile_file.resolve()))
-        app = create_app(router, args.port, token)
+        settings = ToolPolicySettings(router, directory / "tool-policy.json")
+        app = create_app(router, args.port, token, settings=settings)
         _LOG.info("Profile %s · http://127.0.0.1:%s/", profile.name, args.port)
         uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False, proxy_headers=False,
                     ws="none", log_level="warning", timeout_graceful_shutdown=10)
 
 
 def mac_keychain(profile: Profile) -> MacKeychain | None:
-    """Open the native provider only for profiles with opt-in Basic backends."""
-    needs_store = any(isinstance(item, HttpBackend) and item.basic_keychain for item in profile.backends.values())
+    """Open the native provider only when the selected profile references the OS store."""
+    needs_store = profile.access_token_keychain or any(
+        isinstance(item, HttpBackend) and (item.basic_keychain or item.bearer_token_keychain)
+        for item in profile.backends.values()
+    )
     if not needs_store or sys.platform != "darwin":
         return None
     try:
@@ -110,6 +123,25 @@ def mac_keychain(profile: Profile) -> MacKeychain | None:
     except (SecretStoreError, AttributeError):
         _LOG.warning("macOS Keychain is unavailable")
         return None
+
+
+def save_token(key: str) -> None:
+    """Read a token from a real terminal without echo and store it using Security.framework."""
+    try:
+        TypeAdapter(SecretKey).validate_python(key)
+    except ValidationError:
+        raise ValueError("invalid Keychain reference") from None
+    if sys.platform != "darwin":
+        raise ValueError("OS token storage currently requires macOS Keychain")
+    if not sys.stdin.isatty():
+        raise ValueError("token-set requires a terminal for hidden input")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        value = getpass.getpass("Token: ")
+    if not valid_token(value):
+        raise ValueError("invalid token format")
+    MacKeychain().write_token(key, value)
+    print("Token saved in macOS Keychain")
 
 
 def show_logs(directory: Path, limit: int, backend: str | None, session_tag: str | None,
@@ -145,11 +177,22 @@ def show_logs(directory: Path, limit: int, backend: str | None, session_tag: str
 def config_fragment(args, profile: Profile, session: SessionContext | None = None) -> str:
     """Generate a client example that references environment secrets by name."""
     command, *leading = executable()
+    management = getattr(args, "management", False)
+    if management and not profile.management_bridge:
+        raise ValueError("management_bridge is disabled for this profile")
+    if management and session is not None:
+        raise ValueError("management configuration does not accept caller session identity")
+    transport = "mcp-bridge" if management else "stdio"
     argv = [*leading, "--profiles", str(args.profiles.expanduser().resolve()),
-            "--profile", args.profile, "--port", str(args.port), "stdio"]
+            "--profile", args.profile, "--port", str(args.port), transport]
     if session is not None:
         argv.extend(session.cli_arguments())
     name = profile.client_name
+    if management:
+        suffix = "-manage"
+        if len(name) + len(suffix) > 32:
+            suffix = "-m-" + sha256(profile.endpoint_key.encode("ascii")).hexdigest()[:6]
+        name = name[:32 - len(suffix)] + suffix
     token_env = profile.access_token_env
     stdio = {"command": command, "args": argv}
     if args.client == "codex":
@@ -191,6 +234,9 @@ def main(argv=None) -> int:
     try:
         if args.port is not None and not 1 <= args.port <= 65535:
             raise ValueError("port must be in 1..65535")
+        if args.command == "token-set":
+            save_token(args.key)
+            return 0
         if args.command == "demo-profile":
             demo_profile(args.profiles.expanduser())
             return 0
@@ -214,18 +260,22 @@ def main(argv=None) -> int:
             show_logs(args.state.expanduser() / profile.state_path, args.limit, args.backend,
                       args.session_tag, args.trace_id)
         else:
-            token = secret(profile.access_token_env)
+            if args.command == "mcp-bridge" and not profile.management_bridge:
+                raise ValueError("management_bridge is disabled for this profile")
+            store = mac_keychain(profile)
+            token = resolve_token(profile.access_token_keychain, profile.access_token_env, store)
             if args.command == "serve":
-                serve(args, profile, token)
+                serve(args, profile, token, store)
             elif args.command == "status":
                 status = asyncio.run(read_status(origin, profile.endpoint_key, token, profile.timeout_seconds))
                 print(json.dumps(status, ensure_ascii=False, indent=2))
             else:
-                asyncio.run(bridge(origin, profile.endpoint_key, token, profile.timeout_seconds + 5, session))
+                asyncio.run(bridge(origin, profile.endpoint_key, token, profile.timeout_seconds + 5, session,
+                                   management=args.command == "mcp-bridge"))
         return 0
     except Timeout:
         _LOG.error("Profile state is already owned by another gateway process")
-    except (ValueError, FileExistsError) as error:
+    except (ValueError, FileExistsError, SecretStoreError) as error:
         _LOG.error("%s", error)
     except KeyboardInterrupt:
         return 130

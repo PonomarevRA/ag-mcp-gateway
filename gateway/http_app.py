@@ -2,7 +2,7 @@
 
 from base64 import b64decode
 from binascii import Error as Base64Error
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from hmac import compare_digest
 
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -13,6 +13,7 @@ from starlette.routing import Route
 
 from .credential_ui import CredentialsUI, SECURE_HTML
 from .dashboard import STYLE, render
+from .management import Management
 from .mcp_server import catalog_page, make_server
 from .trace_context import with_http_trace
 
@@ -53,7 +54,7 @@ class LocalBoundary:
             await response(scope, receive, send)
             return
         path = request.url.path
-        mcp = path.startswith("/mcp/")
+        mcp = path.startswith(("/mcp/", "/manage/"))
         credentials = path == "/credentials" or path.startswith("/credentials/")
         header = request.headers.get("authorization", "")
         if self.token and not authorized(header, self.token, basic=not mcp, bearer=not credentials):
@@ -65,9 +66,13 @@ class LocalBoundary:
         await self.app(scope, receive, send)
 
 
-def create_app(router, port: int, token: str | None):
+def create_app(router, port: int, token: str | None, *, settings=None):
     """Attach MCP, status JSON and credential management to one local profile."""
-    credentials = CredentialsUI(router.connections, f"http://127.0.0.1:{port}", bool(token))
+    origin = f"http://127.0.0.1:{port}"
+    credentials = CredentialsUI(router.connections, origin, bool(token))
+    management = None
+    if router.profile.management_bridge and token and settings is not None:
+        management = Management(router, settings, origin, credentials.enabled)
 
     async def catalog(cursor):
         """List one page of the currently visible gateway catalog."""
@@ -82,20 +87,32 @@ def create_app(router, port: int, token: str | None):
         return await router.call(params.name, params.arguments or {}, metadata=metadata)
 
     mcp = make_server(catalog, call)
+    servers = {"mcp_manager": mcp}
+    if management is not None:
+        servers["management_manager"] = management.server()
 
     @asynccontextmanager
     async def lifespan(_app):
         """Publish a fresh SDK manager for each ASGI lifecycle."""
-        manager = StreamableHTTPSessionManager(mcp, json_response=True, stateless=True)
-        async with router.running(), manager.run():
-            yield {"mcp_manager": manager}
+        async with AsyncExitStack() as stack:
+            await stack.enter_async_context(router.running())
+            state = {}
+            for key, server in servers.items():
+                manager = StreamableHTTPSessionManager(server, json_response=True, stateless=True)
+                await stack.enter_async_context(manager.run())
+                state[key] = manager
+            yield state
 
     class McpEndpoint:
         """Expose a raw ASGI endpoint without Starlette request coercion."""
 
+        def __init__(self, manager_key: str):
+            """Choose the fixed lifespan manager for this endpoint."""
+            self.manager_key = manager_key
+
         async def __call__(self, scope, receive, send):
             """Dispatch through the SDK manager owned by this request's lifespan."""
-            manager = scope.get("state", {}).get("mcp_manager")
+            manager = scope.get("state", {}).get(self.manager_key)
             if manager is None:
                 response = PlainTextResponse("MCP gateway is unavailable", status_code=503)
                 await response(scope, receive, send)
@@ -105,7 +122,7 @@ def create_app(router, port: int, token: str | None):
     async def overview(request):
         """Render a current sanitized snapshot and bound the text filter."""
         query = request.query_params.get("q", "")[:200]
-        page = render(router.snapshot(), query, credentials=credentials.enabled)
+        page = render(router.snapshot(), query, credentials=credentials.enabled, management=management is not None)
         return HTMLResponse(page, headers=SECURE_HTML)
 
     async def status(_request):
@@ -116,12 +133,22 @@ def create_app(router, port: int, token: str | None):
         """Serve the fixed local dashboard stylesheet."""
         return Response(STYLE, media_type="text/css", headers={"X-Content-Type-Options": "nosniff"})
 
-    app = Starlette(routes=[
-        Route(f"/mcp/{router.profile.endpoint_key}", McpEndpoint()),
+    async def settings_page(request):
+        """Render the same policy state exposed through the management MCP."""
+        value = request.query_params.get("offset", "")
+        offset = int(value) if value.isascii() and value.isdecimal() and len(value) <= 6 else 0
+        return HTMLResponse(management.page(offset), headers=SECURE_HTML)
+
+    routes = [
+        Route(f"/mcp/{router.profile.endpoint_key}", McpEndpoint("mcp_manager")),
         Route("/", overview),
         Route("/credentials", credentials.overview),
         Route("/credentials/{backend}", credentials.update, methods=["POST"]),
         Route(f"/api/status/{router.profile.endpoint_key}", status),
         Route("/dashboard.css", stylesheet),
-    ], lifespan=lifespan)
+    ]
+    if management is not None:
+        routes.extend([Route("/settings", settings_page),
+                       Route(f"/manage/{router.profile.endpoint_key}", McpEndpoint("management_manager"))])
+    app = Starlette(routes=routes, lifespan=lifespan)
     return LocalBoundary(app, port, token)

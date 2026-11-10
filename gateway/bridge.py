@@ -18,10 +18,11 @@ def local_client(token: str | None, timeout: float) -> httpx.AsyncClient:
 
 
 async def bridge(origin: str, profile: str, token: str | None, timeout: float,
-                 session: SessionContext | None = None):
-    """Present one stdio client while sharing the daemon's catalog and upstream workers."""
+                 session: SessionContext | None = None, *, management: bool = False):
+    """Present the selected local daemon surface as a standard MCP stdio client."""
+    surface = "manage" if management else "mcp"
     async with local_client(token, timeout) as http:
-        async with streamable_http_client(f"{origin}/mcp/{profile}", http_client=http) as streams:
+        async with streamable_http_client(f"{origin}/{surface}/{profile}", http_client=http) as streams:
             async with ClientSession(*streams[:2], read_timeout_seconds=timedelta(seconds=timeout)) as client:
                 await client.initialize()
 

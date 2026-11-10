@@ -9,6 +9,7 @@ from mcp import ClientSession, types
 from .connection_diagnostics import ConnectionProbe, FAILURE_LABELS
 from .credentials import SecretStore, SecretStoreError, credential_account
 from .profile import HttpBackend, Profile
+from .token_secrets import resolve_token
 from .upstream import run_backend
 
 
@@ -113,7 +114,8 @@ class BackendConnections:
             worker.ready.set()
 
         async def run():
-            """Load saved Basic credentials for the initial connection when needed."""
+            """Load the selected saved authentication before starting the transport."""
+            config = self.profile.backends[name]
             header = authorization
             if name in self.accounts and header is None:
                 try:
@@ -121,7 +123,18 @@ class BackendConnections:
                 except ReauthorizationError as error:
                     update(name, None, {}, str(error))
                     return
-            await run_backend(name, self.profile.backends[name], self.profile.timeout_seconds, update, header, probe=probe)
+            if isinstance(config, HttpBackend) and config.bearer_token_keychain:
+                try:
+                    token = await asyncio.to_thread(
+                        resolve_token, config.bearer_token_keychain, config.bearer_token_env, self.store)
+                except SecretStoreError:
+                    update(name, None, {}, "keychain-unavailable")
+                    return
+                except ValueError:
+                    update(name, None, {}, "credentials-missing")
+                    return
+                header = f"Bearer {token}"
+            await run_backend(name, config, self.profile.timeout_seconds, update, header, probe=probe)
 
         worker.task = self._track(run())
         return worker

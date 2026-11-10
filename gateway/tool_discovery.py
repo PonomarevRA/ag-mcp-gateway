@@ -1,6 +1,7 @@
 """Expose compact tool/skill discovery and explicit feedback through management MCP."""
 
 import asyncio
+from heapq import nsmallest
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
@@ -45,6 +46,7 @@ class Discovery:
         self.router = router
         self.feedback = feedback
         self.skills = skills
+        self._search_gate = asyncio.Semaphore(1)
         self.commands = {
             "gateway_tools_search": (Query, "Find suitable live MCP tools and approved skills. Results show measured latency and usefulness.", True, self.search),
             "gateway_tool_describe": (ToolReference, "Read one live allowed tool's full schemas, latency and usefulness.", True, self.describe),
@@ -80,37 +82,65 @@ class Discovery:
         return {"name": name, "backend": name.partition(".")[0], "title": (tool.title or "")[:120],
                 "description": (tool.description or "")[:600], **self.signals(name)}
 
-    def rank_tools(self, request: Query) -> list[dict]:
-        """Rank lexical relevance first and smoothed usefulness within ties."""
+    @staticmethod
+    def matching(request: Query, candidates, ratings):
+        """Yield candidate scores with lexical relevance ahead of usefulness."""
         terms = query_words(request.query)
-        matches = []
-        for name in self.router.routes:
-            if request.backend is not None and not name.startswith(request.backend + "."):
-                continue
-            route = self.available(name)
-            if route is None:
-                continue
+        for name, route in candidates:
             label = f"{name} {(route.tool.title or '')[:120]}"
             relevance = 3 * len(terms & query_words(label))
             relevance += len(terms & query_words((route.tool.description or "")[:600]))
             if name.casefold() == request.query.casefold():
                 relevance += 100
             if relevance:
-                helpful, votes = self.feedback.current(name)
-                matches.append((-relevance, -(helpful + 1) / (votes + 2), name, route))
-        matches.sort()
-        return [self.summary(name, route) for _, _, name, route in matches[:request.limit]]
+                helpful, votes = ratings.get(name, (0, 0))
+                yield -relevance, -(helpful + 1) / (votes + 2), name, route
+
+    def rank_tools(self, request: Query, candidates, ratings):
+        """Score a frozen catalogue off the event loop and keep only the best matches."""
+        matches = nsmallest(request.limit, self.matching(request, candidates, ratings))
+        return [(name, route) for _, _, name, route in matches]
+
+    def _finish_ranking(self, future: asyncio.Future):
+        """Release admission only after the worker actually finishes, even on client cancellation."""
+        self._search_gate.release()
+        if not future.cancelled():
+            future.exception()
+
+    async def find_tools(self, request: Query) -> tuple[int, list[dict]]:
+        """Run one ranking at a time and enforce the current catalogue before returning."""
+        await self._search_gate.acquire()
+        try:
+            revision = self.router.catalog_revision
+            prefix = request.backend + "." if request.backend is not None else ""
+            candidates = tuple((name, route) for name, route in self.router.routes.items()
+                               if name.startswith(prefix) and self.available(name) is route)
+            future = asyncio.get_running_loop().run_in_executor(
+                None, self.rank_tools, request, candidates, self.feedback.ranking_snapshot(),
+            )
+        except BaseException:
+            self._search_gate.release()
+            raise
+        future.add_done_callback(self._finish_ranking)
+        matches = await asyncio.shield(future)
+        if self.router.catalog_revision != revision:
+            raise FeedbackError("Catalog changed during discovery. Retry the search.")
+        cards = [self.summary(name, route) for name, route in matches if self.available(name) is route]
+        return revision, cards
 
     async def search(self, request: Query) -> dict:
         """Search both sources, or return only the requested category."""
         skills = []
         if request.kind != "tools" and self.skills is not None:
             result = await self.skills.search(SkillSearch(query=request.query, limit=request.limit))
-            skills = [item for item in result["skills"]
-                      if all(self.available(name) is not None for name in item["tools"])]
+            skills = result["skills"]
+        revision, tools = self.router.catalog_revision, []
+        if request.kind != "skills":
+            revision, tools = await self.find_tools(request)
+        skills = [item for item in skills if all(self.available(name) is not None for name in item["tools"])]
         return {
-            "catalog_revision": self.router.catalog_revision,
-            "tools": self.rank_tools(request) if request.kind != "skills" else [],
+            "catalog_revision": revision,
+            "tools": tools,
             "skills": skills,
             "skill_search_enabled": self.skills is not None,
         }

@@ -179,15 +179,16 @@ class Telemetry:
     def completed(self, tool, outcome, elapsed_ms, merged, input_bytes, output_bytes, *,
                   session_tag=None, trace_id=None):
         """Update rollups and append one sanitized event per inbound request."""
+        duration = round(elapsed_ms, 2)
         if self.history is not None and outcome == "ok" and not merged:
-            self.history.add(tool, elapsed_ms)
+            self.history.add(tool, duration)
         for counts in (self.total, self.tools.setdefault(tool, Counts())):
             counts.add_call(outcome, elapsed_ms, merged, input_bytes, output_bytes)
         event = {
             "at": datetime.now(timezone.utc).isoformat(),
             "tool": tool,
             "outcome": outcome,
-            "duration_ms": round(elapsed_ms, 2),
+            "duration_ms": duration,
             "joined": merged,
             "request_argument_bytes": input_bytes,
             "result_bytes": output_bytes,

@@ -2,6 +2,8 @@
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+from types import SimpleNamespace
 
 import pytest
 from mcp import types
@@ -13,7 +15,7 @@ from gateway.profile import Profile
 from gateway.router import Router
 from gateway.skill_store import SkillStore
 from gateway.telemetry import Journal, LatencyHistory, Telemetry
-from gateway.tool_discovery import DISCOVERY_META
+from gateway.tool_discovery import DISCOVERY_META, Discovery, Query
 from gateway.tool_feedback import FeedbackError, ToolFeedback
 
 TOKEN = "synthetic-agent-discovery"
@@ -45,6 +47,44 @@ def test_latency_history_restores_only_successful_non_joined_calls(tmp_path, mon
     assert second.tool_latency("demo.unknown") == (None, 0)
     event(second, "demo.read", 90)
     assert second.tool_latency("demo.read") == (60, 2)
+
+
+
+def test_latency_rounds_the_same_live_and_after_restart(tmp_path):
+    """Persist the exact centisecond observation used by the live mean."""
+    first = Telemetry(Journal(tmp_path, 4096), with_history=True)
+    event(first, "demo.read", 2.675)
+    restored = Telemetry(Journal(tmp_path, 4096), with_history=True)
+    assert first.tool_latency("demo.read") == restored.tool_latency("demo.read") == (2.67, 1)
+
+
+def test_search_ranking_yields_and_rechecks_policy(tmp_path, monkeypatch):
+    """Keep the event loop free while ranking and reject a changed route snapshot."""
+    started, finish = Event(), Event()
+
+    def held_rank(*_args):
+        """Signal the start of ranking and wait for the async policy change."""
+        started.set()
+        assert finish.wait(timeout=3)
+        return []
+
+    async def exercise():
+        """Change the catalogue before releasing the scoring thread."""
+        router = SimpleNamespace(catalog_revision=1, routes={}, profile=SimpleNamespace(denied=set()))
+        discovery = Discovery(router, ToolFeedback(tmp_path / "feedback.sqlite3"), None)
+        monkeypatch.setattr(discovery, "rank_tools", held_rank)
+        task = asyncio.create_task(discovery.search(Query(query="logs")))
+        try:
+            async with asyncio.timeout(2):
+                while not started.is_set():
+                    await asyncio.sleep(0.01)
+            router.catalog_revision += 1
+        finally:
+            finish.set()
+        with pytest.raises(FeedbackError, match="Catalog changed"):
+            await task
+
+    asyncio.run(exercise())
 
 
 def test_feedback_is_durable_idempotent_and_profile_local(tmp_path):

@@ -49,6 +49,11 @@ class ToolFeedback:
         with self._cache_lock:
             return self._ratings.get(tool, (0, 0))
 
+    def ranking_snapshot(self) -> dict[str, tuple[int, int]]:
+        """Freeze one small vote view for a whole discovery ranking."""
+        with self._cache_lock:
+            return self._ratings.copy()
+
     def connect(self):
         """Open an independent connection with the database growth limit applied."""
         db = sqlite3.connect(self.path, timeout=2)

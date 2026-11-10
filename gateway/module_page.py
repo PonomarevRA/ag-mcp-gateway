@@ -155,8 +155,8 @@ class ModulePage:
 <section aria-labelledby="editor"><h2 id="editor">Определение модуля</h2>
 <form class="module-form" method="post" action="/modules" data-ag-form-row="stack">{self.hidden("save", revision)}
 <div class="module-field" data-ag-form-field><label for="definition">Определение JSON</label>
-<p id="definition-help" class="muted">Операции: select, object, compare, contains, filter, aggregate, math, call.</p>
-<textarea id="definition" name="data" rows="11" maxlength="65536" aria-describedby="definition-help" required>{encoded(selected)}</textarea></div>
+<textarea id="definition" name="data" rows="11" maxlength="65536" aria-describedby="definition-help" required>{encoded(selected)}</textarea>
+<p id="definition-help" class="muted">Операции: select, object, compare, contains, filter, aggregate, math, call.</p></div>
 <button>Сохранить модуль</button></form>{delete}</section>
 <section aria-labelledby="hooks"><h2 id="hooks">Привязки к инструментам</h2>
 <ul class="tools">{"".join(hooks) or "<li>Привязок пока нет.</li>"}</ul>

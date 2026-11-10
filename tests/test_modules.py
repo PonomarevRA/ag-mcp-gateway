@@ -5,6 +5,7 @@ import json
 import re
 import time
 from base64 import b64encode
+from dataclasses import replace
 
 import pytest
 from mcp import types
@@ -299,6 +300,12 @@ def test_changed_definition_rejects_old_activation(fixture_gateway):
             cap = registry.sessions.open()["capability"]
             registry.activate(ActivateHook(expected_revision=1, capability=cap, tool="demo.read",
                                            phase="after", module="scope"))
+            route = router.routes["demo.read"]
+            revised_tool = route.tool.model_copy(update={"outputSchema": {"type": "object"}})
+            router.routes["demo.read"] = replace(route, tool=revised_tool)
+            rejected = await router.call("demo.read", {"value": "x"}, metadata={HOOK_META: cap})
+            assert rejected.isError and "Session hook changed" in rejected.content[0].text
+            router.routes["demo.read"] = route
             changed = definition("scope", {"op": "object", "fields": {"value": "/input/value"}})
             registry.save(Save(expected_revision=1, module=changed))
             result = await router.call("demo.read", {"value": "x"}, metadata={HOOK_META: cap})

@@ -33,6 +33,7 @@ from .skill_store import SkillStore
 from .skill_tools import SkillReference
 from .telemetry import Journal, Telemetry
 from .token_secrets import resolve_token, valid_token
+from .tool_feedback import ToolFeedback
 
 _LOG = logging.getLogger("gateway")
 
@@ -114,12 +115,15 @@ def serve(args, profile: Profile, token: str | None, store: MacKeychain | None):
     with FileLock(str(directory / "gateway.lock"), timeout=0):
         journal = Journal(directory / "logs", profile.log_max_bytes)
         profile_file = args.profiles.expanduser() / f"{profile.name}.json"
-        router = Router(profile, Telemetry(journal), store=store, profile_file=str(profile_file.resolve()))
+        discovery_enabled = profile.agent_discovery and bool(token)
+        telemetry = Telemetry(journal, with_history=discovery_enabled)
+        router = Router(profile, telemetry, store=store, profile_file=str(profile_file.resolve()))
         settings = ToolPolicySettings(router, directory / "tool-policy.json")
         skill_store = open_skills(args, profile) if profile.skill_router is not None and token else None
         if profile.modules_enabled and token:
             router.modules = ModuleRegistry(router, directory / "modules.json")
-        app = create_app(router, args.port, token, settings=settings, skill_store=skill_store)
+        feedback = ToolFeedback(directory / "tool-feedback.sqlite3") if discovery_enabled else None
+        app = create_app(router, args.port, token, settings=settings, skill_store=skill_store, feedback=feedback)
         _LOG.info("Profile %s · http://127.0.0.1:%s/", profile.name, args.port)
         uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False, proxy_headers=False,
                     ws="none", log_level="warning", timeout_graceful_shutdown=10)
@@ -320,7 +324,7 @@ def main(argv=None) -> int:
     except (ValueError, FileExistsError, SecretStoreError) as error:
         _LOG.error("%s", error)
     except sqlite3.Error:
-        _LOG.error("Skill storage is unavailable")
+        _LOG.error("SQLite storage is unavailable")
     except KeyboardInterrupt:
         return 130
     except Exception as error:

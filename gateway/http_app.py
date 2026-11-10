@@ -92,19 +92,23 @@ async def maintain_hooks(registry):
         await asyncio.sleep(60)
 
 
-def create_app(router, port: int, token: str | None, *, settings=None, skill_store=None):
+def create_app(router, port: int, token: str | None, *, settings=None, skill_store=None, feedback=None):
     """Attach MCP, status JSON and credential management to one local profile."""
     origin = f"http://127.0.0.1:{port}"
     credentials = CredentialsUI(router.connections, origin, bool(token))
     management = None
     if router.profile.management_bridge and token and settings is not None:
-        management = Management(router, settings, origin, credentials.enabled, skill_store)
+        management = Management(router, settings, origin, credentials.enabled, skill_store,
+                                feedback if router.profile.agent_discovery else None)
 
     modules = ModulePage(management.modules, origin, credentials.csrf) if management and management.modules else None
 
     async def catalog(cursor):
         """List one page of the currently visible gateway catalog."""
-        return catalog_page(router.visible_tools(), cursor, router.catalog_revision)
+        page = catalog_page(router.visible_tools(), cursor, router.catalog_revision)
+        if management is not None and management.discovery is not None:
+            management.discovery.decorate(page.tools)
+        return page
 
     async def call(params):
         """Pass per-request HTTP trace and MCP metadata to the router."""

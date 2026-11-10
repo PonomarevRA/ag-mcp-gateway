@@ -106,6 +106,7 @@ class Profile(BaseModel):
     access_token_env: EnvName | None = None
     access_token_keychain: SecretKey | None = None
     management_bridge: bool = Field(default=False, strict=True)
+    agent_discovery: bool = Field(default=False, strict=True)
     modules_enabled: bool = Field(default=False, strict=True)
     module_chain_tools: set[ToolName] = Field(default_factory=set, max_length=256)
     skill_router: SkillSettings | None = None
@@ -153,6 +154,8 @@ class Profile(BaseModel):
             raise ValueError("basic_keychain requires a gateway access_token_env or access_token_keychain")
         if self.management_bridge and not has_token:
             raise ValueError("management_bridge requires a gateway token reference")
+        if self.agent_discovery and not self.management_bridge:
+            raise ValueError("agent_discovery requires management_bridge")
         if self.module_chain_tools and not self.modules_enabled:
             raise ValueError("module_chain_tools requires modules_enabled")
         if self.modules_enabled and not self.management_bridge:

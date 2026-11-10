@@ -2,6 +2,9 @@
 
 import json
 import logging
+import math
+import re
+from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +38,77 @@ class Journal:
                     older.replace(newer)
         with current.open("ab") as sink:
             sink.write(line)
+
+
+    def recent_successes(self, max_bytes: int, limit: int) -> list[tuple[str, float]]:
+        """Read a bounded tail of retained successful non-joined journal events."""
+        samples = []
+        remaining = max_bytes
+        for path in self.paths:
+            if remaining <= 0 or len(samples) >= limit:
+                break
+            try:
+                with path.open("rb") as source:
+                    size = source.seek(0, 2)
+                    offset = max(0, size - remaining)
+                    source.seek(offset)
+                    data = source.read(remaining)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                _LOG.warning("Unable to read tool latency history")
+                break
+            remaining -= len(data)
+            if offset:
+                data = data.partition(b"\n")[2]
+            for line in reversed(data.splitlines()):
+                try:
+                    event = json.loads(line)
+                except (ValueError, UnicodeError, RecursionError):
+                    continue
+                if not isinstance(event, dict) or event.get("outcome") != "ok" or event.get("joined") is not False:
+                    continue
+                name, elapsed = event.get("tool"), event.get("duration_ms")
+                if (isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name) and "." in name and
+                        type(elapsed) in (int, float) and 0 <= elapsed < 86_400_000 and math.isfinite(elapsed)):
+                    samples.append((name, elapsed))
+                    if len(samples) == limit:
+                        break
+        samples.reverse()
+        return samples
+
+
+class LatencyHistory:
+    """Maintain per-tool means over a bounded profile-wide sample window."""
+
+    LIMIT = 10_000
+    STARTUP_BYTES = 4 * 1024 * 1024
+
+    def __init__(self, journal: Journal):
+        """Seed from the newest retained journal data, oldest samples first."""
+        self.samples = deque()
+        self.totals: dict[str, tuple[int, int]] = {}
+        for name, elapsed in journal.recent_successes(self.STARTUP_BYTES, self.LIMIT):
+            self.add(name, elapsed)
+
+    def add(self, name: str, elapsed: float):
+        """Insert one successful observation and remove the oldest one at capacity."""
+        centi_ms = round(elapsed * 100)
+        if len(self.samples) == self.LIMIT:
+            old_name, old_duration = self.samples.popleft()
+            total, count = self.totals[old_name]
+            if count == 1:
+                del self.totals[old_name]
+            else:
+                self.totals[old_name] = total - old_duration, count - 1
+        total, count = self.totals.get(name, (0, 0))
+        self.totals[name] = total + centi_ms, count + 1
+        self.samples.append((name, centi_ms))
+
+    def mean(self, name: str) -> tuple[float | None, int]:
+        """Return average gateway duration in milliseconds and the number of samples."""
+        total, count = self.totals.get(name, (0, 0))
+        return (round(total / (100 * count), 2), count) if count else (None, 0)
 
 
 @dataclass
@@ -79,13 +153,14 @@ class Counts:
 class Telemetry:
     """Record bounded tool identities and avoid storing arguments or results."""
 
-    def __init__(self, journal: Journal):
+    def __init__(self, journal: Journal, *, with_history: bool = False):
         """Start empty counters and append new request completions to the supplied journal."""
         self.journal = journal
         self.total = Counts()
         self.tools: dict[str, Counts] = {}
         self.journal_errors = 0
         self._last_upstream: dict[str, str] = {}
+        self.history = LatencyHistory(journal) if with_history else None
 
     def upstream_started(self, tool: str) -> None:
         """Count and timestamp an actual dispatch, including calls that return errors."""
@@ -97,9 +172,15 @@ class Telemetry:
         """Return the latest upstream dispatch time for this backend in UTC."""
         return self._last_upstream.get(backend)
 
+    def tool_latency(self, tool: str) -> tuple[float | None, int]:
+        """Expose observed successful latency when agent discovery is enabled."""
+        return self.history.mean(tool) if self.history is not None else (None, 0)
+
     def completed(self, tool, outcome, elapsed_ms, merged, input_bytes, output_bytes, *,
                   session_tag=None, trace_id=None):
         """Update rollups and append one sanitized event per inbound request."""
+        if self.history is not None and outcome == "ok" and not merged:
+            self.history.add(tool, elapsed_ms)
         for counts in (self.total, self.tools.setdefault(tool, Counts())):
             counts.add_call(outcome, elapsed_ms, merged, input_bytes, output_bytes)
         event = {

@@ -16,6 +16,8 @@ from .profile import HttpBackend, Identifier
 from .router import tool_error
 from .skill_store import SkillStore, SkillStoreError
 from .skill_tools import SkillTools
+from .tool_discovery import Discovery
+from .tool_feedback import FeedbackError, ToolFeedback
 
 
 class InspectQuery(BaseModel):
@@ -37,13 +39,14 @@ class ReconnectRequest(BaseModel):
 class Management:
     """Keep management commands separate from proxied tools and secret values."""
 
-    def __init__(self, router, settings, origin: str, credentials: bool, skill_store: SkillStore | None = None):
+    def __init__(self, router, settings, origin: str, credentials: bool, skill_store: SkillStore | None = None, feedback: ToolFeedback | None = None):
         """Bind this management surface to the selected profile and loopback origin."""
         self.router = router
         self.settings = settings
         self.origin = origin
         self.credentials = credentials
         self.skills = SkillTools(skill_store, router) if skill_store is not None else None
+        self.discovery = Discovery(router, feedback, self.skills) if feedback is not None else None
         self.modules = ModuleService(router.modules, router) if router.modules is not None else None
 
     def inspect(self, query: InspectQuery) -> dict:
@@ -113,14 +116,16 @@ class Management:
             "gateway_reconnect_mcp": (ReconnectRequest, "Reconnect one configured MCP and refresh its tool catalog."),
         }
         skill_commands = self.skills.commands if self.skills is not None else {}
+        discovery_commands = self.discovery.commands if self.discovery is not None else {}
         module_commands = self.modules.commands if self.modules is not None else {}
+        data_commands = {**skill_commands, **discovery_commands}
         tools = []
         for name, (model, description) in schemas.items():
             read_only = name == "gateway_inspect"
             tools.append(types.Tool(name=name, description=description, inputSchema=model.model_json_schema(),
                                     annotations=types.ToolAnnotations(readOnlyHint=read_only, openWorldHint=False)))
 
-        for name, (model, description, read_only, _) in {**skill_commands, **module_commands}.items():
+        for name, (model, description, read_only, _) in {**data_commands, **module_commands}.items():
             tools.append(types.Tool(name=name, description=description, inputSchema=model.model_json_schema(),
                                     annotations=types.ToolAnnotations(readOnlyHint=read_only, openWorldHint=False)))
 
@@ -143,17 +148,18 @@ class Management:
                 except OSError:
                     return tool_error("Unable to save module settings")
                 return types.CallToolResult(content=[], structuredContent=result)
-            if params.name in skill_commands:
-                model, _, _, execute = skill_commands[params.name]
+            if params.name in data_commands:
+                model, _, _, execute = data_commands[params.name]
+                scope = "discovery" if params.name in discovery_commands else "skill"
                 try:
                     query = model.model_validate(params.arguments or {})
                     result = await execute(query)
                 except ValidationError:
-                    return tool_error("Invalid skill arguments")
-                except SkillStoreError as error:
+                    return tool_error(f"Invalid {scope} arguments")
+                except (FeedbackError, SkillStoreError) as error:
                     return tool_error(str(error))
                 except (OSError, sqlite3.Error):
-                    return tool_error("Skill storage is unavailable")
+                    return tool_error(f"{scope.capitalize()} storage is unavailable")
                 return types.CallToolResult(content=[], structuredContent=result)
             if params.name not in schemas:
                 return tool_error("Unknown management tool")

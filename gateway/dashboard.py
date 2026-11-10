@@ -5,6 +5,7 @@ from html import escape
 from urllib.parse import urlencode
 
 from .connection_diagnostics import FAILURE_LABELS
+from .ui_locale import language, language_switch, tr
 
 CATALOG_PAGE_SIZE = 100
 
@@ -38,6 +39,8 @@ header, form { display: flex; align-items: end; justify-content: space-between;
   .module-nav { display: flex; flex-wrap: wrap; gap: .3rem; }
 }
 header nav { display: flex; flex-wrap: wrap; gap: .75rem; }
+.language-switch { margin-inline-start: auto; }
+.language-switch [aria-current] { font-weight: 700; text-decoration: underline; }
 a, input, button { color: inherit; }
 a:focus-visible, input:focus-visible, button:focus-visible { outline: 3px solid #3174c2; }
 a { padding: .4rem 0; }
@@ -83,7 +86,7 @@ summary { cursor: pointer; overflow-wrap: anywhere; }
 }
 """
 
-_ENVIRONMENTS = {"test": "Тестовая среда", "production": "Production"}
+_ENVIRONMENTS = {"test": "Тестовая среда", "production": "Рабочая среда"}
 
 _METRICS = {
     "received": "Запросы",
@@ -112,11 +115,11 @@ def tool_row(tool: dict, metrics: dict) -> str:
     if tool["singleflight"]:
         policy += " · singleflight"
     return (
-        f"<li><strong>{escape(name)}</strong> <small>{policy}</small>"
+        f"<li><strong>{escape(name)}</strong> <small>{tr(policy)}</small>"
         f"<p>{escape(tool['description'])}</p>"
-        f"<small>Запросы {display(counts.get('received', 0))} · "
+        f"<small>{tr("Запросы")} {display(counts.get('received', 0))} · "
         f"upstream {display(counts.get('upstream', 0))} · "
-        f"средняя задержка {display(counts.get('latency_mean_ms'))} мс</small></li>"
+        f"{tr('средняя задержка')} {display(counts.get('latency_mean_ms'))} {tr('мс')}</small></li>"
     )
 
 
@@ -128,17 +131,18 @@ def connection_status(state: str, authenticated: bool) -> str:
     else:
         title, tone = FAILURE_LABELS.get(state, ("Подключение недоступно", "error"))
         marker = ""
-    return f'<span class="status-badge status-{tone}">{marker}{escape(title)}</span>'
+    return f'<span class="status-badge status-{tone}">{marker}{escape(tr(title))}</span>'
 
 
 def last_call_line(timestamp: str | None) -> str:
     """Render a UTC dispatch time or explain the empty current-process history."""
-    value = "вызовов с запуска пока нет"
+    value = tr("вызовов с запуска пока нет")
     if timestamp is not None:
         time = datetime.fromisoformat(timestamp)
-        label = time.strftime("%d.%m.%Y %H:%M:%S UTC")
+        format_string = "%d.%m.%Y %H:%M:%S UTC" if language() == "ru" else "%Y-%m-%d %H:%M:%S UTC"
+        label = time.strftime(format_string)
         value = f'<time datetime="{escape(timestamp, quote=True)}">{label}</time>'
-    return f'<p class="muted">Последний вызов: {value}</p>'
+    return f'<p class="muted">{tr("Последний вызов")}: {value}</p>'
 
 
 def backend_card(backend: dict, can_manage: bool, tools_href: str | None, csrf: str | None) -> str:
@@ -150,20 +154,20 @@ def backend_card(backend: dict, can_manage: bool, tools_href: str | None, csrf: 
     auth_label = {"basic": "HTTP Basic", "bearer": "Bearer", "none": "Без входа через шлюз"}[auth]
     actions = []
     if tools_href:
-        actions.append(f'<a href="{escape(tools_href, quote=True)}">Инструменты</a>')
+        actions.append(f'<a href="{escape(tools_href, quote=True)}">{tr("Инструменты")}</a>')
     if auth == "basic" and can_manage:
         action = "Переавторизоваться" if state == "ready" else "Настроить подключение"
-        actions.append(f'<a href="/credentials?backend={name}">{action}</a>')
+        actions.append(f'<a href="/credentials?backend={name}">{tr(action)}</a>')
     if csrf is not None:
         actions.append(f'<form method="post" action="/reconnect/{name}">'
                        f'<input type="hidden" name="csrf" value="{escape(csrf, quote=True)}">'
-                       f'<button type="submit" aria-label="Переподключить {name}">Переподключить</button></form>')
+                       f'<button type="submit" aria-label="{tr("Переподключить")} {name}">{tr("Переподключить")}</button></form>')
     links = f'<div class="backend-actions">{"".join(actions)}</div>' if actions else ""
     return (
         f'<li id="backend-{name}"><div class="backend-heading"><h3>{name}</h3>'
         f'{connection_status(state, auth != "none")}</div>'
-        f'<p class="muted">{transport} · {auth_label}</p>'
-        f'<p>Доступных инструментов {display(backend["tools"])}</p>'
+        f'<p class="muted">{tr(transport)} · {tr(auth_label)}</p>'
+        f'<p>{tr("Доступных инструментов")} {display(backend["tools"])}</p>'
         f'{last_call_line(backend.get("last_call_at"))}{links}</li>'
     )
 
@@ -201,29 +205,29 @@ def catalog_navigation(page: dict | None, query: str) -> str:
     if page is None or page["total"] <= page["size"]:
         return ""
     offset, size, total = page["offset"], page["size"], page["total"]
-    links = [f"<span>{offset + 1}–{min(total, offset + size)} из {total}</span>"]
+    links = [f"<span>{offset + 1}–{min(total, offset + size)} {tr('из')} {total}</span>"]
     if offset:
         previous = escape(catalog_url(query, page["backend"], offset - size), quote=True)
-        links.append(f'<a rel="prev" href="{previous}">Назад</a>')
+        links.append(f'<a rel="prev" href="{previous}">{tr("Назад")}</a>')
     if offset + size < total:
         following = escape(catalog_url(query, page["backend"], offset + size), quote=True)
-        links.append(f'<a rel="next" href="{following}">Далее</a>')
-    return f'<nav aria-label="Страницы инструментов">{" ".join(links)}</nav>'
+        links.append(f'<a rel="next" href="{following}">{tr("Далее")}</a>')
+    return f'<nav aria-label="{tr("Страницы инструментов")}">{" ".join(links)}</nav>'
 
 
 def render(status: dict, query: str, *, credentials: bool = False, management: bool = False,
            reconnect_csrf: str | None = None, notice: str = "", modules: bool = False) -> str:
     """Render one dashboard snapshot without executing upstream text or links."""
     label = _ENVIRONMENTS.get(status.get("environment"))
-    environment = f" · {label}" if label else ""
-    controls = '<a href="/credentials">Учётные данные MCP</a>' if credentials else ""
+    environment = f" · {tr(label)}" if label else ""
+    controls = f'<a href="/credentials">{tr("Учётные данные MCP")}</a>' if credentials else ""
     if modules:
-        controls += '<a href="/modules">Модули</a>'
+        controls += f'<a href="/modules">{tr("Модули")}</a>'
     if management:
-        controls += '<a href="/settings">Настройки</a>'
+        controls += f'<a href="/settings">{tr("Настройки")}</a>'
     metrics = status["metrics"]
     cards = "".join(
-        f"<div><dt>{label}</dt><dd>{display(metrics['total'][key])}</dd></div>"
+        f"<div><dt>{tr(label)}</dt><dd>{display(metrics['total'][key])}</dd></div>"
         for key, label in _METRICS.items()
     )
     page = status.get("page")
@@ -234,7 +238,7 @@ def render(status: dict, query: str, *, credentials: bool = False, management: b
         if page["backend"]:
             backend = escape(page["backend"], quote=True)
             reset = escape(catalog_url(query, None), quote=True)
-            backend_filter = f'<input type="hidden" name="backend" value="{backend}"><a href="{reset}">Все MCP</a>'
+            backend_filter = f'<input type="hidden" name="backend" value="{backend}"><a href="{reset}">{tr("Все MCP")}</a>'
     cards_html = []
     for item in status["connections"]:
         name = item["name"]
@@ -248,26 +252,26 @@ def render(status: dict, query: str, *, credentials: bool = False, management: b
     catalog = "".join(
         f'<div><h3 id="tools-{escape(prefix)}">{escape(prefix)}</h3><ul class="tools">{"".join(rows)}</ul></div>'
         for prefix, rows in groups.items()
-    ) or '<ul class="tools"><li>Инструменты не найдены.</li></ul>'
+    ) or f'<ul class="tools"><li>{tr("Инструменты не найдены.")}</li></ul>'
     message = f'<p role="status">{escape(notice)}</p>' if notice else ""
     return f"""<!doctype html>
-<html lang="ru">
+<html lang="{language()}">
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ag-mcp-gateway</title><link rel="stylesheet" href="/dashboard.css">
 <main>
-<header><div><h1>ag-mcp-gateway</h1><p>Профиль {escape(status['profile'])}{environment}</p></div>
-<nav aria-label="Действия обзора"><a href="/">Обновить обзор</a>{controls}</nav></header>
-<section aria-labelledby="backends"><h2 id="backends">Каталог MCP-серверов</h2>
+<header><div><h1>ag-mcp-gateway</h1><p>{tr("Профиль")} {escape(status['profile'])}{environment}</p></div>
+<nav aria-label="{tr("Действия обзора")}"><a href="/">{tr("Обновить обзор")}</a>{controls}</nav>{language_switch()}</header>
+<section aria-labelledby="backends"><h2 id="backends">{tr("Каталог MCP-серверов")}</h2>
 {message}<ul class="backends">{backends}</ul></section>
-<section aria-labelledby="metrics"><h2 id="metrics">Вызовы с момента запуска</h2>
+<section aria-labelledby="metrics"><h2 id="metrics">{tr("Вызовы с момента запуска")}</h2>
 <dl class="metrics">{cards}</dl>
-<p class="muted">Оценка токенов по размеру JSON. Ошибки записи журнала {metrics["journal_errors"]}.</p>
+<p class="muted">{tr("Оценка токенов по размеру JSON. Ошибки записи журнала")} {metrics["journal_errors"]}.</p>
 </section>
-<section aria-labelledby="catalog"><h2 id="catalog">Инструменты · {count}</h2>
+<section aria-labelledby="catalog"><h2 id="catalog">{tr("Инструменты")} · {count}</h2>
 <form action="/" method="get">
-<label for="q">Имя или описание</label>
+<label for="q">{tr("Имя или описание")}</label>
 <input id="q" name="q" maxlength="200" value="{escape(query, quote=True)}">
-<button type="submit">Найти</button>{backend_filter}
+<button type="submit">{tr("Найти")}</button>{backend_filter}
 </form>
 {catalog_navigation(page, query)}
 {catalog}</section>

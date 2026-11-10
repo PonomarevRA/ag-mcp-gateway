@@ -9,6 +9,7 @@ from hmac import compare_digest
 
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from starlette.routing import Route
@@ -25,6 +26,7 @@ from .skill_tools import maintain_skill_cache
 from .telemetry import LOG_RETENTION_INTERVAL_SECONDS
 from .telemetry_api import TelemetryAPI
 from .trace_context import with_http_trace
+from .ui_locale import BrowserLocale, tr
 
 
 _LOG = logging.getLogger("gateway")
@@ -200,15 +202,15 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
         """Replace one selected MCP after local browser authentication and CSRF checks."""
         name = request.path_params["backend"]
         if not token or name not in router.profile.backends:
-            return PlainTextResponse("Not found", status_code=404, headers=SECURE_HTML)
+            return PlainTextResponse(tr("Не найдено"), status_code=404, headers=SECURE_HTML)
         if request.headers.get("origin") != origin:
-            return PlainTextResponse("Invalid form origin", status_code=403, headers=SECURE_HTML)
+            return PlainTextResponse(tr("Недопустимый источник формы"), status_code=403, headers=SECURE_HTML)
         try:
             fields = await read_form(request)
         except ValueError:
             fields = {}
         if set(fields) != {"csrf"} or not compare_digest(fields["csrf"].encode(), credentials.csrf.encode()):
-            return PlainTextResponse("Invalid form token", status_code=403, headers=SECURE_HTML)
+            return PlainTextResponse(tr("Недопустимый токен формы"), status_code=403, headers=SECURE_HTML)
         try:
             if await router.connections.reconnect(name):
                 return RedirectResponse(f"/#backend-{name}", status_code=303, headers=SECURE_HTML)
@@ -217,11 +219,11 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
         else:
             code = "connection-failed"
         if code == "busy":
-            return dashboard(notice=f"{name}: переподключение уже выполняется.", status_code=409)
+            return dashboard(notice=f"{name}: {tr('переподключение уже выполняется.')}", status_code=409)
         title, _tone = FAILURE_LABELS.get(code, ("Новое подключение не подтвердилось", "error"))
         worker = router.connections.active.get(name)
-        suffix = " Действующее подключение сохранено." if worker is not None and worker.live else ""
-        return dashboard(notice=f"{name}: {title}.{suffix}", status_code=502)
+        suffix = " " + tr("Действующее подключение сохранено.") if worker is not None and worker.live else ""
+        return dashboard(notice=f"{name}: {tr(title)}.{suffix}", status_code=502)
 
     async def status(_request):
         """Return profile status and metrics as machine-readable JSON."""
@@ -253,5 +255,5 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
         routes.extend([Route("/modules", modules.overview), Route("/modules", modules.submit, methods=["POST"])])
     if telemetry_api is not None:
         routes.extend(telemetry_api.routes())
-    app = Starlette(routes=routes, lifespan=lifespan)
+    app = Starlette(routes=routes, lifespan=lifespan, middleware=[Middleware(BrowserLocale)])
     return LocalBoundary(app, port, token)

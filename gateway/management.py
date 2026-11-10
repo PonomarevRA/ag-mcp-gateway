@@ -20,6 +20,7 @@ from .skill_store import SkillStore, SkillStoreError
 from .skill_tools import SkillTools
 from .tool_discovery import Discovery
 from .tool_feedback import FeedbackError, ToolFeedback
+from .ui_locale import language, language_switch, tr
 
 
 class InspectQuery(BaseModel):
@@ -226,37 +227,37 @@ class Management:
             link = ""
             if "credentials_url" in connection:
                 url = escape(connection["credentials_url"], quote=True)
-                link = f'<p><a href="{url}">Настроить Basic</a></p>'
+                link = f'<p><a href="{url}">{tr("Настроить Basic")}</a></p>'
             status = connection_status(connection["status"], connection["secret_preference"] != "none")
             last_call = last_call_line(connection["last_call_at"])
-            rows.append(f"<li><strong>{name}</strong> {status}<p>{preference}</p>{last_call}{link}</li>")
+            rows.append(f"<li><strong>{name}</strong> {status}<p>{tr(preference)}</p>{last_call}{link}</li>")
         policies = []
         labels = {"allow": "Разрешён", "deny": "Запрещён", "singleflight": "Singleflight"}
         for tool in current["tools"]:
-            label = labels[tool["policy"]]
+            label = tr(labels[tool["policy"]])
             if tool["policy"] == "singleflight" and tool["effective_policy"] != "singleflight":
-                label += " · приостановлен"
+                label += " · " + tr("приостановлен")
             policies.append(f'<li><strong>{escape(tool["tool"])}</strong> · {label}</li>')
         if not policies:
-            policies.append("<li>Инструменты не найдены.</li>")
+            policies.append(f"<li>{tr('Инструменты не найдены.')}</li>")
         links = []
         if offset:
-            links.append(f'<a href="/settings?offset={max(0, offset - 100)}">Назад</a>')
+            links.append(f'<a href="/settings?offset={max(0, offset - 100)}">{tr("Назад")}</a>')
         if current["next_offset"] is not None:
-            links.append(f'<a href="/settings?offset={current["next_offset"]}">Далее</a>')
+            links.append(f'<a href="/settings?offset={current["next_offset"]}">{tr("Далее")}</a>')
         gateway = self.router.profile
         token_source = "Хранилище ОС" if gateway.access_token_keychain else "Окружение"
         if gateway.access_token_keychain and gateway.access_token_env:
             token_source = "Хранилище ОС, затем окружение"
         return f"""<!doctype html>
-<html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Настройки MCP</title><link rel="stylesheet" href="/dashboard.css">
-<main><header><div><h1>Настройки MCP</h1><p>Профиль {escape(current["profile"])}</p></div>
-<a href="/">К каталогу</a></header><section aria-labelledby="policy"><h2 id="policy">Управление</h2>
-<p>MCP Bridge включён. Ревизия политики {current["revision"]}.</p>
-<p>Источник токена шлюза — {token_source}.</p></section>
-<section aria-labelledby="tool-policy"><h2 id="tool-policy">Политика инструментов</h2>
+<html lang="{language()}"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{tr("Настройки MCP")}</title><link rel="stylesheet" href="/dashboard.css">
+<main><header><div><h1>{tr("Настройки MCP")}</h1><p>{tr("Профиль")} {escape(current["profile"])}</p></div>
+<a href="/">{tr("К каталогу")}</a>{language_switch()}</header><section aria-labelledby="policy"><h2 id="policy">{tr("Управление")}</h2>
+<p>{tr("MCP Bridge включён. Ревизия политики")} {current["revision"]}.</p>
+<p>{tr("Источник токена шлюза")} · {tr(token_source)}.</p></section>
+<section aria-labelledby="tool-policy"><h2 id="tool-policy">{tr("Политика инструментов")}</h2>
 <ul class="tools">{"".join(policies)}</ul>
-<nav class="backend-actions" aria-label="Страницы инструментов">{"".join(links)}</nav></section>
-<section aria-labelledby="sources"><h2 id="sources">Источники учётных данных MCP</h2>
+<nav class="backend-actions" aria-label="{tr("Страницы инструментов")}">{"".join(links)}</nav></section>
+<section aria-labelledby="sources"><h2 id="sources">{tr("Источники учётных данных MCP")}</h2>
 <ul class="tools">{"".join(rows)}</ul></section></main></html>"""

@@ -11,6 +11,7 @@ from starlette.responses import HTMLResponse, PlainTextResponse, RedirectRespons
 from .credential_ui import SECURE_HTML, read_form
 from .module_data import MAX_DATA, ModuleError, parse_json
 from .module_registry import ActivateHook, Bind, Delete, HookCapability, PinHook, Run, Save, SetGenerations
+from .ui_locale import language, language_switch, module_error, tr
 
 EXAMPLE = {
     "id": "project",
@@ -27,6 +28,11 @@ OPS = {
 def encoded(value) -> str:
     """Serialize a document for an escaped, inert browser editor or preview."""
     return escape(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def empty_row(message: str) -> str:
+    """Render the localized empty state for a module list."""
+    return f"<li>{tr(message)}</li>"
 
 
 def options(values, *, blank: str | None = None) -> str:
@@ -63,118 +69,118 @@ class ModulePage:
         rules = current["generation_rules"]
         items = []
         for identity, life in sorted(current["hooks"].items()):
-            pin = "Снять закрепление" if life["pinned"] else "Закрепить"
+            pin = tr("Снять закрепление" if life["pinned"] else "Закрепить")
             pin_value = "no" if life["pinned"] else "yes"
             sessions = []
             for session in life["sessions"]:
                 sessions.append(f'<li><code>{session["id"]}</code> · {session_time(session["used_at"])}</li>')
-            protection = " · закреплён" if life["pinned"] else ""
+            protection = " · " + tr("закреплён") if life["pinned"] else ""
             expiry = ""
             if life["retention_deadline"] is not None:
-                expiry = f'<p class="muted">Порог очистки {session_time(life["retention_deadline"])} без активной привязки</p>'
+                expiry = f'<p class="muted">{tr("Порог очистки")} {session_time(life["retention_deadline"])} {tr("без активной привязки")}</p>'
             items.append(f"""<li><strong>{escape(current["modules"][identity]["title"])}</strong>
-<p>Gen{life["generation"]}{protection} · Сессий {len(sessions)}</p>{expiry}
-<details><summary>Выжившие сессии</summary><ul>{"".join(sessions) or "<li>Успешных сессий пока нет.</li>"}</ul></details>
+<p>Gen{life["generation"]}{protection} · {tr("Сессий")} {len(sessions)}</p>{expiry}
+<details><summary>{tr("Выжившие сессии")}</summary><ul>{"".join(sessions) or empty_row("Успешных сессий пока нет.")}</ul></details>
 <form method="post" action="/modules">{self.hidden("pin", revision)}
 <input type="hidden" name="id" value="{identity}"><input type="hidden" name="pinned" value="{pin_value}">
 <button>{pin}</button></form></li>""")
-        active = "".join(f'<li><code>{session["id"]}</code> · до {session_time(session["expires_at"])} · привязок {session["bindings"]}</li>'
+        active = "".join(f'<li><code>{session["id"]}</code> · {tr("до")} {session_time(session["expires_at"])} · {tr("привязок")} {session["bindings"]}</li>'
                          for session in current["active_sessions"])
-        local_options = options(local, blank="Снять активацию")
-        return f"""<section aria-labelledby="lifecycle"><h2 id="lifecycle">Хуки и сессии</h2>
-<p>Считается одно успешное применение на сессию. Срок неактивности Gen3, Gen2 и Gen1 — 1, 7 и 30 дней.</p>
-<ul class="tools">{"".join(items) or "<li>Локальных шаблонов пока нет.</li>"}</ul>
-<h3>Пороги выживания</h3>
+        local_options = options(local, blank=tr("Снять активацию"))
+        return f"""<section aria-labelledby="lifecycle"><h2 id="lifecycle">{tr("Хуки и сессии")}</h2>
+<p>{tr("Считается одно успешное применение на сессию. Срок неактивности Gen3, Gen2 и Gen1 — 1, 7 и 30 дней.")}</p>
+<ul class="tools">{"".join(items) or empty_row("Локальных шаблонов пока нет.")}</ul>
+<h3>{tr("Пороги выживания")}</h3>
 <form class="module-form" method="post" action="/modules" data-ag-form-row="stack">{self.hidden("generations", revision)}
-<div class="module-field" data-ag-form-field><label for="gen2">Сессий для Gen2</label>
+<div class="module-field" data-ag-form-field><label for="gen2">{tr("Сессий для Gen2")}</label>
 <input id="gen2" name="gen2" type="number" min="2" max="15" value="{rules["gen2_sessions"]}" required></div>
-<div class="module-field" data-ag-form-field><label for="gen1">Сессий для Gen1</label>
+<div class="module-field" data-ag-form-field><label for="gen1">{tr("Сессий для Gen1")}</label>
 <input id="gen1" name="gen1" type="number" min="3" max="16" value="{rules["gen1_sessions"]}" required></div>
-<button>Сохранить пороги</button></form>
-<h3>Активные сессии</h3><ul class="tools">{active or "<li>Активных сессий нет.</li>"}</ul>
-<form method="post" action="/modules">{self.hidden("open", revision)}<button>Открыть сессию на час</button></form>
-<details><summary>Управление активацией</summary>
+<button>{tr("Сохранить пороги")}</button></form>
+<h3>{tr("Активные сессии")}</h3><ul class="tools">{active or empty_row("Активных сессий нет.")}</ul>
+<form method="post" action="/modules">{self.hidden("open", revision)}<button>{tr("Открыть сессию на час")}</button></form>
+<details><summary>{tr("Управление активацией")}</summary>
 <form class="module-form" method="post" action="/modules" data-ag-form-row="stack">{self.hidden("activate", revision)}
-<div class="module-field" data-ag-form-field><label for="capability">Ключ сессии</label>
+<div class="module-field" data-ag-form-field><label for="capability">{tr("Ключ сессии")}</label>
 <input id="capability" name="capability" type="password" minlength="43" maxlength="43" autocomplete="off" required></div>
-<div class="module-field" data-ag-form-field><label for="session-tool">Инструмент сессии</label>
+<div class="module-field" data-ag-form-field><label for="session-tool">{tr("Инструмент сессии")}</label>
 <input id="session-tool" name="tool" list="module-tools" maxlength="128" required></div>
-<div class="module-field" data-ag-form-field><label for="session-phase">Этап сессии</label>
-<select id="session-phase" name="phase"><option value="before">До запроса</option><option value="after">После ответа</option></select></div>
-<div class="module-field" data-ag-form-field><label for="session-module">Шаблон сессии</label>
-<select id="session-module" name="module">{local_options}</select></div><button>Сохранить активацию</button></form>
+<div class="module-field" data-ag-form-field><label for="session-phase">{tr("Этап сессии")}</label>
+<select id="session-phase" name="phase"><option value="before">{tr("До запроса")}</option><option value="after">{tr("После ответа")}</option></select></div>
+<div class="module-field" data-ag-form-field><label for="session-module">{tr("Шаблон сессии")}</label>
+<select id="session-module" name="module">{local_options}</select></div><button>{tr("Сохранить активацию")}</button></form>
 <form class="module-form" method="post" action="/modules" data-ag-form-row="stack">{self.hidden("close", revision)}
-<div class="module-field" data-ag-form-field><label for="close-capability">Ключ закрываемой сессии</label>
+<div class="module-field" data-ag-form-field><label for="close-capability">{tr("Ключ закрываемой сессии")}</label>
 <input id="close-capability" name="capability" type="password" minlength="43" maxlength="43" autocomplete="off" required></div>
-<button>Закрыть сессию</button></form></details></section>"""
+<button>{tr("Закрыть сессию")}</button></form></details></section>"""
 
     def render(self, edit: str = "", *, tool_hint: str = "", notice: str = "", result: dict | None = None, status: int = 200):
         """Render bounded definitions, form actions and the last explicit run result."""
         current = self.service.registry.catalog()
         modules = current["modules"]
         revision = current["revision"]
-        selected = modules.get(edit, EXAMPLE)
+        selected = modules.get(edit, {**EXAMPLE, "title": tr(EXAMPLE["title"])})
         local = []
         items = []
         for identity, module in sorted(modules.items()):
             operations = [step["op"] for step in module["steps"]]
             if "call" not in operations:
                 local.append((identity, module["title"]))
-            labels = " → ".join(OPS[operation] for operation in operations)
+            labels = " → ".join(tr(OPS[operation]) for operation in operations)
             items.append(f'<li><a href="/modules?edit={identity}#editor">{escape(module["title"])}</a>'
                          f'<p class="muted">{identity} · {escape(labels)}</p></li>')
         hooks = []
         labels = {"before": "До запроса", "after": "После ответа"}
         for tool, phases in sorted(current["bindings"].items()):
             for phase, name in phases.items():
-                hooks.append(f'<li><strong>{escape(tool)}</strong> · {labels[phase]} · {escape(name)}</li>')
+                hooks.append(f'<li><strong>{escape(tool)}</strong> · {tr(labels[phase])} · {escape(name)}</li>')
         routes = set(self.service.router.routes) | set(current["bindings"])
         tool_options = options((tool, tool) for tool in sorted(routes)[:100])
         module_options = options((name, value["title"]) for name, value in sorted(modules.items()))
-        hook_options = options(local, blank="Снять привязку")
+        hook_options = options(local, blank=tr("Снять привязку"))
         bind_disabled = "" if routes else " disabled"
-        alert = f'<p role="status" class="module-message">{escape(notice)}</p>' if notice else ""
-        preview = (f'<div class="module-preview"><h3>Результат</h3><pre>{encoded(result["result"])}</pre></div>'
+        alert = f'<p role="status" class="module-message">{escape(tr(notice))}</p>' if notice else ""
+        preview = (f'<div class="module-preview"><h3>{tr("Результат")}</h3><pre>{encoded(result["result"])}</pre></div>'
                    if result is not None else "")
         delete = ""
         if edit in modules:
             delete = (f'<form method="post" action="/modules">{self.hidden("delete", revision)}'
-                      f'<input type="hidden" name="id" value="{edit}"><button>Удалить модуль</button></form>')
+                      f'<input type="hidden" name="id" value="{edit}"><button>{tr("Удалить модуль")}</button></form>')
         disabled = "" if modules else " disabled"
         html = f"""<!doctype html>
-<html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Модули MCP</title><link rel="stylesheet" href="/dashboard.css">
+<html lang="{language()}"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{tr("Модули MCP")}</title><link rel="stylesheet" href="/dashboard.css">
 <main class="module-layout">
-<nav class="module-nav" aria-label="Разделы"><a href="/">Каталог MCP</a>
-<a href="/settings">Настройки</a><a href="/modules" aria-current="page">Модули</a></nav>
-<div class="module-main"><header><div><h1>Модули MCP</h1>
-<p>Преобразования JSON, вычисления и цепочки чтения</p></div></header>{alert}
-<section aria-labelledby="library"><h2 id="library">Реестр</h2><p>Ревизия {revision}</p>
-<ul class="tools">{"".join(items) or "<li>Модули ещё не добавлены.</li>"}</ul>
-<a href="/modules#editor">Новый модуль</a></section>
-<section aria-labelledby="editor"><h2 id="editor">Определение модуля</h2>
+<nav class="module-nav" aria-label="{tr("Разделы")}"><a href="/">{tr("Каталог MCP")}</a>
+<a href="/settings">{tr("Настройки")}</a><a href="/modules" aria-current="page">{tr("Модули")}</a></nav>
+<div class="module-main"><header><div><h1>{tr("Модули MCP")}</h1>
+<p>{tr("Преобразования JSON, вычисления и цепочки чтения")}</p></div>{language_switch()}</header>{alert}
+<section aria-labelledby="library"><h2 id="library">{tr("Реестр")}</h2><p>{tr("Ревизия")} {revision}</p>
+<ul class="tools">{"".join(items) or empty_row("Модули ещё не добавлены.")}</ul>
+<a href="/modules#editor">{tr("Новый модуль")}</a></section>
+<section aria-labelledby="editor"><h2 id="editor">{tr("Определение модуля")}</h2>
 <form class="module-form" method="post" action="/modules" data-ag-form-row="stack">{self.hidden("save", revision)}
-<div class="module-field" data-ag-form-field><label for="definition">Определение JSON</label>
+<div class="module-field" data-ag-form-field><label for="definition">{tr("Определение JSON")}</label>
 <textarea id="definition" name="data" rows="11" maxlength="65536" aria-describedby="definition-help" required>{encoded(selected)}</textarea>
-<p id="definition-help" class="muted">Операции: select, object, compare, contains, filter, aggregate, math, call.</p></div>
-<button>Сохранить модуль</button></form>{delete}</section>
-<section aria-labelledby="hooks"><h2 id="hooks">Привязки к инструментам</h2>
-<ul class="tools">{"".join(hooks) or "<li>Привязок пока нет.</li>"}</ul>
+<p id="definition-help" class="muted">{tr("Операции: select, object, compare, contains, filter, aggregate, math, call.")}</p></div>
+<button>{tr("Сохранить модуль")}</button></form>{delete}</section>
+<section aria-labelledby="hooks"><h2 id="hooks">{tr("Привязки к инструментам")}</h2>
+<ul class="tools">{"".join(hooks) or empty_row("Привязок пока нет.")}</ul>
 <form class="module-form" method="post" action="/modules" data-ag-form-row="stack">{self.hidden("bind", revision)}
-<div class="module-field" data-ag-form-field><label for="tool">Инструмент</label>
+<div class="module-field" data-ag-form-field><label for="tool">{tr("Инструмент")}</label>
 <input id="tool" name="tool" value="{escape(tool_hint)}" list="module-tools" maxlength="128"
  aria-describedby="tool-help" required{bind_disabled}>
 <datalist id="module-tools">{tool_options}</datalist>
-<p id="tool-help" class="muted">Укажите полное имя из каталога. Подсказки показывают до 100 имён.</p></div>
-<div class="module-field" data-ag-form-field><label for="phase">Этап</label><select id="phase" name="phase"><option value="before">До запроса</option>
-<option value="after">После ответа</option></select></div>
-<div class="module-field" data-ag-form-field><label for="binding">Локальный модуль</label><select id="binding" name="module">{hook_options}</select></div>
-<button{bind_disabled}>Сохранить привязку</button></form></section>
-<section aria-labelledby="run"><h2 id="run">Ручной запуск</h2>
+<p id="tool-help" class="muted">{tr("Укажите полное имя из каталога. Подсказки показывают до 100 имён.")}</p></div>
+<div class="module-field" data-ag-form-field><label for="phase">{tr("Этап")}</label><select id="phase" name="phase"><option value="before">{tr("До запроса")}</option>
+<option value="after">{tr("После ответа")}</option></select></div>
+<div class="module-field" data-ag-form-field><label for="binding">{tr("Локальный модуль")}</label><select id="binding" name="module">{hook_options}</select></div>
+<button{bind_disabled}>{tr("Сохранить привязку")}</button></form></section>
+<section aria-labelledby="run"><h2 id="run">{tr("Ручной запуск")}</h2>
 <form class="module-form" method="post" action="/modules" data-ag-form-row="stack">{self.hidden("run", revision)}
-<div class="module-field" data-ag-form-field><label for="run-module">Модуль</label><select id="run-module" name="id" required{disabled}>{module_options}</select></div>
-<div class="module-field" data-ag-form-field><label for="run-data">Входной JSON</label><textarea id="run-data" name="data" rows="4" maxlength="65536" required{disabled}>{{"value": 42}}</textarea></div>
-<button{disabled}>Запустить модуль</button></form>{preview}</section>{self.lifecycle(current, local)}</div></main></html>"""
+<div class="module-field" data-ag-form-field><label for="run-module">{tr("Модуль")}</label><select id="run-module" name="id" required{disabled}>{module_options}</select></div>
+<div class="module-field" data-ag-form-field><label for="run-data">{tr("Входной JSON")}</label><textarea id="run-data" name="data" rows="4" maxlength="65536" required{disabled}>{{"value": 42}}</textarea></div>
+<button{disabled}>{tr("Запустить модуль")}</button></form>{preview}</section>{self.lifecycle(current, local)}</div></main></html>"""
         return HTMLResponse(html, status_code=status, headers=SECURE_HTML)
 
     async def overview(self, request):
@@ -184,13 +190,13 @@ class ModulePage:
     async def submit(self, request):
         """Validate browser origin and CSRF before making changes or running modules."""
         if request.headers.get("origin") != self.origin:
-            return PlainTextResponse("Invalid form origin", status_code=403, headers=SECURE_HTML)
+            return PlainTextResponse(tr("Недопустимый источник формы"), status_code=403, headers=SECURE_HTML)
         try:
             fields = await read_form(request, limit=3 * MAX_DATA + 1024, max_fields=7)
         except ValueError:
             return self.render(notice="Некорректная форма.", status=400)
         if not compare_digest(fields.get("csrf", "").encode(), self.csrf.encode()):
-            return PlainTextResponse("Invalid form token", status_code=403, headers=SECURE_HTML)
+            return PlainTextResponse(tr("Недопустимый токен формы"), status_code=403, headers=SECURE_HTML)
         try:
             action = fields.get("action")
             revision = self.revision(fields.get("revision", ""))
@@ -205,7 +211,7 @@ class ModulePage:
         except ValidationError:
             return self.render(notice="Проверьте поля и определение модуля.", status=400)
         except ModuleError as error:
-            return self.render(notice=str(error), status=400)
+            return self.render(notice=module_error(str(error)), status=400)
         except OSError:
             return self.render(notice="Не удалось сохранить настройки.", status=503)
         return RedirectResponse("/modules", status_code=303, headers=SECURE_HTML)

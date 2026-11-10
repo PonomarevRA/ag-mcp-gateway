@@ -62,7 +62,7 @@ def verify_boundary(command, token_env, token, origin, environment, other_token)
         assert client.get(f"/api/status/{environment}/company",
                           headers={"Authorization": f"Bearer {other_token}"}).status_code == 401
         page = client.get("/")
-        label = "Production" if environment == "production" else "Тестовая среда"
+        label = "Рабочая среда" if environment == "production" else "Тестовая среда"
         assert page.is_success and label in page.text
     with httpx.Client(trust_env=False, base_url=origin) as guest:
         assert guest.get("/").status_code == 401

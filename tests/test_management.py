@@ -116,6 +116,7 @@ def test_management_policy_cas_auth_and_restart(tmp_path, monkeypatch):
         assert {tool["name"] for tool in proxy} == {"local.read", "local.write"}
         initial = call(client, manage_path, "gateway_inspect", {"limit": 1})["structuredContent"]
         assert initial["views"]["settings"] == ORIGIN + "/settings" and initial["next_offset"] == 1
+        assert initial["connections"][0]["last_call_at"] is None
         assert GATEWAY not in json.dumps(initial) and "FIXTURE_GATEWAY" not in json.dumps(initial)
         forbidden = call(client, manage_path, "gateway_set_tool_policy",
                          {"tool": "local.write", "policy": "singleflight", "expected_revision": 0})
@@ -124,7 +125,9 @@ def test_management_policy_cas_auth_and_restart(tmp_path, monkeypatch):
         assert call(client, manage_path, "gateway_set_tool_policy", command)["structuredContent"]["revision"] == 1
         assert call(client, manage_path, "gateway_set_tool_policy", command)["isError"]
         assert call(client, proxy_path, "local.read", {})["isError"]
-        assert "Запрещён" in client.get("/settings", headers=HEADERS).text
+        settings_page = client.get("/settings", headers=HEADERS).text
+        assert "Запрещён" in settings_page and "Подключён без входа" in settings_page
+        assert "вызовов с запуска пока нет" in settings_page
 
         def fail_write(_state):
             """Simulate a disk failure before the replacement."""

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from threading import Event
 
 import pytest
@@ -45,6 +46,8 @@ def test_singleflight_cancellation_and_fresh_call(tmp_path):
         router.routes["a.read"] = Route(tool, session)
         first = asyncio.create_task(router.call("a.read", {"b": 2, "a": 1}))
         await session.entered.wait()
+        first_dispatch = telemetry.last_upstream_at("a")
+        assert first_dispatch is not None
         second = asyncio.create_task(router.call("a.read", {"a": 1, "b": 2}))
         await asyncio.sleep(0)
         first.cancel()
@@ -53,8 +56,11 @@ def test_singleflight_cancellation_and_fresh_call(tmp_path):
         session.release.set()
         assert (await second).structuredContent["args"] == {"a": 1, "b": 2}
         assert session.calls == 1
+        assert telemetry.last_upstream_at("a") == first_dispatch
         assert not (await router.call("a.read", {"a": 1, "b": 2})).isError
+        latest_dispatch = telemetry.last_upstream_at("a")
         assert (await router.call("a.write", {"private": "secret"})).isError
+        assert telemetry.last_upstream_at("a") == latest_dispatch
         assert session.calls == 2
         counts = telemetry.snapshot()["total"]
         assert counts["merged"] == 1
@@ -326,3 +332,28 @@ def test_background_lifespan_clears_stale_routes_and_cancels_pending_startup(tmp
         assert client.get("/api/status/test").json()["backends"] == {"slow": "starting"}
         assert list_tools(client) == []
     assert second_stopped.is_set()
+
+
+
+def test_last_call_is_per_backend_and_independent_of_connection_state(tmp_path):
+    """Publish a UTC dispatch time only for the attempted MCP, even on tool failure."""
+    class FailureSession:
+        async def call_tool(self, name, arguments, *, meta=None):
+            """Simulate a tool failure while keeping the connection available."""
+            return types.CallToolResult(content=[], isError=True)
+
+    profile = Profile.model_validate({"name": "test", "backends": {
+        "active": {"transport": "stdio", "command": "unused"},
+        "idle": {"transport": "stdio", "command": "unused"},
+    }})
+    router = Router(profile, Telemetry(Journal(tmp_path, 4096)))
+    router.statuses.update(active="ready", idle="auth-rejected")
+    router.routes["active.read"] = Route(types.Tool(name="read", inputSchema={}), FailureSession())
+    assert all(row["last_call_at"] is None for row in router.snapshot()["connections"])
+
+    assert asyncio.run(router.call("active.read", {})).isError
+    assert asyncio.run(router.call("idle.missing", {})).isError
+    active, idle = router.snapshot()["connections"]
+    assert active["status"] == "ready"
+    assert datetime.fromisoformat(active["last_call_at"]).tzinfo == timezone.utc
+    assert idle["status"] == "auth-rejected" and idle["last_call_at"] is None

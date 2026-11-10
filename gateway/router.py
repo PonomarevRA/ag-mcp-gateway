@@ -111,7 +111,7 @@ class Router:
         }
 
     def connection_catalog(self, tools: list[dict]) -> list[dict]:
-        """Summarize configured backends with readiness, auth mode and visible tool counts."""
+        """Summarize readiness, authentication, dispatch time and tool count per backend."""
         counts = dict.fromkeys(self.profile.backends, 0)
         for tool in tools:
             if not tool["denied"]:
@@ -131,6 +131,7 @@ class Router:
                 "transport": backend.transport,
                 "auth": auth,
                 "status": self.statuses[name],
+                "last_call_at": self.telemetry.last_upstream_at(name),
                 "tools": counts[name],
             })
         return items

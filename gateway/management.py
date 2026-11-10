@@ -6,6 +6,7 @@ from mcp import types
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .connections import ReauthorizationError
+from .dashboard import connection_status, last_call_line
 from .mcp_server import catalog_page, make_server
 from .policy_settings import PolicyChange
 from .profile import HttpBackend, Identifier
@@ -75,7 +76,12 @@ class Management:
                     source = "os_then_env" if config.bearer_token_env else "os"
                 elif config.bearer_token_env:
                     source = "env"
-            entry = {"backend": name, "status": self.router.statuses[name], "secret_preference": source}
+            entry = {
+                "backend": name,
+                "status": self.router.statuses[name],
+                "last_call_at": self.router.telemetry.last_upstream_at(name),
+                "secret_preference": source,
+            }
             if self.credentials and name in self.router.connections.accounts:
                 entry["credentials_url"] = f"{views['credentials']}?backend={name}"
             connections.append(entry)
@@ -144,7 +150,9 @@ class Management:
             if "credentials_url" in connection:
                 url = escape(connection["credentials_url"], quote=True)
                 link = f'<p><a href="{url}">Настроить Basic</a></p>'
-            rows.append(f"<li><strong>{name}</strong><p>{preference}</p>{link}</li>")
+            status = connection_status(connection["status"], connection["secret_preference"] != "none")
+            last_call = last_call_line(connection["last_call_at"])
+            rows.append(f"<li><strong>{name}</strong> {status}<p>{preference}</p>{last_call}{link}</li>")
         policies = []
         labels = {"allow": "Разрешён", "deny": "Запрещён", "singleflight": "Singleflight"}
         for tool in current["tools"]:

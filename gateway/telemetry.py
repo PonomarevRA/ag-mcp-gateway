@@ -85,11 +85,17 @@ class Telemetry:
         self.total = Counts()
         self.tools: dict[str, Counts] = {}
         self.journal_errors = 0
+        self._last_upstream: dict[str, str] = {}
 
     def upstream_started(self, tool: str) -> None:
-        """Count an actual dispatch, including an upstream that returns an error."""
+        """Count and timestamp an actual dispatch, including calls that return errors."""
         self.total.upstream += 1
         self.tools.setdefault(tool, Counts()).upstream += 1
+        self._last_upstream[tool.partition(".")[0]] = datetime.now(timezone.utc).isoformat()
+
+    def last_upstream_at(self, backend: str) -> str | None:
+        """Return the latest upstream dispatch time for this backend in UTC."""
+        return self._last_upstream.get(backend)
 
     def completed(self, tool, outcome, elapsed_ms, merged, input_bytes, output_bytes, *,
                   session_tag=None, trace_id=None):

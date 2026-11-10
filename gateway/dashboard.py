@@ -1,5 +1,6 @@
 """Render the read-only catalog and metrics as escaped, responsive HTML."""
 
+from datetime import datetime
 from html import escape
 
 from .connection_diagnostics import FAILURE_LABELS
@@ -97,6 +98,27 @@ def tool_row(tool: dict, metrics: dict) -> str:
     )
 
 
+def connection_status(state: str, authenticated: bool) -> str:
+    """Show the same connection state and accessible label on both dashboard pages."""
+    if state == "ready":
+        title, tone = ("Подключён без входа" if not authenticated else "Подключён"), "ready"
+        marker = '<span aria-hidden="true">✓</span> '
+    else:
+        title, tone = FAILURE_LABELS.get(state, ("Подключение недоступно", "error"))
+        marker = ""
+    return f'<span class="status-badge status-{tone}">{marker}{escape(title)}</span>'
+
+
+def last_call_line(timestamp: str | None) -> str:
+    """Render a UTC dispatch time or explain the empty current-process history."""
+    value = "вызовов с запуска пока нет"
+    if timestamp is not None:
+        time = datetime.fromisoformat(timestamp)
+        label = time.strftime("%d.%m.%Y %H:%M:%S UTC")
+        value = f'<time datetime="{escape(timestamp, quote=True)}">{label}</time>'
+    return f'<p class="muted">Последний вызов: {value}</p>'
+
+
 def backend_card(backend: dict, can_manage: bool, has_tool_group: bool) -> str:
     """Show confirmed transport readiness and relevant actions for one backend."""
     name = escape(backend["name"])
@@ -104,12 +126,6 @@ def backend_card(backend: dict, can_manage: bool, has_tool_group: bool) -> str:
     auth = backend["auth"]
     transport = "Локальный процесс · stdio" if backend["transport"] == "stdio" else "Streamable HTTP"
     auth_label = {"basic": "HTTP Basic", "bearer": "Bearer", "none": "Без входа через шлюз"}[auth]
-    if state == "ready":
-        title, tone = ("Подключён без входа" if auth == "none" else "Подключён"), "ready"
-        marker = '<span aria-hidden="true">✓</span> '
-    else:
-        title, tone = FAILURE_LABELS.get(state, ("Подключение недоступно", "error"))
-        marker = ""
     actions = []
     if has_tool_group:
         actions.append(f'<a href="#tools-{name}">Инструменты</a>')
@@ -119,9 +135,10 @@ def backend_card(backend: dict, can_manage: bool, has_tool_group: bool) -> str:
     links = f'<div class="backend-actions">{"".join(actions)}</div>' if actions else ""
     return (
         f'<li><div class="backend-heading"><h3>{name}</h3>'
-        f'<span class="status-badge status-{tone}">{marker}{escape(title)}</span></div>'
+        f'{connection_status(state, auth != "none")}</div>'
         f'<p class="muted">{transport} · {auth_label}</p>'
-        f'<p>Доступных инструментов {display(backend["tools"])}</p>{links}</li>'
+        f'<p>Доступных инструментов {display(backend["tools"])}</p>'
+        f'{last_call_line(backend.get("last_call_at"))}{links}</li>'
     )
 
 

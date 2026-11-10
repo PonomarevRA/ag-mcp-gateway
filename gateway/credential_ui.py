@@ -17,6 +17,7 @@ _MESSAGES = {
     "saved": "Подключение проверено. Учётные данные сохранены в Связке ключей.",
     "saved-offline": "Учётные данные сохранены. Новая сессия закрылась до переключения. Шлюз продолжит использовать прежнее подключение, если оно доступно.",
     "connected": "MCP подключён с сохранёнными учётными данными.",
+    "saved-disconnected": "Учётные данные сохранены. Текущее состояние подключения указано ниже.",
 }
 _ERRORS = {
     "invalid": (400, "Проверьте логин и пароль или строку Basic/Base64."),
@@ -44,6 +45,7 @@ class CredentialsUI:
         self.origin = origin
         self.enabled = enabled and bool(connections.accounts)
         self.csrf = token_urlsafe(32)
+        self.confirmations: dict[str, tuple[str, str]] = {}
 
     async def overview(self, request: Request) -> Response:
         """Render credential controls and fixed confirmation text."""
@@ -52,7 +54,8 @@ class CredentialsUI:
         selected = request.query_params.get("backend")
         if selected is not None and selected not in self.connections.accounts:
             return self._error("not-enabled")
-        return self._page(_MESSAGES.get(request.query_params.get("result", ""), ""), selected=selected)
+        receipt = request.query_params.get("confirmation")
+        return self._page(self._confirmation(selected, receipt), selected=selected)
 
     async def update(self, request: Request) -> Response:
         """Validate the protected form, then start one scoped credential transaction."""
@@ -89,7 +92,24 @@ class CredentialsUI:
             result = "connected"
         else:
             return self._error("connection-failed", name)
-        return RedirectResponse(f"/credentials?backend={name}&result={result}", status_code=303, headers=SECURE_HTML)
+        receipt = token_urlsafe(24)
+        self.confirmations[name] = (receipt, result)
+        location = f"/credentials?backend={name}&confirmation={receipt}"
+        return RedirectResponse(location, status_code=303, headers=SECURE_HTML)
+
+    def _confirmation(self, selected: str | None, receipt: str | None) -> str:
+        """Show the latest verified form result for this backend and its current state."""
+        confirmation = self.confirmations.get(selected) if selected is not None else None
+        if confirmation is None or receipt != confirmation[0]:
+            return ""
+        result = confirmation[1]
+        worker = self.connections.active.get(selected)
+        if worker is None or worker.status != "ready":
+            if result == "connected":
+                return ""
+            if result == "saved":
+                result = "saved-disconnected"
+        return _MESSAGES[result]
 
     def _error(self, code: str, selected: str | None = None) -> Response:
         """Translate known errors without exposing transport messages or form values."""

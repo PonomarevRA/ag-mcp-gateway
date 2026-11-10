@@ -102,16 +102,23 @@ async def discover(session: ClientSession, prefix: str):
 async def run_backend(prefix, config, timeout, publish, authorization: str | None = None):
     """Keep the discovered session alive and publish a sanitized failure on exit."""
     probe = ConnectionProbe()
+    failure_published = False
     try:
         async with open_session(config, timeout, authorization, probe) as (session, closed):
-            async with asyncio.timeout(timeout):
-                await session.initialize()
-                tools = await discover(session, prefix)
-            if not closed.is_set():
-                publish(prefix, session, tools, "ready")
-                await closed.wait()
+            try:
+                async with asyncio.timeout(timeout):
+                    await session.initialize()
+                    tools = await discover(session, prefix)
+                if not closed.is_set():
+                    publish(prefix, session, tools, "ready")
+                    await closed.wait()
+            except Exception as error:
+                status = probe.failure(error)
+            else:
+                status = probe.failure(None)
+            # Withdraw the route before SDK cleanup, which can await a remote DELETE.
+            publish(prefix, None, {}, status)
+            failure_published = True
     except Exception as error:
-        status = probe.failure(error)
-    else:
-        status = probe.failure(None)
-    publish(prefix, None, {}, status)
+        if not failure_published:
+            publish(prefix, None, {}, probe.failure(error))

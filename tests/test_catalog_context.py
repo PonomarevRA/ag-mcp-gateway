@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 
 import httpx
 import pytest
@@ -13,6 +14,7 @@ from gateway.profile import Profile
 from gateway.router import Route, Router
 from gateway.session_context import SESSION_META, SessionContext
 from gateway.telemetry import Journal, Telemetry
+from gateway.upstream import run_backend
 
 _IDENTITY = {"harness": "fixture", "instanceId": "local-fixture", "remoteSessionId": "fixture-chat-123"}
 
@@ -102,6 +104,51 @@ def test_http_status_diagnostic_ignores_response_text(status, code):
         await probe.response(httpx.Response(status, request=httpx.Request("POST", "http://127.0.0.1/mcp"),
                                             text="fixture-raw-response"))
         assert probe.failure(None) == code
+
+    asyncio.run(scenario())
+
+
+def test_lost_route_is_withdrawn_before_transport_teardown(monkeypatch):
+    """Simulate a slow HTTP close and observe the catalog update before teardown finishes."""
+    async def scenario():
+        """Control the disconnect and the cleanup independently."""
+        close = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        statuses = []
+
+        class Session:
+            async def initialize(self):
+                """Simulate a successfully initialized upstream."""
+
+        @asynccontextmanager
+        async def open_session(config, timeout, authorization, probe):
+            """Hold cleanup until the test confirms the route was withdrawn."""
+            yield Session(), close
+            cleanup_started.set()
+            await release_cleanup.wait()
+
+        async def discover(session, prefix):
+            """The fixture exposes an empty but successfully verified catalog."""
+            return {}
+
+        def publish(prefix, session, tools, status):
+            """Record the ordering of router notifications."""
+            statuses.append(status)
+
+        monkeypatch.setattr("gateway.upstream.open_session", open_session)
+        monkeypatch.setattr("gateway.upstream.discover", discover)
+        task = asyncio.create_task(run_backend("fixture", None, 1, publish))
+        try:
+            await asyncio.sleep(0)
+            assert statuses == ["ready"]
+            close.set()
+            await asyncio.wait_for(cleanup_started.wait(), 1)
+            assert statuses == ["ready", "unavailable (connection closed)"]
+        finally:
+            release_cleanup.set()
+            await asyncio.wait_for(task, 1)
+        assert len(statuses) == 2
 
     asyncio.run(scenario())
 

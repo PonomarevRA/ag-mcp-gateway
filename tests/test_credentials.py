@@ -137,6 +137,35 @@ def test_dashboard_verifies_then_saves_and_reuses_same_gateway_token(gateway):
         assert router.routes["grafana.read"].session.label == "new"
 
 
+def test_dashboard_confirmation_requires_verified_operation_and_current_connection(gateway):
+    """Reject invented receipts and keep the current status accurate after disconnect."""
+    router, _store, _account, sessions = gateway
+    browser = {"Authorization": _BROWSER}
+    with TestClient(create_app(router, 18794, _LOCAL_TOKEN), base_url=_ORIGIN) as client:
+        form = client.get("/credentials?backend=grafana&result=connected", headers=browser)
+        assert 'role="status"' not in form.text
+        fake = client.get("/credentials?backend=grafana&confirmation=invented", headers=browser)
+        assert 'role="status"' not in fake.text
+        csrf = re.search(r'name="csrf" value="([^"]+)"', form.text).group(1)
+        response = client.post("/credentials/grafana", headers={**browser, "Origin": _ORIGIN},
+                               data={"csrf": csrf, "operation": "save", "login": "new-user",
+                                     "password": "new-fixture-password"}, follow_redirects=False)
+        assert response.status_code == 303
+        location = response.headers["location"]
+        assert "Подключение проверено." in client.get(location, headers=browser).text
+
+        async def disconnect():
+            """Wait for the published worker to withdraw its route."""
+            session = sessions["new"]
+            session.disconnect.set()
+            await asyncio.wait_for(session.closed.wait(), 1)
+
+        client.portal.call(disconnect)
+        page = client.get(location, headers=browser).text
+        assert "Учётные данные сохранены." in page and "Подключение недоступно" in page
+        assert "Подключение проверено." not in page and "MCP подключён" not in page
+
+
 def test_rotation_drains_already_dispatched_tool(gateway):
     """Swap new requests immediately while letting the old generation finish its own call."""
     router, store, account, sessions = gateway

@@ -263,3 +263,45 @@ def test_basic_requires_gateway_authentication_and_excludes_bearer():
     data["backends"]["grafana"]["bearer_token_env"] = "UPSTREAM_TOKEN"
     with pytest.raises(ValueError, match="mutually exclusive"):
         Profile.model_validate(data)
+
+
+@pytest.mark.parametrize(("locale", "alternate", "error"), [
+    ("ru", "en", "Проверьте логин и пароль или строку Basic/Base64."),
+    ("en", "ru", "Check the username and password or the Basic/Base64 value."),
+])
+def test_rejected_basic_paste_returns_to_same_localized_form(gateway, locale, alternate, error):
+    """Keep retry visible and targeted, with no submitted credential in the response."""
+    router, store, account, _sessions = gateway
+    browser = {"Authorization": _BROWSER}
+    with TestClient(create_app(router, 18794, _LOCAL_TOKEN), base_url=_ORIGIN) as client:
+        first = client.get(f"/credentials?backend=grafana&lang={locale}", headers=browser)
+        csrf = re.search(r'name="csrf" value="([^"]+)"', first.text).group(1)
+        invalid = "fixture-invalid%%%"
+        failed = client.post("/credentials/grafana", headers={**browser, "Origin": _ORIGIN},
+                             data={"csrf": csrf, "operation": "paste", "basic": invalid})
+        assert failed.status_code == 400 and failed.headers["content-language"] == locale
+        assert f'<p id="credential-feedback" role="alert">{error}</p>' in failed.text
+        assert "<details open>" in failed.text
+        assert re.search(r'id="grafana-basic"[^>]*aria-describedby="credential-feedback" aria-invalid="true" autofocus',
+                         failed.text)
+        assert f'href="/credentials?backend=grafana&amp;lang={alternate}"' in failed.text
+        assert invalid not in failed.text and store.values[account] == _OLD
+        next_page = client.get(f"/credentials?backend=grafana&lang={alternate}", headers=browser)
+        assert next_page.headers["content-language"] == alternate
+        assert 'id="grafana-basic"' in next_page.text and "<details open>" not in next_page.text
+
+
+def test_generic_verification_failure_names_retained_connection(gateway):
+    """Tell the operator that a live route survived even without a specific upstream error code."""
+    router, store, account, _sessions = gateway
+    browser = {"Authorization": _BROWSER}
+    with TestClient(create_app(router, 18794, _LOCAL_TOKEN), base_url=_ORIGIN) as client:
+        first = client.get("/credentials?backend=grafana&lang=en", headers=browser)
+        csrf = re.search(r'name="csrf" value="([^"]+)"', first.text).group(1)
+        failed = client.post("/credentials/grafana", headers={**browser, "Origin": _ORIGIN},
+                             data={"csrf": csrf, "operation": "save", "login": "unrecognized",
+                                   "password": "fixture-rejected"})
+        assert failed.status_code == 502
+        assert "The existing connection is still active." in failed.text
+        assert "fixture-rejected" not in failed.text
+        assert store.values[account] == _OLD and router.routes["grafana.read"].session.label == "old"

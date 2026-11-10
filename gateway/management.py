@@ -2,13 +2,19 @@
 
 import sqlite3
 from bisect import bisect_left
+from hmac import compare_digest
 from html import escape
+from secrets import token_urlsafe
+from urllib.parse import urlencode
 
 from mcp import types
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 
 from .agent_diagnostics import AgentDiagnostics
 from .connections import ReauthorizationError
+from .credential_ui import SECURE_HTML, read_form
 from .dashboard import connection_status, last_call_line
 from .mcp_server import catalog_page, make_server
 from .module_data import ModuleError
@@ -21,6 +27,22 @@ from .skill_tools import SkillTools
 from .tool_discovery import Discovery
 from .tool_feedback import FeedbackError, ToolFeedback
 from .ui_locale import language, language_switch, tr
+
+
+_POLICY_LABELS = {"allow": "Разрешён", "deny": "Запрещён", "singleflight": "Singleflight"}
+_PAGE_SIZE = 100
+
+
+def _settings_url(offset: int, backend: str | None, receipt: str | None = None) -> str:
+    """Build a settings URL that preserves the current browser scope."""
+    params = {}
+    if backend:
+        params["backend"] = backend
+    if offset:
+        params["offset"] = offset
+    if receipt:
+        params["saved"] = receipt
+    return "/settings" + ("?" + urlencode(params) if params else "")
 
 
 class InspectQuery(BaseModel):
@@ -42,12 +64,15 @@ class ReconnectRequest(BaseModel):
 class Management:
     """Keep management commands separate from proxied tools and secret values."""
 
-    def __init__(self, router, settings, origin: str, credentials: bool, skill_store: SkillStore | None = None, feedback: ToolFeedback | None = None, telemetry_api=None):
+    def __init__(self, router, settings, origin: str, credentials: bool, skill_store: SkillStore | None = None,
+                 feedback: ToolFeedback | None = None, telemetry_api=None, *, csrf: str | None = None):
         """Bind this management surface to the selected profile and loopback origin."""
         self.router = router
         self.settings = settings
         self.origin = origin
         self.credentials = credentials
+        self.csrf = csrf
+        self.confirmation: tuple[str, int, str] | None = None
         self._policy_key: tuple[int, int] | None = None
         self._policy_names: tuple[str, ...] = ()
         self.skills = SkillTools(skill_store, router) if skill_store is not None else None
@@ -215,13 +240,71 @@ class Management:
 
         return make_server(catalog, call)
 
-    def page(self, offset: int) -> str:
-        """Render saved tool policies and credential entry points for operators."""
-        current = self.inspect(InspectQuery(offset=offset))
+    def _browser_query(self, request: Request) -> tuple[int, str | None]:
+        """Align browser offsets and use only a backend configured on this profile."""
+        value = request.query_params.get("offset", "")
+        offset = int(value) if value.isascii() and value.isdecimal() and len(value) <= 6 else 0
+        backend = request.query_params.get("backend")
+        return offset - offset % _PAGE_SIZE, backend if backend in self.router.profile.backends else None
+
+    async def overview(self, request: Request) -> Response:
+        """Render one policy page and report a current verified save, when present."""
+        offset, backend = self._browser_query(request)
+        notice = ""
+        if self.confirmation is not None:
+            receipt, revision, message = self.confirmation
+            if request.query_params.get("saved") == receipt and self.settings.state.revision == revision:
+                notice = message
+        return HTMLResponse(self.page(offset, backend, notice=notice), headers=SECURE_HTML)
+
+    async def submit(self, request: Request) -> Response:
+        """Apply one same-origin browser policy edit through the Bridge's CAS path."""
+        if self.csrf is None:
+            return PlainTextResponse(tr("Не найдено"), status_code=404, headers=SECURE_HTML)
+        if request.headers.get("origin") != self.origin:
+            return PlainTextResponse(tr("Недопустимый источник формы"), status_code=403, headers=SECURE_HTML)
+        offset, backend = self._browser_query(request)
+        try:
+            fields = await read_form(request, limit=4096, max_fields=4)
+        except ValueError:
+            fields = {}
+        if not compare_digest(fields.pop("csrf", "").encode(), self.csrf.encode()):
+            return PlainTextResponse(tr("Недопустимый токен формы"), status_code=403, headers=SECURE_HTML)
+        try:
+            if set(fields) != {"tool", "policy", "expected_revision"}:
+                raise ValueError("invalid policy form")
+            raw_revision = fields["expected_revision"]
+            if not raw_revision.isascii() or not raw_revision.isdecimal() or len(raw_revision) > 19:
+                raise ValueError("invalid policy revision")
+            change = PolicyChange(tool=fields["tool"], policy=fields["policy"],
+                                  expected_revision=int(raw_revision))
+        except ValueError:
+            return self._policy_error(offset, backend, "Проверьте инструмент и политику.", 400)
+        if change.expected_revision != self.settings.state.revision:
+            return self._policy_error(offset, backend, "Политика уже изменилась. Проверьте текущую версию и повторите.", 409)
+        try:
+            revision = self.settings.change(change)
+        except ValueError:
+            return self._policy_error(offset, backend, "Эта политика сейчас недоступна для инструмента.", 400)
+        except OSError:
+            return self._policy_error(offset, backend, "Не удалось сохранить политику. Повторите позже.", 503)
+        message = "Политика уже актуальна." if revision == change.expected_revision else "Политика сохранена."
+        receipt = token_urlsafe(24)
+        self.confirmation = (receipt, revision, message)
+        return RedirectResponse(_settings_url(offset, backend, receipt) + "#tool-policy",
+                                status_code=303, headers=SECURE_HTML)
+
+    def _policy_error(self, offset: int, backend: str | None, message: str, status: int) -> Response:
+        """Show current policy data after a rejected edit without reflecting form text."""
+        return HTMLResponse(self.page(offset, backend, notice=message, error=True),
+                            status_code=status, headers=SECURE_HTML)
+
+    def _connection_rows(self, connections: list[dict]) -> str:
+        """Render credential entry points and status for the selected MCPs."""
         rows = []
         sources = {"os": "Хранилище ОС", "os_then_env": "Хранилище ОС, затем окружение",
                    "env": "Окружение", "none": "Без учётных данных"}
-        for connection in current["connections"]:
+        for connection in connections:
             name = escape(connection["backend"])
             preference = sources[connection["secret_preference"]]
             link = ""
@@ -231,24 +314,89 @@ class Management:
             status = connection_status(connection["status"], connection["secret_preference"] != "none")
             last_call = last_call_line(connection["last_call_at"])
             rows.append(f"<li><strong>{name}</strong> {status}<p>{tr(preference)}</p>{last_call}{link}</li>")
-        policies = []
-        labels = {"allow": "Разрешён", "deny": "Запрещён", "singleflight": "Singleflight"}
-        for tool in current["tools"]:
-            label = tr(labels[tool["policy"]])
-            if tool["policy"] == "singleflight" and tool["effective_policy"] != "singleflight":
+        return "".join(rows)
+
+    def _policy_form(self, tool: dict, revision: int, action: str) -> str:
+        """Render only choices allowed by the current tool or its configured baseline."""
+        if self.csrf is None:
+            return ""
+        name = tool["tool"]
+        route = self.router.routes.get(name)
+        annotations = route.tool.annotations if route is not None else None
+        singleflight_allowed = name in self.settings.baseline_singleflight or bool(
+            annotations and annotations.readOnlyHint is True
+        )
+        options = []
+        for policy, label in _POLICY_LABELS.items():
+            current = policy == tool["policy"]
+            if policy == "singleflight" and not singleflight_allowed and not current:
+                continue
+            selected = " selected" if current else ""
+            disabled = " disabled" if policy == "singleflight" and not singleflight_allowed else ""
+            options.append(f'<option value="{policy}"{selected}{disabled}>{tr(label)}</option>')
+        escaped_name = escape(name, quote=True)
+        select_label = escape(tr("Политика для {tool}").format(tool=name), quote=True)
+        save_label = escape(tr("Сохранить политику для {tool}").format(tool=name), quote=True)
+        return f"""<form class="module-form" method="post" action="{action}">
+<input type="hidden" name="csrf" value="{escape(self.csrf, quote=True)}">
+<input type="hidden" name="tool" value="{escaped_name}">
+<input type="hidden" name="expected_revision" value="{revision}">
+<select name="policy" aria-label="{select_label}">{"".join(options)}</select>
+<button type="submit" aria-label="{save_label}">{tr("Сохранить политику")}</button></form>"""
+
+    def _policy_rows(self, tools: list[dict], revision: int, action: str) -> str:
+        """Show configured policy and distinguish missing tools from paused coalescing."""
+        rows = []
+        for tool in tools:
+            label = tr(_POLICY_LABELS[tool["policy"]])
+            if not tool["discovered"]:
+                label += " · " + tr("Нет в каталоге")
+            elif tool["policy"] == "singleflight" and tool["effective_policy"] != "singleflight":
                 label += " · " + tr("приостановлен")
-            policies.append(f'<li><strong>{escape(tool["tool"])}</strong> · {label}</li>')
-        if not policies:
-            policies.append(f"<li>{tr('Инструменты не найдены.')}</li>")
+            form = self._policy_form(tool, revision, action)
+            rows.append(f'<li><strong>{escape(tool["tool"])}</strong> · {label}{form}</li>')
+        return "".join(rows) or f"<li>{tr('Инструменты не найдены.')}</li>"
+
+    def _backend_filter(self, backend: str | None) -> str:
+        """Render a native GET filter so pagination never spans unrelated MCPs."""
+        options = [f'<option value="">{tr("Все MCP")}</option>']
+        for name in self.router.profile.backends:
+            selected = " selected" if name == backend else ""
+            options.append(f'<option value="{escape(name, quote=True)}"{selected}>{escape(name)}</option>')
+        return f"""<form class="module-form" method="get" action="/settings">
+<label for="policy-backend">{tr("Фильтр по MCP")}</label>
+<select id="policy-backend" name="backend">{"".join(options)}</select>
+<button type="submit">{tr("Применить фильтр")}</button></form>"""
+
+    def page(self, offset: int, backend: str | None = None, *, notice: str = "", error: bool = False) -> str:
+        """Render the scoped, revisioned policy view without exposing secret values."""
+        current = self.inspect(InspectQuery(offset=offset, backend=backend))
+        total = current["total_tools"]
+        last_offset = max(0, (total - 1) // _PAGE_SIZE * _PAGE_SIZE)
+        if offset > last_offset:
+            offset = last_offset
+            current = self.inspect(InspectQuery(offset=offset, backend=backend))
+        action = escape(_settings_url(offset, backend), quote=True)
+        policies = self._policy_rows(current["tools"], current["revision"], action)
+        rows = self._connection_rows(current["connections"])
         links = []
         if offset:
-            links.append(f'<a href="/settings?offset={max(0, offset - 100)}">{tr("Назад")}</a>')
+            previous = escape(_settings_url(max(0, offset - _PAGE_SIZE), backend), quote=True)
+            links.append(f'<a rel="prev" href="{previous}#tool-policy">{tr("Назад")}</a>')
         if current["next_offset"] is not None:
-            links.append(f'<a href="/settings?offset={current["next_offset"]}">{tr("Далее")}</a>')
+            following = escape(_settings_url(current["next_offset"], backend), quote=True)
+            links.append(f'<a rel="next" href="{following}#tool-policy">{tr("Далее")}</a>')
+        count = tr("Показано {start}–{stop} из {total}").format(
+            start=offset + 1, stop=offset + len(current["tools"]), total=total,
+        ) if total else ""
         gateway = self.router.profile
         token_source = "Хранилище ОС" if gateway.access_token_keychain else "Окружение"
         if gateway.access_token_keychain and gateway.access_token_env:
             token_source = "Хранилище ОС, затем окружение"
+        feedback = ""
+        if notice:
+            role = "alert" if error else "status"
+            feedback = f'<p role="{role}">{escape(tr(notice))}</p>'
         return f"""<!doctype html>
 <html lang="{language()}"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{tr("Настройки MCP")}</title><link rel="stylesheet" href="/dashboard.css">
@@ -257,7 +405,10 @@ class Management:
 <p>{tr("MCP Bridge включён. Ревизия политики")} {current["revision"]}.</p>
 <p>{tr("Источник токена шлюза")} · {tr(token_source)}.</p></section>
 <section aria-labelledby="tool-policy"><h2 id="tool-policy">{tr("Политика инструментов")}</h2>
-<ul class="tools">{"".join(policies)}</ul>
+{feedback}{self._backend_filter(backend)}
+<p>{tr("Через MCP Bridge также доступны")} <code>gateway_<wbr>inspect</code> · <code>gateway_<wbr>set_<wbr>tool_<wbr>policy</code>.</p>
+<p>{count}</p>
+<ul class="tools">{policies}</ul>
 <nav class="backend-actions" aria-label="{tr("Страницы инструментов")}">{"".join(links)}</nav></section>
 <section aria-labelledby="sources"><h2 id="sources">{tr("Источники учётных данных MCP")}</h2>
-<ul class="tools">{"".join(rows)}</ul></section></main></html>"""
+<ul class="tools">{rows}</ul></section></main></html>"""

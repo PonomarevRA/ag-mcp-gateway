@@ -67,8 +67,13 @@ def test_browser_and_bridge_replace_only_a_verified_catalog(tmp_path, monkeypatc
         assert failed.status_code == 502 and "HTTP 401" in failed.text
         assert "Действующее подключение сохранено" in failed.text
         assert router.catalog_revision == before and listed(client) == {"local.old", "other.old"}
-        ok = client.post(url, headers=headers, data={"csrf": csrf}, follow_redirects=False)
-        assert ok.status_code == 303 and ok.headers["location"] == "/#backend-local"
+        ok = client.post(url + "?q=old&backend=local", headers=headers, data={"csrf": csrf}, follow_redirects=False)
+        assert ok.status_code == 303 and ok.headers["location"].endswith("#backend-local")
+        confirmed = client.get(ok.headers["location"], headers=browser)
+        assert "local: Подключение проверено и заменено." in confirmed.text
+        assert 'name="backend" value="local"' in confirmed.text and 'value="old"' in confirmed.text
+        fabricated = client.get("/?reconnected=local&confirmation=fake", headers=browser)
+        assert "Подключение проверено и заменено." not in fabricated.text
         assert router.catalog_revision > before and listed(client) == {"local.new", "other.old"}
         reply = client.post("/manage/test", headers=agent, json={
             "jsonrpc": "2.0", "id": 2, "method": "tools/call",

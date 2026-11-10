@@ -6,6 +6,8 @@ from base64 import b64decode
 from binascii import Error as Base64Error
 from contextlib import AsyncExitStack, asynccontextmanager
 from hmac import compare_digest
+from secrets import token_urlsafe
+from urllib.parse import urlencode
 
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
@@ -17,7 +19,8 @@ from starlette.routing import Route
 from .connection_diagnostics import FAILURE_LABELS
 from .connections import ReauthorizationError
 from .credential_ui import CredentialsUI, SECURE_HTML, read_form
-from .dashboard import CATALOG_PAGE_SIZE, STYLE, render
+from .dashboard import CATALOG_PAGE_SIZE, STYLE, catalog_url, render
+from .diagnostic_page import DiagnosticPage
 from .management import Management
 from .mcp_server import make_server
 from .module_data import ModuleError
@@ -69,7 +72,8 @@ class LocalBoundary:
             return
         path = request.url.path
         mcp = path.startswith(("/mcp/", "/manage/"))
-        browser_action = path == "/credentials" or path.startswith(("/credentials/", "/reconnect/")) or path == "/modules"
+        browser_action = (path in {"/credentials", "/modules"} or path.startswith(("/credentials/", "/reconnect/"))
+                          or (path == "/settings" and request.method == "POST"))
         header = request.headers.get("authorization", "")
         if self.token and not authorized(header, self.token, basic=not mcp, bearer=not browser_action):
             challenge = "Bearer" if mcp else 'Basic realm="ag-mcp-gateway"'
@@ -109,9 +113,11 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
     credentials = CredentialsUI(router.connections, origin, bool(token))
     management = None
     telemetry_api = TelemetryAPI(router.telemetry, technical) if technical is not None else None
+    diagnostics = DiagnosticPage(telemetry_api, router.profile) if telemetry_api is not None else None
+    reconnect_receipts: dict[str, str] = {}
     if router.profile.management_bridge and token and settings is not None:
         management = Management(router, settings, origin, credentials.enabled, skill_store,
-                                feedback if router.profile.agent_discovery else None, telemetry_api)
+                                feedback if router.profile.agent_discovery else None, telemetry_api, csrf=credentials.csrf)
 
     modules = ModulePage(management.modules, origin, credentials.csrf) if management and management.modules else None
 
@@ -187,16 +193,26 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
         """Render a single catalog page and the authorized browser controls."""
         snapshot = router.dashboard_snapshot(query, offset, backend, page_size=CATALOG_PAGE_SIZE)
         page = render(snapshot, query, credentials=credentials.enabled, management=management is not None,
-                      reconnect_csrf=credentials.csrf if token else None, notice=notice, modules=modules is not None)
+                      reconnect_csrf=credentials.csrf if token else None, notice=notice, modules=modules is not None,
+                      diagnostics=diagnostics is not None)
         return HTMLResponse(page, status_code=status_code, headers=SECURE_HTML)
 
-    async def overview(request):
-        """Render the catalog with a bounded search filter."""
+    def catalog_filters(request):
+        """Keep bounded search and paging across a backend action."""
         value = request.query_params.get("offset", "")
         offset = int(value) if value.isascii() and value.isdecimal() and len(value) <= 6 else 0
         backend = request.query_params.get("backend")
-        return dashboard(request.query_params.get("q", "")[:200], offset=offset,
-                         backend=backend if backend in router.profile.backends else None)
+        return {"query": request.query_params.get("q", "")[:200], "offset": offset,
+                "backend": backend if backend in router.profile.backends else None}
+
+    async def overview(request):
+        """Show reconnect confirmation only for a successful session replacement."""
+        name = request.query_params.get("reconnected")
+        receipt = request.query_params.get("confirmation")
+        notice = ""
+        if receipt and name in reconnect_receipts and reconnect_receipts[name] == receipt:
+            notice = f"{name}: {tr('Подключение проверено и заменено.')}"
+        return dashboard(**catalog_filters(request), notice=notice)
 
     async def reconnect(request):
         """Replace one selected MCP after local browser authentication and CSRF checks."""
@@ -211,19 +227,26 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
             fields = {}
         if set(fields) != {"csrf"} or not compare_digest(fields["csrf"].encode(), credentials.csrf.encode()):
             return PlainTextResponse(tr("Недопустимый токен формы"), status_code=403, headers=SECURE_HTML)
+        filters = catalog_filters(request)
         try:
             if await router.connections.reconnect(name):
-                return RedirectResponse(f"/#backend-{name}", status_code=303, headers=SECURE_HTML)
+                receipt = token_urlsafe(16)
+                reconnect_receipts[name] = receipt
+                previous = catalog_url(**filters)
+                separator = "&" if "?" in previous else "?"
+                query = urlencode({"reconnected": name, "confirmation": receipt})
+                return RedirectResponse(f"{previous}{separator}{query}#backend-{name}",
+                                        status_code=303, headers=SECURE_HTML)
         except ReauthorizationError as error:
             code = str(error)
         else:
             code = "connection-failed"
         if code == "busy":
-            return dashboard(notice=f"{name}: {tr('переподключение уже выполняется.')}", status_code=409)
+            return dashboard(**filters, notice=f"{name}: {tr('переподключение уже выполняется.')}", status_code=409)
         title, _tone = FAILURE_LABELS.get(code, ("Новое подключение не подтвердилось", "error"))
         worker = router.connections.active.get(name)
         suffix = " " + tr("Действующее подключение сохранено.") if worker is not None and worker.live else ""
-        return dashboard(notice=f"{name}: {tr(title)}.{suffix}", status_code=502)
+        return dashboard(**filters, notice=f"{name}: {tr(title)}.{suffix}", status_code=502)
 
     async def status(_request):
         """Return profile status and metrics as machine-readable JSON."""
@@ -232,12 +255,6 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
     async def stylesheet(_request):
         """Serve the fixed local dashboard stylesheet."""
         return Response(STYLE, media_type="text/css", headers={"X-Content-Type-Options": "nosniff"})
-
-    async def settings_page(request):
-        """Render the same policy state exposed through the management MCP."""
-        value = request.query_params.get("offset", "")
-        offset = int(value) if value.isascii() and value.isdecimal() and len(value) <= 6 else 0
-        return HTMLResponse(management.page(offset), headers=SECURE_HTML)
 
     routes = [
         Route(f"/mcp/{router.profile.endpoint_key}", McpEndpoint("mcp_manager")),
@@ -249,11 +266,13 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
         Route("/dashboard.css", stylesheet),
     ]
     if management is not None:
-        routes.extend([Route("/settings", settings_page),
+        routes.extend([Route("/settings", management.overview),
+                       Route("/settings", management.submit, methods=["POST"]),
                        Route(f"/manage/{router.profile.endpoint_key}", McpEndpoint("management_manager"))])
     if modules is not None:
         routes.extend([Route("/modules", modules.overview), Route("/modules", modules.submit, methods=["POST"])])
     if telemetry_api is not None:
         routes.extend(telemetry_api.routes())
+        routes.append(Route("/diagnostics", diagnostics.overview))
     app = Starlette(routes=routes, lifespan=lifespan, middleware=[Middleware(BrowserLocale)])
     return LocalBoundary(app, port, token)

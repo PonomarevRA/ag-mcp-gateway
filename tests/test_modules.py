@@ -5,6 +5,7 @@ import json
 import re
 import time
 from base64 import b64encode
+from html import escape, unescape
 
 import pytest
 from mcp import types
@@ -216,6 +217,60 @@ def test_module_page_and_management_share_state(fixture_gateway):
                               "revision": "1", "id": "module", "data": '{"value":"<script>unsafe</script>"}'})
         assert rendered.status_code == 200 and "&lt;script&gt;unsafe&lt;/script&gt;" in rendered.text
         assert seen == []
+
+
+def test_module_page_preserves_operator_work(fixture_gateway):
+    """Keep escaped drafts, retain revision fences and confirm completed operations."""
+    router, settings, registry, _seen = fixture_gateway
+    app = create_app(router, 18792, TOKEN, settings=settings)
+    headers = {"Authorization": "Basic " + b64encode(f"gateway:{TOKEN}".encode()).decode(), "Origin": ORIGIN}
+
+    with TestClient(app, base_url=ORIGIN, headers=headers) as client:
+        page = client.get("/modules?lang=en")
+        csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
+
+        def post(action, revision, **fields):
+            """Submit the same bounded form the authenticated browser sends."""
+            return client.post("/modules", data={"csrf": csrf, "action": action, "revision": str(revision), **fields},
+                               follow_redirects=False)
+
+        draft = '{ "title": "<fixture>"'
+        invalid = post("save", 0, data=draft)
+        assert invalid.status_code == 400
+        assert escape(draft) in invalid.text and '<p id="module-feedback" role="alert"' in invalid.text
+        assert registry.state.revision == 0
+
+        body = definition("projection", {"op": "select", "source": "/input/value"}).model_dump_json()
+        saved = post("save", 0, data=body)
+        assert saved.status_code == 303 and "edit=projection" in saved.headers["Location"]
+        assert "Module saved." in client.get(saved.headers["Location"]).text
+        assert "Module saved." not in client.get(saved.headers["Location"]).text
+        assert "Module saved." not in client.get("/modules?confirmation=forged").text
+
+        stale = post("save", 0, data=body)
+        assert stale.status_code == 400 and "Module revision changed." in stale.text
+        editor = stale.text.split('<h2 id="editor">', 1)[1].split("</form>", 1)[0]
+        assert 'name="revision" value="0"' in editor
+        assert registry.state.revision == 1
+
+        data = '{"value": null}'
+        result = post("run", 1, id="projection", data=data)
+        assert result.status_code == 200 and "<pre>null</pre>" in result.text
+        assert 'value="projection" selected' in result.text
+        assert escape(data) in result.text
+
+        opened = post("open", 1)
+        lifecycle = opened.text.split('<h2 id="lifecycle">', 1)[1]
+        grant = json.loads(unescape(re.search(r'<pre>(.*?)</pre>', lifecycle, re.S).group(1)))
+        capability = grant["capability"]
+        invalid_capability = "x" * 43
+        invalid_close = post("close", 1, capability=invalid_capability)
+        assert invalid_close.status_code == 400
+        assert capability not in invalid_close.text and invalid_capability not in invalid_close.text
+        closed = post("close", 1, capability=capability)
+        assert closed.status_code == 303
+        confirmation = client.get(closed.headers["Location"]).text
+        assert "Session closed." in confirmation and capability not in confirmation and grant["session_id"] not in confirmation
 
 
 def test_hook_sessions_promote_once_and_remain_isolated(fixture_gateway):

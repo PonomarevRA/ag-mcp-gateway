@@ -65,6 +65,7 @@ class CredentialsUI:
             return PlainTextResponse(tr("Не найдено"), status_code=404, headers=SECURE_HTML)
         if request.headers.get("origin") != self.origin:
             return PlainTextResponse(tr("Недопустимый источник формы"), status_code=403, headers=SECURE_HTML)
+        operation = ""
         try:
             fields = await read_form(request)
             csrf = fields.pop("csrf", "")
@@ -80,19 +81,19 @@ class CredentialsUI:
             else:
                 raise ValueError("invalid form")
         except ValueError:
-            return self._error("invalid", name)
+            return self._error("invalid", name, operation=operation)
 
         try:
             connected = await self.connections.rotate(name, authorization)
         except ReauthorizationError as error:
-            return self._error(str(error), name)
+            return self._error(str(error), name, operation=operation)
 
         if operation in {"save", "paste"}:
             result = "saved" if connected else "saved-offline"
         elif connected:
             result = "connected"
         else:
-            return self._error("connection-failed", name)
+            return self._error("connection-failed", name, operation=operation)
         receipt = token_urlsafe(24)
         self.confirmations[name] = (receipt, result)
         location = f"/credentials?backend={name}&confirmation={receipt}"
@@ -112,7 +113,7 @@ class CredentialsUI:
                 result = "saved-disconnected"
         return tr(_MESSAGES[result])
 
-    def _error(self, code: str, selected: str | None = None) -> Response:
+    def _error(self, code: str, selected: str | None = None, *, operation: str = "") -> Response:
         """Translate known errors without exposing transport messages or form values."""
         if code in _ERRORS:
             status, message = _ERRORS[code]
@@ -121,31 +122,35 @@ class CredentialsUI:
             message, _tone = FAILURE_LABELS[code]
             status = 502
             message = tr(message) + "."
-            worker = self.connections.active.get(selected)
-            if worker is not None and worker.live:
-                message += " " + tr("Действующее подключение сохранено.")
         else:
             status, message = _ERRORS["connection-failed"]
             message = tr(message)
-        return self._page(message, status, selected=selected)
+        worker = self.connections.active.get(selected)
+        if status in {502, 503} and worker is not None and worker.live:
+            message += " " + tr("Действующее подключение сохранено.")
+        return self._page(message, status, selected=selected, failed_operation=operation,
+                          correct_input=code in {"invalid", "auth-rejected"})
 
-    def _page(self, message: str, status: int = 200, *, selected: str | None = None) -> Response:
-        """Render the profile and one native form pair for each configured Basic backend."""
+    def _page(self, message: str, status: int = 200, *, selected: str | None = None,
+              failed_operation: str = "", correct_input: bool = False) -> Response:
+        """Render Basic forms and direct error recovery to the failed form."""
         names = [selected] if selected else sorted(self.connections.accounts)
-        controls = "".join(self._controls(name) for name in names)
-        notice = f'<p role="status">{escape(message)}</p>' if message else ""
+        controls = "".join(self._controls(name, failed_operation=failed_operation, correct_input=correct_input)
+                           for name in names)
+        role = "alert" if status >= 400 else "status"
+        notice = f'<p id="credential-feedback" role="{role}">{escape(message)}</p>' if message else ""
         content = f"""<!doctype html>
 <html lang="{language()}">
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{tr("Учётные данные MCP")}</title><link rel="stylesheet" href="/dashboard.css">
 <main><header><div><h1>{tr("Учётные данные MCP")}</h1><p>{tr("Профиль")} {escape(self.connections.profile.endpoint_key)}</p></div>
-<a href="/">{tr("К обзору")}</a>{language_switch()}</header>
+<a href="/">{tr("К обзору")}</a>{language_switch(backend=selected)}</header>
 <section aria-label="{tr("Переавторизация")}">
 <p>{tr("Шлюз проверит подключение перед сохранением данных в Связке ключей macOS.")}</p>
 {notice}<ul class="tools">{controls}</ul></section></main></html>"""
         return HTMLResponse(content, status_code=status, headers=SECURE_HTML)
 
-    def _controls(self, name: str) -> str:
+    def _controls(self, name: str, *, failed_operation: str = "", correct_input: bool = False) -> str:
         """Build accessible forms whose fields never echo secrets back to the browser."""
         label = escape(name)
         action = f"/credentials/{label}"
@@ -157,23 +162,31 @@ class CredentialsUI:
             code = worker.status if worker is not None else "starting"
             title, tone = FAILURE_LABELS.get(code, ("Подключение недоступно", "error"))
             state = f'<p class="status-badge status-{tone}">{escape(tr(title))}</p>'
+        # Keep the chosen form visible without reflecting any submitted value.
+        feedback = ' aria-describedby="credential-feedback"'
+        save_help = feedback if failed_operation == "save" else ""
+        save_focus = " autofocus" if failed_operation == "save" and correct_input else ""
+        paste_help = feedback if failed_operation == "paste" else ""
+        paste_open = " open" if failed_operation == "paste" else ""
+        paste_focus = ' aria-invalid="true" autofocus' if failed_operation == "paste" and correct_input else ""
+        reconnect_help = feedback if failed_operation == "reconnect" else ""
         return f"""<li><h2>{label}</h2>{state}
 <form class="credential-form" method="post" action="{action}">
 {csrf}<input type="hidden" name="operation" value="save">
 <div><label for="{label}-login">{tr("Логин")}</label>
-<input id="{label}-login" name="login" required maxlength="256" autocomplete="off"></div>
+<input id="{label}-login" name="login" required maxlength="256" autocomplete="off"{save_help}{save_focus}></div>
 <div><label for="{label}-password">{tr("Пароль")}</label>
 <input id="{label}-password" type="password" name="password" required maxlength="1024" autocomplete="new-password"></div>
 <button type="submit">{tr("Проверить и сохранить")}</button></form>
-<details><summary>{tr("Ввести готовый Basic / Base64")}</summary>
+<details{paste_open}><summary>{tr("Ввести готовый Basic / Base64")}</summary>
 <form class="credential-form" method="post" action="{action}">
 {csrf}<input type="hidden" name="operation" value="paste">
 <div><label for="{label}-basic">Basic / Base64</label>
-<input id="{label}-basic" type="password" name="basic" required maxlength="8198" autocomplete="new-password"></div>
+<input id="{label}-basic" type="password" name="basic" required maxlength="8198" autocomplete="new-password"{paste_help}{paste_focus}></div>
 <button type="submit">{tr("Проверить и сохранить Basic")}</button></form></details>
 <form class="credential-form" method="post" action="{action}">
 {csrf}<input type="hidden" name="operation" value="reconnect">
-<button type="submit">{tr("Подключиться с сохранёнными данными")}</button></form></li>"""
+<button type="submit"{reconnect_help}>{tr("Подключиться с сохранёнными данными")}</button></form></li>"""
 
 
 async def read_form(request: Request, *, limit: int = _LIMIT, max_fields: int = 4) -> dict[str, str]:

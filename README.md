@@ -20,6 +20,8 @@
 
 Откройте [обзор](http://127.0.0.1:18792/) и выберите **Русский** или **English** в шапке. Во втором терминале выполните `./ag-mcp-gateway status`. Для остановки нажмите Ctrl+C в терминале сервера.
 
+На карточке MCP доступны его инструменты и диагностика. При включённом MCP Bridge в браузерных **Настройках** можно применить политику отдельного инструмента.
+
 Для рабочего профиля скопируйте [подходящий пример](profiles/company.example.json) из каталога `profiles` в `~/.ag-mcp-gateway/profiles/<имя>.json`, согласуйте настройки и запускайте `./ag-mcp-gateway --profile <имя> serve`. Связка ключей macOS имеет приоритет над явно настроенным резервным источником из окружения. При Basic-аутентификации в браузере используйте пользователя `gateway` и токен профиля как пароль. Флаг без авторизации предназначен для локального демо.
 
 ### Для агентов
@@ -48,6 +50,8 @@ A local standalone gateway lets several agents use MCP servers through one servi
 ```
 
 Open the [overview](http://127.0.0.1:18792/) and choose **English** or **Русский** in the header. Run `./ag-mcp-gateway status` in a second terminal. Press Ctrl+C in the server terminal to stop it.
+
+Open the tools or diagnostics for a specific server from its MCP card. When MCP Bridge is enabled, browser **Settings** lets an operator apply a policy to an individual tool.
 
 For a working profile, copy an [example](profiles/company.example.json) from `profiles` to `~/.ag-mcp-gateway/profiles/<name>.json`, configure it with the operator, and run `./ag-mcp-gateway --profile <name> serve`. The macOS Keychain takes precedence over an explicitly configured environment fallback. Browser Basic authentication uses username `gateway` and the profile token as the password. The unauthenticated flag is intended for the local demo.
 

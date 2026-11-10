@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 from base64 import b64encode
 
 import pytest
@@ -231,3 +232,88 @@ def test_management_config_names_are_distinct_from_ordinary_clients(tmp_path):
     assert "[mcp_servers.amg-mgmt-test-x]" in managed
     assert "[mcp_servers.amg-test-x-manage]" in ordinary
     assert "mcp-bridge" in managed and "local-gateway" not in managed
+
+
+def test_browser_policy_uses_shared_revision_and_protected_form(tmp_path, monkeypatch):
+    """Edit a filtered policy in the browser and recover when Bridge changes its revision."""
+    async def run_backend(name, config, timeout, publish, authorization, *, probe):
+        """Publish a page and a second-page tool with a known read-only annotation."""
+        size = 101 if name == "local" else 1
+        tools = {}
+        for index in range(size):
+            tool = types.Tool(name=f"read{index:03}", inputSchema={"type": "object"},
+                              annotations=types.ToolAnnotations(readOnlyHint=index != 0))
+            tools[f"{name}.{tool.name}"] = tool
+        publish(name, object(), tools, "ready")
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("gateway.connections.run_backend", run_backend)
+    profile = Profile.model_validate({
+        "name": "fixture", "access_token_env": "FIXTURE_GATEWAY", "management_bridge": True,
+        "backends": {
+            "local": {"transport": "stdio", "command": "fixture"},
+            "other": {"transport": "stdio", "command": "fixture"},
+        },
+        "denied": ["other.missing"],
+    })
+    router = Router(profile, Telemetry(Journal(tmp_path / "logs", 4096)))
+    settings = ToolPolicySettings(router, tmp_path / "policy.json")
+    app = create_app(router, 18793, GATEWAY, settings=settings)
+    browser = {"Authorization": "Basic " + b64encode(f"gateway:{GATEWAY}".encode()).decode()}
+    same_origin = {**browser, "Origin": ORIGIN}
+    manage = "/manage/fixture"
+
+    with TestClient(app, base_url=ORIGIN) as client:
+        initial = client.get("/settings?backend=local&lang=en", headers=browser)
+        assert "Showing 1–100 of 101" in initial.text
+        assert "other.missing" not in initial.text
+        assert 'href="/settings?backend=local&amp;offset=100#tool-policy"' in initial.text
+        target = "/settings?backend=local&offset=100"
+        last = client.get(target + "000", headers=browser)
+        assert "Showing 101–101 of 101" in last.text
+        assert "Policy for local.read100" in last.text
+        csrf = re.search(r'name="csrf" value="([^"]+)"', last.text)[1]
+        data = {"csrf": csrf, "tool": "local.read100", "policy": "deny", "expected_revision": "0"}
+        assert client.post(target, headers=browser, data=data).status_code == 403
+        assert client.post(target, headers={**HEADERS, "Origin": ORIGIN}, data=data).status_code == 401
+        assert client.post(target, headers=same_origin, data={**data, "csrf": "wrong"}).status_code == 403
+        assert settings.state.revision == 0
+
+        saved = client.post(target, headers=same_origin, data=data, follow_redirects=False)
+        assert saved.status_code == 303
+        assert saved.headers["location"].startswith(target + "&saved=")
+        confirmed = client.get(saved.headers["location"], headers=browser)
+        assert "Policy saved." in confirmed.text
+        assert "local.read100</strong> · Denied" in confirmed.text
+        inspected = call(client, manage, "gateway_inspect", {"backend": "local", "offset": 100})["structuredContent"]
+        assert inspected["revision"] == 1 and inspected["tools"][0]["policy"] == "deny"
+
+        change = {"tool": "local.read100", "policy": "allow", "expected_revision": 1}
+        assert call(client, manage, "gateway_set_tool_policy", change)["structuredContent"]["revision"] == 2
+        stale = client.post(target, headers=same_origin, data={**data, "expected_revision": "1"})
+        assert stale.status_code == 409
+        assert "The policy has changed." in stale.text
+        assert 'name="expected_revision" value="2"' in stale.text
+        assert "local.read100</strong> · Allowed" in stale.text
+
+        unsupported = client.post(target, headers=same_origin, data={
+            **data, "tool": "local.read000", "policy": "singleflight", "expected_revision": "2",
+        })
+        assert unsupported.status_code == 400
+        assert "This policy is currently unavailable for the tool." in unsupported.text
+        assert settings.state.revision == 2
+
+        def fail_write(_state):
+            """Reject a browser save without exposing storage errors."""
+            raise OSError("fixture storage path")
+
+        monkeypatch.setattr(settings, "_write", fail_write)
+        storage_error = client.post(target, headers=same_origin,
+                                    data={**data, "expected_revision": "2"})
+        assert storage_error.status_code == 503
+        assert "Unable to save the policy. Try again later." in storage_error.text
+        assert "fixture storage path" not in storage_error.text
+        assert settings.state.revision == 2
+
+        other = client.get("/settings?backend=other&lang=ru", headers=browser)
+        assert "other.missing</strong> · Запрещён · Нет в каталоге" in other.text

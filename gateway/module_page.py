@@ -4,6 +4,8 @@ import json
 from datetime import UTC, datetime
 from hmac import compare_digest
 from html import escape
+from secrets import token_urlsafe
+from urllib.parse import urlencode
 
 from pydantic import ValidationError
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse
@@ -23,6 +25,16 @@ OPS = {
     "contains": "Проверка включения", "filter": "Фильтр JSON", "aggregate": "Агрегация",
     "math": "Арифметика", "call": "Вызов MCP",
 }
+_CONFIRMATIONS = {
+    "save": "Модуль сохранён.", "bind": "Привязка обновлена.", "generations": "Пороги сохранены.",
+    "pin": "Закрепление обновлено.", "activate": "Активация обновлена.", "close": "Сессия закрыта.",
+    "delete": "Модуль удалён.",
+}
+_RETAINED_FIELDS = {
+    "save": {"data": 65_536}, "run": {"id": 32, "data": 65_536},
+    "bind": {"tool": 128, "phase": 6, "module": 32},
+}
+_FORM_SECTIONS = {"save": "editor", "run": "run", "bind": "hooks"}
 
 
 def encoded(value) -> str:
@@ -35,11 +47,17 @@ def empty_row(message: str) -> str:
     return f"<li>{tr(message)}</li>"
 
 
-def options(values, *, blank: str | None = None) -> str:
+def result_panel(result) -> str:
+    """Render the explicit operation's escaped JSON result beside its form."""
+    return f'<div class="module-preview"><h3>{tr("Результат")}</h3><pre>{encoded(result)}</pre></div>'
+
+
+def options(values, *, blank: str | None = None, selected: str | None = None) -> str:
     """Render value/label pairs with an optional first empty choice."""
     items = [f'<option value="">{escape(blank)}</option>'] if blank is not None else []
     for value, label in values:
-        items.append(f'<option value="{escape(value)}">{escape(label)}</option>')
+        current = " selected" if value == selected else ""
+        items.append(f'<option value="{escape(value)}"{current}>{escape(label)}</option>')
     return "".join(items)
 
 
@@ -56,6 +74,7 @@ class ModulePage:
         self.service = service
         self.origin = origin
         self.csrf = csrf
+        self.confirmations: dict[str, str] = {}
 
     def hidden(self, action: str, revision: int) -> str:
         """Bind an action to this UI instance and the currently rendered revision."""
@@ -63,7 +82,7 @@ class ModulePage:
                 f'<input type="hidden" name="action" value="{action}">'
                 f'<input type="hidden" name="revision" value="{revision}">')
 
-    def lifecycle(self, current: dict, local: list[tuple[str, str]]) -> str:
+    def lifecycle(self, current: dict, local: list[tuple[str, str]], *, feedback: str = "", preview: str = "") -> str:
         """Render generation settings, history and explicit session controls."""
         revision = current["revision"]
         rules = current["generation_rules"]
@@ -98,7 +117,8 @@ class ModulePage:
 <input id="gen1" name="gen1" type="number" min="3" max="16" value="{rules["gen1_sessions"]}" required></div>
 <button>{tr("Сохранить пороги")}</button></form>
 <h3>{tr("Активные сессии")}</h3><ul class="tools">{active or empty_row("Активных сессий нет.")}</ul>
-<form method="post" action="/modules">{self.hidden("open", revision)}<button>{tr("Открыть сессию на час")}</button></form>
+<form method="post" action="/modules#lifecycle">{self.hidden("open", revision)}<button>{tr("Открыть сессию на час")}</button></form>
+{feedback}{preview}
 <details><summary>{tr("Управление активацией")}</summary>
 <form class="module-form" method="post" action="/modules" data-ag-form-row="stack">{self.hidden("activate", revision)}
 <div class="module-field" data-ag-form-field><label for="capability">{tr("Ключ сессии")}</label>
@@ -114,12 +134,23 @@ class ModulePage:
 <input id="close-capability" name="capability" type="password" minlength="43" maxlength="43" autocomplete="off" required></div>
 <button>{tr("Закрыть сессию")}</button></form></details></section>"""
 
-    def render(self, edit: str = "", *, tool_hint: str = "", notice: str = "", result: dict | None = None, status: int = 200):
+    def render(self, edit: str = "", *, tool_hint: str = "", notice: str = "", result: dict | None = None,
+               status: int = 200, form: dict[str, str] | None = None, opened_session: dict | None = None):
         """Render bounded definitions, form actions and the last explicit run result."""
         current = self.service.registry.catalog()
         modules = current["modules"]
         revision = current["revision"]
+        form = form or {}
+        action = form.get("action")
+
+        def form_revision(name: str) -> int:
+            """Keep stale drafts fenced until the operator reloads the saved version."""
+            value = form.get("revision", "")
+            return self.revision(value) if action == name and value else revision
+
         selected = modules.get(edit, {**EXAMPLE, "title": tr(EXAMPLE["title"])})
+        definition = escape(form["data"]) if action == "save" else encoded(selected)
+        edit_action = "/modules?" + urlencode({"edit": edit}) if edit in modules else "/modules"
         local = []
         items = []
         for identity, module in sorted(modules.items()):
@@ -136,12 +167,22 @@ class ModulePage:
                 hooks.append(f'<li><strong>{escape(tool)}</strong> · {tr(labels[phase])} · {escape(name)}</li>')
         routes = set(self.service.router.routes) | set(current["bindings"])
         tool_options = options((tool, tool) for tool in sorted(routes)[:100])
-        module_options = options((name, value["title"]) for name, value in sorted(modules.items()))
-        hook_options = options(local, blank=tr("Снять привязку"))
+        run_module = form.get("id") if action == "run" else edit
+        run_data = form["data"] if action == "run" else '{"value": 42}'
+        module_options = options(((name, value["title"]) for name, value in sorted(modules.items())), selected=run_module)
+        hook_module = form.get("module") if action == "bind" else None
+        hook_options = options(local, blank=tr("Снять привязку"), selected=hook_module)
+        if action == "bind":
+            tool_hint = form["tool"]
+        after_selected = " selected" if action == "bind" and form.get("phase") == "after" else ""
         bind_disabled = "" if routes else " disabled"
-        alert = f'<p role="status" class="module-message">{escape(tr(notice))}</p>' if notice else ""
-        preview = (f'<div class="module-preview"><h3>{tr("Результат")}</h3><pre>{encoded(result["result"])}</pre></div>'
-                   if result is not None else "")
+        role = "alert" if status >= 400 else "status"
+        alert = f'<p id="module-feedback" role="{role}" class="module-message">{escape(tr(notice))}</p>' if notice else ""
+        feedback_section = "lifecycle" if opened_session is not None else _FORM_SECTIONS.get(action)
+        preview = result_panel(result["result"]) if result is not None else ""
+        session_preview = result_panel(opened_session) if opened_session is not None else ""
+        lifecycle = self.lifecycle(current, local, feedback=alert if feedback_section == "lifecycle" else "",
+                                   preview=session_preview)
         delete = ""
         if edit in modules:
             delete = (f'<form method="post" action="/modules">{self.hidden("delete", revision)}'
@@ -154,38 +195,54 @@ class ModulePage:
 <nav class="module-nav" aria-label="{tr("Разделы")}"><a href="/">{tr("Каталог MCP")}</a>
 <a href="/settings">{tr("Настройки")}</a><a href="/modules" aria-current="page">{tr("Модули")}</a></nav>
 <div class="module-main"><header><div><h1>{tr("Модули MCP")}</h1>
-<p>{tr("Преобразования JSON, вычисления и цепочки чтения")}</p></div>{language_switch()}</header>{alert}
+<p>{tr("Преобразования JSON, вычисления и цепочки чтения")}</p></div>{language_switch()}</header>{alert if feedback_section is None else ""}
 <section aria-labelledby="library"><h2 id="library">{tr("Реестр")}</h2><p>{tr("Ревизия")} {revision}</p>
 <ul class="tools">{"".join(items) or empty_row("Модули ещё не добавлены.")}</ul>
 <a href="/modules#editor">{tr("Новый модуль")}</a></section>
 <section aria-labelledby="editor"><h2 id="editor">{tr("Определение модуля")}</h2>
-<form class="module-form" method="post" action="/modules" data-ag-form-row="stack">{self.hidden("save", revision)}
+{alert if feedback_section == "editor" else ""}
+<form class="module-form" method="post" action="{escape(edit_action)}#editor" data-ag-form-row="stack">{self.hidden("save", form_revision("save"))}
 <div class="module-field" data-ag-form-field><label for="definition">{tr("Определение JSON")}</label>
-<textarea id="definition" name="data" rows="11" maxlength="65536" aria-describedby="definition-help" required>{encoded(selected)}</textarea>
+<textarea id="definition" name="data" rows="11" maxlength="65536" aria-describedby="definition-help" required>{definition}</textarea>
 <p id="definition-help" class="muted">{tr("Операции: select, object, compare, contains, filter, aggregate, math, call.")}</p></div>
 <button>{tr("Сохранить модуль")}</button></form>{delete}</section>
 <section aria-labelledby="hooks"><h2 id="hooks">{tr("Привязки к инструментам")}</h2>
+{alert if feedback_section == "hooks" else ""}
 <ul class="tools">{"".join(hooks) or empty_row("Привязок пока нет.")}</ul>
-<form class="module-form" method="post" action="/modules" data-ag-form-row="stack">{self.hidden("bind", revision)}
+<form class="module-form" method="post" action="{escape(edit_action)}#hooks" data-ag-form-row="stack">{self.hidden("bind", form_revision("bind"))}
 <div class="module-field" data-ag-form-field><label for="tool">{tr("Инструмент")}</label>
 <input id="tool" name="tool" value="{escape(tool_hint)}" list="module-tools" maxlength="128"
  aria-describedby="tool-help" required{bind_disabled}>
 <datalist id="module-tools">{tool_options}</datalist>
 <p id="tool-help" class="muted">{tr("Укажите полное имя из каталога. Подсказки показывают до 100 имён.")}</p></div>
 <div class="module-field" data-ag-form-field><label for="phase">{tr("Этап")}</label><select id="phase" name="phase"><option value="before">{tr("До запроса")}</option>
-<option value="after">{tr("После ответа")}</option></select></div>
+<option value="after"{after_selected}>{tr("После ответа")}</option></select></div>
 <div class="module-field" data-ag-form-field><label for="binding">{tr("Локальный модуль")}</label><select id="binding" name="module">{hook_options}</select></div>
 <button{bind_disabled}>{tr("Сохранить привязку")}</button></form></section>
 <section aria-labelledby="run"><h2 id="run">{tr("Ручной запуск")}</h2>
-<form class="module-form" method="post" action="/modules" data-ag-form-row="stack">{self.hidden("run", revision)}
+{alert if feedback_section == "run" else ""}
+<form class="module-form" method="post" action="{escape(edit_action)}#run" data-ag-form-row="stack">{self.hidden("run", form_revision("run"))}
 <div class="module-field" data-ag-form-field><label for="run-module">{tr("Модуль")}</label><select id="run-module" name="id" required{disabled}>{module_options}</select></div>
-<div class="module-field" data-ag-form-field><label for="run-data">{tr("Входной JSON")}</label><textarea id="run-data" name="data" rows="4" maxlength="65536" required{disabled}>{{"value": 42}}</textarea></div>
-<button{disabled}>{tr("Запустить модуль")}</button></form>{preview}</section>{self.lifecycle(current, local)}</div></main></html>"""
+<div class="module-field" data-ag-form-field><label for="run-data">{tr("Входной JSON")}</label><textarea id="run-data" name="data" rows="4" maxlength="65536" required{disabled}>{escape(run_data)}</textarea></div>
+<button{disabled}>{tr("Запустить модуль")}</button></form>{preview}</section>{lifecycle}</div></main></html>"""
         return HTMLResponse(html, status_code=status, headers=SECURE_HTML)
 
     async def overview(self, request):
         """Open the library or edit one selected module."""
-        return self.render(request.query_params.get("edit", "")[:32], tool_hint=request.query_params.get("tool", "")[:128])
+        receipt = request.query_params.get("confirmation", "")
+        notice = self.confirmations.pop(receipt, "") if request.method == "GET" else ""
+        return self.render(request.query_params.get("edit", "")[:32], tool_hint=request.query_params.get("tool", "")[:128],
+                           notice=notice)
+
+    def confirmation(self, action: str, edit: str, tool: str):
+        """Confirm a successful form edit once without letting URL text impersonate a result."""
+        receipt = token_urlsafe(24)
+        self.confirmations[receipt] = _CONFIRMATIONS[action]
+        if len(self.confirmations) > 32:
+            self.confirmations.pop(next(iter(self.confirmations)))
+        query = urlencode({key: value for key, value in (("edit", edit), ("tool", tool), ("confirmation", receipt))
+                           if value})
+        return RedirectResponse(f"/modules?{query}#module-feedback", status_code=303, headers=SECURE_HTML)
 
     async def submit(self, request):
         """Validate browser origin and CSRF before making changes or running modules."""
@@ -197,24 +254,31 @@ class ModulePage:
             return self.render(notice="Некорректная форма.", status=400)
         if not compare_digest(fields.get("csrf", "").encode(), self.csrf.encode()):
             return PlainTextResponse(tr("Недопустимый токен формы"), status_code=403, headers=SECURE_HTML)
+        action = fields.get("action", "")
+        edit = request.query_params.get("edit", "")[:32]
+        form = {key: fields.get(key, "")[:limit] for key, limit in _RETAINED_FIELDS.get(action, {}).items()}
+        if form:
+            form["action"] = action
         try:
-            action = fields.get("action")
             revision = self.revision(fields.get("revision", ""))
+            if form:
+                form["revision"] = str(revision)
             if action == "open":
                 opened = await self.service.open_session()
-                return self.render(notice="Сессия открыта. Сохраните ключ для клиента.", result={"result": opened})
+                return self.render(edit, notice="Сессия открыта. Сохраните ключ для клиента.", opened_session=opened)
             if action == "run":
                 query = Run.model_validate({"id": fields.get("id"), "data": parse_json(fields.get("data", "")),
                                             "expected_revision": revision})
-                return self.render(notice="Модуль выполнен.", result=await self.service.run(query))
-            await self.edit(action, fields, revision)
+                return self.render(edit, notice="Модуль выполнен.", result=await self.service.run(query), form=form)
+            saved = await self.edit(action, fields, revision)
         except ValidationError:
-            return self.render(notice="Проверьте поля и определение модуля.", status=400)
+            return self.render(edit, notice="Проверьте поля и определение модуля.", status=400, form=form)
         except ModuleError as error:
-            return self.render(notice=module_error(str(error)), status=400)
+            return self.render(edit, notice=module_error(str(error)), status=400, form=form)
         except OSError:
-            return self.render(notice="Не удалось сохранить настройки.", status=503)
-        return RedirectResponse("/modules", status_code=303, headers=SECURE_HTML)
+            return self.render(edit, notice="Не удалось сохранить настройки.", status=503, form=form)
+        tool = fields.get("tool", "") if action == "bind" else ""
+        return self.confirmation(action, saved or edit, tool)
 
     @staticmethod
     def revision(value: str) -> int:
@@ -223,12 +287,14 @@ class ModulePage:
             raise ModuleError("Некорректная ревизия.")
         return int(value)
 
-    async def edit(self, action, fields: dict[str, str], revision: int):
+    async def edit(self, action: str, fields: dict[str, str], revision: int) -> str | None:
         """Translate one form action into the same typed edit used by Bridge."""
         payload = {"expected_revision": revision}
         if action == "save":
             payload["module"] = parse_json(fields.get("data", ""))
-            await self.service.save(Save.model_validate(payload))
+            change = Save.model_validate(payload)
+            await self.service.save(change)
+            return change.module.id
         elif action == "bind":
             payload.update(tool=fields.get("tool"), phase=fields.get("phase"), module=fields.get("module") or None)
             await self.service.bind(Bind.model_validate(payload))
@@ -253,3 +319,4 @@ class ModulePage:
             await self.service.delete(Delete.model_validate(payload))
         else:
             raise ModuleError("Неизвестное действие.")
+        return None

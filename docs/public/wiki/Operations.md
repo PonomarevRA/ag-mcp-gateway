@@ -8,7 +8,13 @@ Choose a profile and check its exact origin. In the overview, inspect connection
 
 For the local gateway token, use `token-set <symbolic-key>` and configure `access_token_keychain`. Configure an environment fallback only when appropriate. Keep test and production settings and tokens separate.
 
+## Tool policy
+
+For a protected profile with MCP Bridge enabled, open **Settings**, choose the MCP server and apply a policy to one tool. If another change advanced the revision, check the current value before retrying. Enable singleflight only for suitable read operations.
+
 ## Logs and metrics
+
+Open **Diagnostics** from an MCP card to filter by that server. Enter a trace ID to locate the warnings and errors for a call. Use **Older events** to continue through the journal. Raw arguments and results are omitted.
 
 ```sh
 ag-mcp-gateway --profile NAME status

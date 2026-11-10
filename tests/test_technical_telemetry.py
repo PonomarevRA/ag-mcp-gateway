@@ -161,6 +161,19 @@ def test_external_collection_and_agent_diagnosis(tmp_path, monkeypatch):
             assert metric_tool["result"]["structuredContent"]["gateway"] == metrics["gateway"]
             assert journal.status()["cursor"] == final["cursor"]
 
+            assert client.get("/diagnostics").status_code == 401
+            assert client.get("/diagnostics", headers={**HEADERS, "Sec-Fetch-Site": "cross-site"}).status_code == 403
+            params = {"backend": "local", "trace_id": trace, "lang": "ru"}
+            html = client.get("/diagnostics", headers=HEADERS, params=params)
+            assert html.headers["Content-Language"] == "ru"
+            assert "MCP вернул ошибку инструмента." in html.text and trace in html.text
+            assert "fixture-private-argument" not in html.text and "fixture-private-result" not in html.text
+            assert "trace_id=" + trace + "&amp;lang=en" in html.text
+            empty = client.get("/diagnostics?trace_id=" + "1" * 32, headers=HEADERS)
+            assert "На этой странице нет ошибок и предупреждений." in empty.text
+            assert client.get("/diagnostics?trace_id=bad", headers=HEADERS).status_code == 400
+            assert client.get("/diagnostics?epoch=expired&before=4", headers=HEADERS).status_code == 409
+
             with sqlite3.connect(journal.path) as connection:
                 connection.execute("UPDATE events SET payload=? WHERE sequence=4", (b"{}",))
             assert client.get(LOGS + "/events", headers=HEADERS).status_code == 503

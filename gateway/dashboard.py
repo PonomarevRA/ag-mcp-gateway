@@ -41,8 +41,8 @@ header, form { display: flex; align-items: end; justify-content: space-between;
 header nav { display: flex; flex-wrap: wrap; gap: .75rem; }
 .language-switch { margin-inline-start: auto; }
 .language-switch [aria-current] { font-weight: 700; text-decoration: underline; }
-a, input, button { color: inherit; }
-a:focus-visible, input:focus-visible, button:focus-visible { outline: 3px solid #3174c2; }
+a, input, select, button { color: inherit; }
+a:focus-visible, input:focus-visible, select:focus-visible, button:focus-visible { outline: 3px solid #3174c2; }
 a { padding: .4rem 0; }
 form { justify-content: start; align-items: center; }
 .credential-form { align-items: end; margin-top: .8rem; min-width: 0; }
@@ -50,7 +50,7 @@ form { justify-content: start; align-items: center; }
   flex: 1 1 min(100%, 12rem); gap: .25rem; min-width: 0; max-width: 100%; }
 .credential-form input { width: 100%; min-width: 0; }
 .credential-form button { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
-input, button { font: inherit; border: 1px solid #64768b; border-radius: .45rem;
+input, select, button { font: inherit; border: 1px solid #64768b; border-radius: .45rem;
   padding: .4rem .65rem; background: transparent; max-width: 100%; box-sizing: border-box; }
 .metrics { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(100%,9rem),1fr));
   gap: .65rem; margin: .8rem 0; }
@@ -65,6 +65,9 @@ small, .muted { color: #445770; }
 .backends { grid-template-columns: repeat(auto-fit,minmax(min(100%,17rem),1fr)); }
 .backend-heading { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem .65rem; }
 .backend-heading h3 { margin: 0; }
+.diagnostic-fields { margin: .35rem 0 0; display: flex; flex-wrap: wrap; gap: .25rem 1rem; }
+.diagnostic-fields > div { min-width: 0; }
+.diagnostic-fields dd { font-weight: normal; }
 .backend-actions { display: flex; flex-wrap: wrap; gap: .35rem .8rem; }
 .status-badge { display: inline-block; max-width: 100%; box-sizing: border-box;
   padding: .1rem .5rem; border-radius: .35rem; font-size: .9em; font-weight: 650;
@@ -111,11 +114,11 @@ def tool_row(tool: dict, metrics: dict) -> str:
     """Show one tool policy, its upstream description and observed counters."""
     name = tool["name"]
     counts = metrics.get(name, {})
-    policy = "Запрещён" if tool["denied"] else "Доступен"
+    policy = tr("Запрещён" if tool["denied"] else "Доступен")
     if tool["singleflight"]:
         policy += " · singleflight"
     return (
-        f"<li><strong>{escape(name)}</strong> <small>{tr(policy)}</small>"
+        f"<li><strong>{escape(name)}</strong> <small>{policy}</small>"
         f"<p>{escape(tool['description'])}</p>"
         f"<small>{tr("Запросы")} {display(counts.get('received', 0))} · "
         f"upstream {display(counts.get('upstream', 0))} · "
@@ -145,7 +148,8 @@ def last_call_line(timestamp: str | None) -> str:
     return f'<p class="muted">{tr("Последний вызов")}: {value}</p>'
 
 
-def backend_card(backend: dict, can_manage: bool, tools_href: str | None, csrf: str | None) -> str:
+def backend_card(backend: dict, can_manage: bool, tools_href: str | None, csrf: str | None,
+                 *, reconnect_context: str = "", diagnostics: bool = False) -> str:
     """Show confirmed transport readiness and relevant actions for one backend."""
     name = escape(backend["name"])
     state = backend["status"]
@@ -158,8 +162,11 @@ def backend_card(backend: dict, can_manage: bool, tools_href: str | None, csrf: 
     if auth == "basic" and can_manage:
         action = "Переавторизоваться" if state == "ready" else "Настроить подключение"
         actions.append(f'<a href="/credentials?backend={name}">{tr(action)}</a>')
+    if diagnostics:
+        actions.append(f'<a href="/diagnostics?backend={name}">{tr("Диагностика")}</a>')
     if csrf is not None:
-        actions.append(f'<form method="post" action="/reconnect/{name}">'
+        context = escape(reconnect_context, quote=True)
+        actions.append(f'<form method="post" action="/reconnect/{name}{context}">'
                        f'<input type="hidden" name="csrf" value="{escape(csrf, quote=True)}">'
                        f'<button type="submit" aria-label="{tr("Переподключить")} {name}">{tr("Переподключить")}</button></form>')
     links = f'<div class="backend-actions">{"".join(actions)}</div>' if actions else ""
@@ -216,7 +223,7 @@ def catalog_navigation(page: dict | None, query: str) -> str:
 
 
 def render(status: dict, query: str, *, credentials: bool = False, management: bool = False,
-           reconnect_csrf: str | None = None, notice: str = "", modules: bool = False) -> str:
+           reconnect_csrf: str | None = None, notice: str = "", modules: bool = False, diagnostics: bool = False) -> str:
     """Render one dashboard snapshot without executing upstream text or links."""
     label = _ENVIRONMENTS.get(status.get("environment"))
     environment = f" · {tr(label)}" if label else ""
@@ -225,6 +232,8 @@ def render(status: dict, query: str, *, credentials: bool = False, management: b
         controls += f'<a href="/modules">{tr("Модули")}</a>'
     if management:
         controls += f'<a href="/settings">{tr("Настройки")}</a>'
+    if diagnostics:
+        controls += f'<a href="/diagnostics">{tr("Диагностика")}</a>'
     metrics = status["metrics"]
     cards = "".join(
         f"<div><dt>{tr(label)}</dt><dd>{display(metrics['total'][key])}</dd></div>"
@@ -238,16 +247,21 @@ def render(status: dict, query: str, *, credentials: bool = False, management: b
         if page["backend"]:
             backend = escape(page["backend"], quote=True)
             reset = escape(catalog_url(query, None), quote=True)
-            backend_filter = f'<input type="hidden" name="backend" value="{backend}"><a href="{reset}">{tr("Все MCP")}</a>'
+            backend_filter = (f'<input type="hidden" name="backend" value="{backend}">'
+                              f'<span>{tr("Фильтр MCP")} <strong>{backend}</strong></span>'
+                              f'<a href="{reset}">{tr("Все MCP")}</a>')
+    reset_search = f'<a href="/">{tr("Сбросить фильтры")}</a>' if query else ""
+    context = catalog_url(query, page["backend"], page["offset"]) if page is not None else "/"
     cards_html = []
     for item in status["connections"]:
         name = item["name"]
         href = None
-        if name in groups:
+        if page is None and name in groups:
             href = f"#tools-{name}"
         elif page is not None and (name in page["groups"] or (page["backend"] and item["tools"])):
-            href = catalog_url(query, name)
-        cards_html.append(backend_card(item, credentials, href, reconnect_csrf))
+            href = catalog_url(query, name) + "#catalog"
+        cards_html.append(backend_card(item, credentials, href, reconnect_csrf,
+                                       reconnect_context=context.removeprefix("/"), diagnostics=diagnostics))
     backends = "".join(cards_html)
     catalog = "".join(
         f'<div><h3 id="tools-{escape(prefix)}">{escape(prefix)}</h3><ul class="tools">{"".join(rows)}</ul></div>'
@@ -271,7 +285,7 @@ def render(status: dict, query: str, *, credentials: bool = False, management: b
 <form action="/" method="get">
 <label for="q">{tr("Имя или описание")}</label>
 <input id="q" name="q" maxlength="200" value="{escape(query, quote=True)}">
-<button type="submit">{tr("Найти")}</button>{backend_filter}
+<button type="submit">{tr("Найти")}</button>{backend_filter}{reset_search}
 </form>
 {catalog_navigation(page, query)}
 {catalog}</section>

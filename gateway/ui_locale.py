@@ -13,8 +13,8 @@ from .ui_messages import ENGLISH, MODULE_ERRORS_RU
 
 _NAMES = {"ru": "Русский", "en": "English"}
 _COOKIE = "amg_ui_lang"
-_FILTERS = {"q": 200, "backend": 32, "offset": 6, "edit": 32, "tool": 128}
-_PAGES = {"/", "/settings", "/modules", "/credentials"}
+_FILTERS = {"q": 200, "backend": 32, "offset": 6, "edit": 32, "tool": 128, "trace_id": 32, "epoch": 128, "before": 19}
+_PAGES = {"/", "/settings", "/modules", "/credentials", "/diagnostics"}
 
 
 @dataclass(frozen=True)
@@ -48,12 +48,15 @@ def module_error(message: str) -> str:
     return tr("Не удалось выполнить операцию модуля.")
 
 
-def language_switch() -> str:
-    """Render keyboard-accessible alternate links to the same safe browser view."""
+def language_switch(*, backend: str | None = None) -> str:
+    """Render alternate links, retaining a validated backend selected by the page."""
     page = _locale.get()
+    filters = dict(page.filters)
+    if backend is not None:
+        filters["backend"] = backend
     items = []
     for code, name in _NAMES.items():
-        url = escape(f"{page.path}?{urlencode((*page.filters, ('lang', code)))}", quote=True)
+        url = escape(f"{page.path}?{urlencode({**filters, 'lang': code})}", quote=True)
         current = ' aria-current="true"' if code == page.language else ""
         items.append(f'<a href="{url}" lang="{code}" hreflang="{code}" rel="alternate"{current}>{name}</a>')
     return f'<nav class="language-switch" aria-label="{tr("Язык интерфейса")}">{"".join(items)}</nav>'

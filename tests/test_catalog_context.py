@@ -217,11 +217,15 @@ def test_dashboard_pages_search_the_full_catalog(tmp_path):
     first = client.get("/").text
     assert "Инструменты · 250" in first
     assert "alpha.tool_000" in first and "alpha.tool_099" in first and "alpha.tool_100" not in first
-    assert 'rel="next" href="/?offset=100"' in first and 'href="/?backend=beta"' in first
+    assert 'rel="next" href="/?offset=100"' in first and 'href="/?backend=beta#catalog"' in first
     assert "alpha.tool_001</strong> <small>Запрещён" in first
+    assert 'href="/?backend=alpha#catalog"' in first
+    filtered_backend = client.get("/?q=Fixture&backend=alpha&lang=en").text
+    assert "MCP filter" in filtered_backend and "Clear filters" in filtered_backend
+    assert "beta.tool_000" not in filtered_backend
     second = client.get("/?offset=100").text
     assert "alpha.tool_100" in second and "beta.tool_074" in second and "beta.tool_075" not in second
-    last = client.get("/?backend=beta&offset=999999").text
+    last = client.get("/?backend=beta&offset=999999&lang=ru").text
     assert "Инструменты · 125" in last and "beta.tool_124" in last and "alpha.tool_124" not in last
     filtered = client.get("/", params={"q": "NEEDLE"}).text
     assert "Инструменты · 1" in filtered and "beta.tool_124" in filtered and "alpha.tool_000" not in filtered

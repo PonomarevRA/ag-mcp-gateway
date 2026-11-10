@@ -5,7 +5,6 @@ import json
 import re
 import time
 from base64 import b64encode
-from dataclasses import replace
 
 import pytest
 from mcp import types
@@ -18,7 +17,7 @@ from gateway.module_data import ModuleError, pointer
 from gateway.module_registry import (ActivateHook, Bind, Delete, Module, ModuleRegistry, PinHook, Run, Save,
                                      SetGenerations)
 from gateway.module_runtime import ModuleService, run_local
-from gateway.policy_settings import ToolPolicySettings
+from gateway.policy_settings import PolicyChange, ToolPolicySettings
 from gateway.profile import Profile
 from gateway.router import Router
 from gateway.telemetry import Journal, Telemetry
@@ -288,29 +287,74 @@ def test_hook_sweep_protects_pins_and_active_bindings(fixture_gateway):
     asyncio.run(scenario())
 
 
-def test_changed_definition_rejects_old_activation(fixture_gateway):
-    """Fail closed before dispatch if a scoped definition or schema changed."""
-    router, _, registry, seen = fixture_gateway
+def test_required_null_survives_disk_catalog_and_resave(fixture_gateway):
+    """Persist an explicit JSON null in filter definitions across each serialization."""
+    router, _, registry, _ = fixture_gateway
+    module = definition("nullable", {"op": "filter", "source": "/input", "pattern": None})
+    registry.save(Save(expected_revision=0, module=module))
+    document = json.loads(registry.path.read_text())
+    assert document["modules"]["nullable"]["steps"][0]["pattern"] is None
+    reopened = ModuleRegistry(router, registry.path)
+    restored = reopened.catalog()["modules"]["nullable"]
+    assert restored["steps"][0]["pattern"] is None
+    reopened.save(Save.model_validate({"expected_revision": 1, "module": restored}))
+    assert run_local(reopened.state.modules["nullable"], [None, False, 0]) == [None]
+
+
+def test_scoped_hook_stays_revoked_after_schema_policy_or_definition_reverts(fixture_gateway):
+    """Reject old activations after ABA edits, including in-flight success accounting."""
+    router, settings, registry, seen = fixture_gateway
 
     async def scenario():
-        """Save a new pipeline and invalidate a live session activation."""
+        """Revert each kind of edit and require explicit reactivation."""
         async with router.running():
-            old = definition("scope", {"op": "select", "source": "/input"})
+            old = definition("scope", {"op": "contains", "source": "/input/value", "pattern": True},
+                             {"op": "select", "source": "/input"})
             registry.save(Save(expected_revision=0, module=old))
             cap = registry.sessions.open()["capability"]
-            registry.activate(ActivateHook(expected_revision=1, capability=cap, tool="demo.read",
-                                           phase="after", module="scope"))
+            meta = {HOOK_META: cap}
+            binding = ActivateHook(expected_revision=1, capability=cap, tool="demo.read",
+                                   phase="after", module="scope")
+            registry.activate(binding)
             route = router.routes["demo.read"]
-            revised_tool = route.tool.model_copy(update={"outputSchema": {"type": "object"}})
-            router.routes["demo.read"] = replace(route, tool=revised_tool)
-            rejected = await router.call("demo.read", {"value": "x"}, metadata={HOOK_META: cap})
+            worker = route.worker
+            catalog = worker.tools
+            original = route.tool.model_copy(update={"outputSchema": {"properties": {"value": {"const": True}}}})
+            worker.tools = {**catalog, "demo.read": original}
+            router._publish("demo", worker)
+            registry.activate(binding)
+            revised_tool = original.model_copy(update={"outputSchema": {"properties": {"value": {"const": 1}}}})
+            worker.tools = {**catalog, "demo.read": revised_tool}
+            router._publish("demo", worker)
+            worker.tools = {**catalog, "demo.read": original}
+            router._publish("demo", worker)
+            rejected = await router.call("demo.read", {"value": "x"}, metadata=meta)
             assert rejected.isError and "Session hook changed" in rejected.content[0].text
-            router.routes["demo.read"] = route
-            changed = definition("scope", {"op": "object", "fields": {"value": "/input/value"}})
+
+            worker.tools = catalog
+            router._publish("demo", worker)
+            registry.activate(binding)
+            settings.change(PolicyChange(expected_revision=0, tool="demo.read", policy="deny"))
+            settings.change(PolicyChange(expected_revision=1, tool="demo.read", policy="singleflight"))
+            rejected = await router.call("demo.read", {"value": "x"}, metadata=meta)
+            assert rejected.isError and "Session hook changed" in rejected.content[0].text
+
+            registry.activate(binding)
+            _, _, in_flight = registry.for_tool("demo.read", router.routes["demo.read"], cap)
+            changed = definition("scope", {"op": "contains", "source": "/input/value", "pattern": 1},
+                                 {"op": "select", "source": "/input"})
             registry.save(Save(expected_revision=1, module=changed))
-            result = await router.call("demo.read", {"value": "x"}, metadata={HOOK_META: cap})
-            assert result.isError and "Session hook changed" in result.content[0].text
+            registry.save(Save(expected_revision=2, module=old))
+            registry.succeeded(in_flight)
+            registry.release(in_flight)
+            rejected = await router.call("demo.read", {"value": "x"}, metadata=meta)
+            assert rejected.isError and "Session hook changed" in rejected.content[0].text
             assert seen == []
             assert not registry.catalog()["hooks"]["scope"]["sessions"]
+
+            registry.activate(binding.model_copy(update={"expected_revision": 3}))
+            accepted = await router.call("demo.read", {"value": "x"}, metadata=meta)
+            assert not accepted.isError
+            assert len(registry.catalog()["hooks"]["scope"]["sessions"]) == 1
 
     asyncio.run(scenario())

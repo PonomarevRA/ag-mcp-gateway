@@ -66,6 +66,9 @@ class ToolPolicySettings:
                 denied.add(tool)
             elif mode == "singleflight":
                 singleflight.add(tool)
+        if self.router.modules is not None:
+            for tool in denied - profile.denied:
+                self.router.modules.sessions.invalidate(tool)
         if profile.denied != denied or profile.singleflight != singleflight:
             profile.denied = denied
             profile.singleflight = singleflight

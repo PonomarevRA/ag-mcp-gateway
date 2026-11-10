@@ -1,9 +1,8 @@
 """Bound the retention and per-session activation of reusable MCP hooks."""
 
-import json
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from uuid import uuid4
 
@@ -49,6 +48,7 @@ class HookLife(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
     created_at: int = Field(ge=0, strict=True)
+    definition_revision: int = Field(default=0, ge=0, strict=True)
     sessions: list[SurvivedSession] = Field(default_factory=list, max_length=MAX_SURVIVED)
     last_used_at: int | None = Field(default=None, ge=0, strict=True)
     pinned: bool = Field(default=False, strict=True)
@@ -72,10 +72,9 @@ class HookLife(BaseModel):
         return self.model_copy(update={"sessions": survivors[-MAX_SURVIVED:], "last_used_at": now})
 
 
-def fingerprint(value) -> str:
-    """Hash the content defining an activation without storing or exposing it in the lease."""
-    data = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
-    return sha256(data).hexdigest()
+def token_hash(token: str) -> str:
+    """Index capabilities by a digest instead of retaining their plaintext."""
+    return sha256(token.encode("ascii")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -83,8 +82,8 @@ class Activation:
     """Pin a local module to its definition and the bound tool schemas."""
 
     module: str
-    definition: str
-    schema: str
+    definition_revision: int
+    schema_generation: int
 
 
 @dataclass
@@ -94,7 +93,7 @@ class HookSession:
     id: str
     expires_at: int
     bindings: dict[tuple[str, str], Activation] = field(default_factory=dict)
-    used: set[tuple[str, str]] = field(default_factory=set)
+    used: set[tuple[str, int]] = field(default_factory=set)
 
 
 class HookSessions:
@@ -116,14 +115,14 @@ class HookSessions:
             raise ModuleError("Hook session limit reached")
         token = secrets.token_urlsafe(32)
         session = HookSession(uuid4().hex, now + _SESSION_SECONDS)
-        self.sessions[fingerprint(token)] = session
+        self.sessions[token_hash(token)] = session
         return {"session_id": session.id, "capability": token, "expires_at": session.expires_at}
 
     def get(self, token) -> HookSession:
         """Resolve only an unexpired server-issued capability."""
-        if not isinstance(token, str) or len(token) != 43:
+        if not isinstance(token, str) or len(token) != 43 or not token.isascii():
             raise ModuleError("Invalid or expired hook session")
-        session = self.sessions.get(fingerprint(token))
+        session = self.sessions.get(token_hash(token))
         if session is None or session.expires_at <= int(time.time()):
             raise ModuleError("Invalid or expired hook session")
         return session
@@ -138,10 +137,17 @@ class HookSessions:
             raise ModuleError("Hook activation limit reached")
         session.bindings[key] = activation
 
+    def invalidate(self, tool: str):
+        """Fence existing bindings after a policy deny, even if it is later lifted."""
+        for session in self.sessions.values():
+            for key, activation in session.bindings.items():
+                if key[0] == tool:
+                    session.bindings[key] = replace(activation, schema_generation=-1)
+
     def close(self, token):
         """Revoke a capability and stop it from authorizing future calls."""
         session = self.get(token)
-        self.sessions.pop(fingerprint(token), None)
+        self.sessions.pop(token_hash(token), None)
         return {"session_id": session.id, "closed": True}
 
     def catalog(self) -> list[dict]:

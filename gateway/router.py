@@ -12,7 +12,7 @@ from .connections import BackendConnections, Connection
 from .credentials import SecretStore
 from .hook_lifecycle import HOOK_META
 from .mcp_client import CatalogSession
-from .module_data import ModuleError, object_required
+from .module_data import ModuleError, json_signature, object_required
 from .module_runtime import check_schema, run_local, transform_result
 from .profile import HttpBackend, Profile
 from .session_context import SESSION_META, SessionContext
@@ -32,6 +32,8 @@ class Route:
     tool: types.Tool
     session: ClientSession
     worker: Connection | None = None
+    schema_generation: int = 0
+    schema_signature: bytes | None = None
 
 
 class Router:
@@ -54,12 +56,20 @@ class Router:
         """Replace only this backend's catalog with the selected generation."""
         self.statuses[prefix] = worker.status
         self.catalog_revision += 1
-        old_names = [name for name in self.routes if name.startswith(prefix + ".")]
-        for name in old_names:
+        old_routes = {name: route for name, route in self.routes.items() if name.startswith(prefix + ".")}
+        for name in old_routes:
             del self.routes[name]
         if worker.session is not None:
             for name, tool in worker.tools.items():
-                self.routes[name] = Route(tool, worker.session, worker)
+                previous = old_routes.get(name)
+                schema_generation = self.catalog_revision
+                signature = None
+                if self.modules is not None:
+                    signature = json_signature([tool.inputSchema, tool.outputSchema])
+                    if previous is not None and previous.schema_signature == signature:
+                        schema_generation = previous.schema_generation
+                self.routes[name] = Route(tool, worker.session, worker, schema_generation, signature)
+
 
     @asynccontextmanager
     async def running(self):

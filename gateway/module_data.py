@@ -5,6 +5,7 @@ import json
 import math
 import operator
 import re
+from hashlib import sha256
 
 MAX_DATA = 262_144
 _NUMERIC = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
@@ -92,6 +93,13 @@ def same_scalar(left, right) -> bool:
     if type(left) in (int, float) and type(right) in (int, float):
         return left == right
     return type(left) is type(right) and left == right
+
+
+
+def json_signature(value) -> bytes:
+    """Canonicalize JSON for revision checks without conflating true and 1."""
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    return sha256(encoded).digest()
 
 
 def contains(value, pattern, budget: list[int]) -> bool:

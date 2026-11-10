@@ -10,8 +10,8 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints, model_validator
 
 from .hook_lifecycle import (MAX_SESSION_USES, Activation, GenerationRules, HookLife, HookSession,
-                             HookSessions, fingerprint)
-from .module_data import ModuleError, bounded_json, formula_tree
+                             HookSessions)
+from .module_data import ModuleError, bounded_json, formula_tree, json_signature
 from .policy_settings import write_state
 from .profile import Identifier, ToolName
 
@@ -102,6 +102,10 @@ class Module(Contract):
             raise ValueError("too many MCP calls")
         return self
 
+    def step_signature(self) -> bytes:
+        """Compare operational steps as JSON, independent of the title."""
+        return json_signature([step.model_dump() for step in self.steps])
+
     @property
     def local(self) -> bool:
         """Return whether this module is eligible for automatic hooks."""
@@ -123,6 +127,12 @@ class ModuleState(Contract):
     bindings: dict[ToolName, Hooks] = Field(default_factory=dict, max_length=256)
     lifecycle: dict[Identifier, HookLife] = Field(default_factory=dict, max_length=64)
     generation_rules: GenerationRules = Field(default_factory=GenerationRules)
+
+    def document(self) -> dict:
+        """Omit absent bindings while preserving required JSON nulls inside modules."""
+        result = self.model_dump(exclude_none=True)
+        result["modules"] = {key: module.model_dump() for key, module in self.modules.items()}
+        return result
 
     @model_validator(mode="after")
     def check_references(self):
@@ -229,7 +239,7 @@ class ModuleRegistry:
 
     def _write(self, state: ModuleState) -> None:
         """Persist a bounded snapshot before publishing it to the event loop."""
-        data = bounded_json(state.model_dump(exclude_none=True), MAX_STATE, node_limit=32_000)
+        data = bounded_json(state.document(), MAX_STATE, node_limit=32_000)
         write_state(self.path, data)
         self.state = state
 
@@ -256,11 +266,12 @@ class ModuleRegistry:
         history = self.state.lifecycle.copy()
         if not module.local:
             history.pop(module.id, None)
-        elif module.id not in history or (before is not None and before.steps != module.steps):
+        elif module.id not in history or (before is not None and before.step_signature() != module.step_signature()):
             prior = history.get(module.id)
-            history[module.id] = HookLife(created_at=int(time.time()), pinned=bool(prior and prior.pinned))
+            history[module.id] = HookLife(created_at=int(time.time()), definition_revision=self.state.revision + 1,
+                                         pinned=bool(prior and prior.pinned))
         modules = {**self.state.modules, module.id: module}
-        definitions = {key: value.model_dump(exclude_none=True) for key, value in modules.items()}
+        definitions = {key: value.model_dump() for key, value in modules.items()}
         # Reserve file capacity for bounded session histories and profile bindings.
         bounded_json(definitions, MAX_DEFINITIONS, node_limit=24_000)
         return self._edit(change, modules=modules, lifecycle=history)
@@ -328,7 +339,7 @@ class ModuleRegistry:
     def catalog(self) -> dict:
         """Expose templates, their generation and pseudonymous session history."""
         state = self.state
-        result = state.model_dump(exclude_none=True)
+        result = state.document()
         rules = state.generation_rules
         result["hooks"] = {
             key: {**life.model_dump(exclude_none=True), "generation": life.generation(rules),
@@ -338,16 +349,6 @@ class ModuleRegistry:
         result.pop("lifecycle")
         result["active_sessions"] = self.sessions.catalog()
         return result
-
-    @staticmethod
-    def module_fingerprint(module: Module) -> str:
-        """Pin execution steps while allowing cosmetic changes to the title."""
-        return fingerprint([step.model_dump(exclude_none=True) for step in module.steps])
-
-    @staticmethod
-    def tool_fingerprint(tool) -> str:
-        """Invalidate activations when the current input or output schema changes."""
-        return fingerprint([tool.inputSchema, tool.outputSchema])
 
     def activate(self, change: ActivateHook) -> dict:
         """Authorize a local hook for the requested session, tool and phase only."""
@@ -366,8 +367,8 @@ class ModuleRegistry:
             now = int(time.time())
             if not life.pinned and life.deadline(self.state.generation_rules) <= now and module.id not in self.protected(now):
                 raise ModuleError("Hook template expired")
-            activation = Activation(module.id, self.module_fingerprint(module), self.tool_fingerprint(route.tool))
-            if (activation.module, activation.definition) not in session.used and len(session.used) >= MAX_SESSION_USES:
+            activation = Activation(module.id, life.definition_revision, route.schema_generation)
+            if (activation.module, activation.definition_revision) not in session.used and len(session.used) >= MAX_SESSION_USES:
                 raise ModuleError("Hook session usage limit reached")
         self.sessions.bind(session, change.tool, change.phase, activation)
         return {"session_id": session.id, "tool": change.tool, "phase": change.phase, "module": change.module}
@@ -388,9 +389,10 @@ class ModuleRegistry:
                 resolved.append(permanent)
                 continue
             module = state.modules.get(activation.module)
-            if (permanent is not None or module is None or not module.local or
-                    self.module_fingerprint(module) != activation.definition or
-                    self.tool_fingerprint(route.tool) != activation.schema):
+            life = state.lifecycle.get(activation.module)
+            if (permanent is not None or module is None or life is None or
+                    life.definition_revision != activation.definition_revision or
+                    route.schema_generation != activation.schema_generation):
                 raise ModuleError("Session hook changed. Detach or activate the current definition.")
             active.append(activation)
             resolved.append(module)
@@ -408,14 +410,12 @@ class ModuleRegistry:
         for activation in usage.activations:
             if len(usage.session.used) + len(seen) >= MAX_SESSION_USES:
                 break
-            key = (activation.module, activation.definition)
-            module = self.state.modules.get(activation.module)
-            if key in usage.session.used or module is None or self.module_fingerprint(module) != activation.definition:
-                continue
+            key = (activation.module, activation.definition_revision)
             life = history.get(activation.module)
-            if life is not None:
-                history[activation.module] = life.used(usage.session.id, now)
-                seen.add(key)
+            if key in usage.session.used or life is None or life.definition_revision != activation.definition_revision:
+                continue
+            history[activation.module] = life.used(usage.session.id, now)
+            seen.add(key)
         if seen:
             try:
                 self._write(self.state.model_copy(update={"lifecycle": history}))

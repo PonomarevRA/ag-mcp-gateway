@@ -1,6 +1,7 @@
 """Expose bounded dashboard settings through a separate local MCP surface."""
 
 import sqlite3
+from bisect import bisect_left
 from html import escape
 
 from mcp import types
@@ -45,9 +46,23 @@ class Management:
         self.settings = settings
         self.origin = origin
         self.credentials = credentials
+        self._policy_key: tuple[int, int] | None = None
+        self._policy_names: tuple[str, ...] = ()
         self.skills = SkillTools(skill_store, router) if skill_store is not None else None
         self.discovery = Discovery(router, feedback, self.skills) if feedback is not None else None
         self.modules = ModuleService(router.modules, router) if router.modules is not None else None
+
+    def policy_names(self) -> tuple[str, ...]:
+        """Reuse the ordered policy union until route or override membership changes."""
+        state = self.settings.state
+        key = self.router.catalog_revision, state.revision
+        if key != self._policy_key:
+            profile = self.router.profile
+            names = set(self.router.routes) | profile.denied | profile.singleflight
+            names.update(tool for tool in state.overrides if tool.partition(".")[0] in profile.backends)
+            self._policy_names = tuple(sorted(names))
+            self._policy_key = key
+        return self._policy_names
 
     def inspect(self, query: InspectQuery) -> dict:
         """Expose current policy revision, connection state and browser destinations."""
@@ -59,12 +74,16 @@ class Management:
             views["modules"] = f"{self.origin}/modules"
         if self.credentials:
             views["credentials"] = f"{self.origin}/credentials"
-        names = set(self.router.routes) | profile.denied | profile.singleflight
-        names |= {tool for tool in self.settings.state.overrides if tool.partition(".")[0] in profile.backends}
-        selected = sorted(name for name in names if query.backend is None or name.startswith(query.backend + "."))
+        names = self.policy_names()
+        start, stop = 0, len(names)
+        if query.backend is not None:
+            # A slash sorts immediately after the period that delimits the namespace.
+            start = bisect_left(names, query.backend + ".")
+            stop = bisect_left(names, query.backend + "/")
+        total = stop - start
         end = query.offset + query.limit
         tools = []
-        for name in selected[query.offset:end]:
+        for name in names[start + query.offset:min(start + end, stop)]:
             policy = "allow"
             if name in profile.denied:
                 policy = "deny"
@@ -103,8 +122,8 @@ class Management:
             "views": views,
             "connections": connections,
             "tools": tools,
-            "total_tools": len(selected),
-            "next_offset": end if end < len(selected) else None,
+            "total_tools": total,
+            "next_offset": end if end < total else None,
         }
 
     def server(self):

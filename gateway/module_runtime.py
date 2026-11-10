@@ -2,12 +2,11 @@
 
 import asyncio
 
-from jsonschema import validate
 from mcp import types
-from referencing import Registry
 
 from .module_data import (ModuleError, array_required, bounded_json, contains, difference,
                           formula, number, object_required, parse_json, pointer)
+from .schema_checks import SchemaChecks
 from .module_registry import (ActivateHook, Aggregate, Bind, Call, Compare, Containment, Delete,
                               HookCapability, ListModules, Math, Module, Object, PinHook, Run, Save,
                               Select, SetGenerations)
@@ -79,12 +78,12 @@ def run_local(module: Module, data):
     return pipeline.context["value"]
 
 
-def check_schema(value, schema: dict | None) -> None:
+def check_schema(value, schema: dict | None, checks: SchemaChecks) -> None:
     """Validate a transformed JSON value without resolving remote schema references."""
     if schema is None:
         return
     try:
-        validate(value, schema, registry=Registry())
+        checks.validate(value, schema)
     except Exception as error:
         raise ModuleError("Module output does not match the tool schema") from error
 
@@ -105,14 +104,14 @@ def result_data(result: types.CallToolResult, *, allow_text: bool = False):
 
 
 def transform_result(module: Module, result: types.CallToolResult,
-                     output_schema: dict | None) -> types.CallToolResult:
+                     output_schema: dict | None, checks: SchemaChecks) -> types.CallToolResult:
     """Replace the JSON payload without forwarding a duplicate of the raw response."""
     value = run_local(module, result_data(result))
     text = bounded_json(value).decode()
     structured = None
     if result.structuredContent is not None:
         structured = object_required(value)
-        check_schema(structured, output_schema)
+        check_schema(structured, output_schema, checks)
     return types.CallToolResult(content=[types.TextContent(type="text", text=text)],
                                 structuredContent=structured, _meta=result.meta)
 

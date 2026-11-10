@@ -4,6 +4,7 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from functools import cached_property
 from time import monotonic
 
 from mcp import ClientSession, types
@@ -12,9 +13,11 @@ from .connections import BackendConnections, Connection
 from .credentials import SecretStore
 from .hook_lifecycle import HOOK_META
 from .mcp_client import CatalogSession
+from .mcp_server import catalog_window
 from .module_data import ModuleError, json_signature, object_required
 from .module_runtime import check_schema, run_local, transform_result
 from .profile import HttpBackend, Profile
+from .schema_checks import SchemaChecks
 from .session_context import SESSION_META, SessionContext
 from .telemetry import Telemetry
 from .trace_context import TraceContext, without_trace_fields
@@ -36,6 +39,18 @@ class Route:
     schema_signature: bytes | None = None
 
 
+@dataclass
+class FlightResult:
+    """Hold the shared response and lazily size it for callers using its original JSON."""
+
+    result: types.CallToolResult
+
+    @cached_property
+    def output_bytes(self) -> int:
+        """Serialize an unchanged shared response once for the journal byte estimate."""
+        return len(self.result.model_dump_json(by_alias=True, exclude_none=True).encode())
+
+
 class Router:
     """Own catalog, upstream workers and the singleflight scope of one profile."""
 
@@ -46,8 +61,11 @@ class Router:
         self.telemetry = telemetry
         self.routes: dict[str, Route] = {}
         self.catalog_revision = 0
+        self._visible_revision = -1
+        self._visible_names: tuple[str, ...] = ()
         self.statuses = dict.fromkeys(profile.backends, "starting")
-        self.pending: dict[tuple[str, bytes, int], asyncio.Task] = {}
+        self.pending: dict[tuple[str, bytes, int], asyncio.Task[FlightResult]] = {}
+        self.schema_checks = SchemaChecks()
         self.modules = None
         self.management_singleflight: set[str] = set()
         self.connections = BackendConnections(profile, self._publish, store, profile_file)
@@ -83,19 +101,29 @@ class Router:
                     flight.cancel()
                 await asyncio.gather(*flights, return_exceptions=True)
 
+    def _catalog_names(self) -> tuple[str, ...]:
+        """Cache visibility and ordering for one publication or policy revision."""
+        if self._visible_revision != self.catalog_revision:
+            self._visible_names = tuple(sorted(name for name in self.routes if name not in self.profile.denied))
+            self._visible_revision = self.catalog_revision
+        return self._visible_names
+
+    def _visible_descriptor(self, name: str) -> types.Tool:
+        """Create a fresh public descriptor without upstream UI or task metadata."""
+        tool = self.routes[name].tool
+        return types.Tool(name=name, title=tool.title, description=tool.description, inputSchema=tool.inputSchema,
+                          outputSchema=tool.outputSchema, annotations=tool.annotations)
+
     def visible_tools(self) -> list[types.Tool]:
-        """Expose accessible tools under stable names without upstream UI or task metadata."""
-        items = []
-        for name, route in sorted(self.routes.items()):
-            if name in self.profile.denied:
-                continue
-            tool = route.tool
-            items.append(types.Tool(
-                name=name, title=tool.title, description=tool.description,
-                inputSchema=tool.inputSchema, outputSchema=tool.outputSchema,
-                annotations=tool.annotations,
-            ))
-        return items
+        """Return all public descriptors for callers that explicitly need the complete list."""
+        return [self._visible_descriptor(name) for name in self._catalog_names()]
+
+    def visible_page(self, cursor: str | None) -> types.ListToolsResult:
+        """Materialize only the selected revision-fenced page of public descriptors."""
+        names = self._catalog_names()
+        window, next_cursor = catalog_window(len(names), cursor, self.catalog_revision)
+        return types.ListToolsResult(tools=[self._visible_descriptor(name) for name in names[window]],
+                                     nextCursor=next_cursor)
 
     def singleflight_active(self, name: str, route: Route) -> bool:
         """Require live read-only metadata for management opt-ins, even after rediscovery."""
@@ -163,6 +191,7 @@ class Router:
         input_bytes = output_bytes = 0
         context = None
         hook_usage = None
+        flight = None
         modules = self.modules
         hook_token = None
         if metadata is not None and HOOK_META in metadata:
@@ -203,26 +232,30 @@ class Router:
             input_bytes = len(encoded)
             if metadata is None and trace is None and self.singleflight_active(name, route):
                 if before is not None:
-                    check_schema(arguments, route.tool.inputSchema)
+                    check_schema(arguments, route.tool.inputSchema, self.schema_checks)
                 task, joined = self._shared(name, encoded, route, arguments)
-                result = await asyncio.shield(task)
+                flight = await asyncio.shield(task)
+                result = flight.result
             else:
                 try:
                     arguments, forwarded = self._contextual_call(name, route, arguments, metadata, context, trace)
                 except ValueError:
                     return tool_error("Configured session parameter is absent from the upstream schema")
                 if before is not None:
-                    check_schema(arguments, route.tool.inputSchema)
+                    check_schema(arguments, route.tool.inputSchema, self.schema_checks)
                 result = await self._dispatch(name, route, arguments, forwarded)
             if after is not None and not result.isError:
                 try:
-                    result = transform_result(after, result, route.tool.outputSchema)
+                    result = transform_result(after, result, route.tool.outputSchema, self.schema_checks)
                 except ModuleError:
                     return tool_error("Response hook failed after the upstream call completed")
             if hook_usage is not None and not result.isError:
                 modules.succeeded(hook_usage)
             outcome = "error" if result.isError else "ok"
-            output_bytes = len(result.model_dump_json(by_alias=True, exclude_none=True).encode())
+            if flight is not None and result is flight.result:
+                output_bytes = flight.output_bytes
+            else:
+                output_bytes = len(result.model_dump_json(by_alias=True, exclude_none=True).encode())
             return result
         except ModuleError as error:
             return tool_error(str(error))
@@ -265,7 +298,7 @@ class Router:
         async def run():
             """Forget the flight after success, failure or shutdown cancellation."""
             try:
-                return await self._dispatch(name, route, arguments)
+                return FlightResult(await self._dispatch(name, route, arguments))
             finally:
                 self.pending.pop(key, None)
 
@@ -284,7 +317,7 @@ class Router:
         try:
             async with asyncio.timeout(self.profile.timeout_seconds):
                 if isinstance(route.session, CatalogSession):
-                    return await route.session.call_published_tool(route.tool, arguments, metadata)
+                    return await route.session.call_published_tool(route.tool, arguments, metadata, self.schema_checks)
                 return await route.session.call_tool(route.tool.name, arguments, meta=metadata)
         except TimeoutError:
             return tool_error("Upstream call timed out")

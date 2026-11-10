@@ -18,7 +18,7 @@ from .connections import ReauthorizationError
 from .credential_ui import CredentialsUI, SECURE_HTML, read_form
 from .dashboard import STYLE, render
 from .management import Management
-from .mcp_server import catalog_page, make_server
+from .mcp_server import make_server
 from .module_data import ModuleError
 from .module_page import ModulePage
 from .skill_tools import maintain_skill_cache
@@ -105,7 +105,7 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
 
     async def catalog(cursor):
         """List one page of the currently visible gateway catalog."""
-        page = catalog_page(router.visible_tools(), cursor, router.catalog_revision)
+        page = router.visible_page(cursor)
         if management is not None and management.discovery is not None:
             management.discovery.decorate(page.tools)
         return page

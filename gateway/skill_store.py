@@ -51,10 +51,13 @@ COMMIT;
 
 def query_words(value: str) -> set[str]:
     """Normalize text to Unicode search terms without exposing FTS query syntax."""
-    words = re.findall(r"[^\W_]+", unicodedata.normalize("NFC", value.lower()))
+    text = value.lower()
+    if text.isascii():
+        return set(re.findall(r"[^\W_]+", text))
+    words = re.findall(r"[^\W_]+", unicodedata.normalize("NFC", text))
     return {
         "".join(char for char in unicodedata.normalize("NFD", word) if unicodedata.category(char) != "Mn")
-        if word.isascii() or all("LATIN" in unicodedata.name(char, "") for char in word)
+        if not word.isascii() and all("LATIN" in unicodedata.name(char, "") for char in word)
         else word
         for word in words
     }

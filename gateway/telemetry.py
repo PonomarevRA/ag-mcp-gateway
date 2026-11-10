@@ -31,14 +31,18 @@ class Journal:
         if len(line) > self.segment_bytes:
             return
         current = self.paths[0]
-        if current.exists() and current.stat().st_size + len(line) > self.segment_bytes:
-            for index in range(_SEGMENTS - 1, 0, -1):
-                older, newer = self.paths[index - 1], self.paths[index]
-                if older.exists():
-                    older.replace(newer)
+        with current.open("ab") as sink:
+            if sink.tell() + len(line) <= self.segment_bytes:
+                sink.write(line)
+                return
+        for index in range(_SEGMENTS - 1, 0, -1):
+            older, newer = self.paths[index - 1], self.paths[index]
+            try:
+                older.replace(newer)
+            except FileNotFoundError:
+                continue
         with current.open("ab") as sink:
             sink.write(line)
-
 
     def recent_successes(self, max_bytes: int, limit: int) -> list[tuple[str, float]]:
         """Read a bounded tail of retained successful non-joined journal events."""

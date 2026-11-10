@@ -4,7 +4,7 @@ from mcp import McpError, types
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
-VERSION = "0.10.0"
+VERSION = "0.10.1"
 _PAGE_SIZE = 100
 
 
@@ -27,8 +27,8 @@ def make_server(list_tools, call_tool) -> Server:
     return server
 
 
-def catalog_page(tools: list[types.Tool], cursor: str | None, revision: int) -> types.ListToolsResult:
-    """Publish one bounded page and reject cursors from a previous catalog revision."""
+def catalog_window(total: int, cursor: str | None, revision: int) -> tuple[slice, str | None]:
+    """Validate the revision and select a page before materializing its descriptors."""
     start = 0
     if cursor is not None:
         prefix = f"{revision}:"
@@ -36,11 +36,18 @@ def catalog_page(tools: list[types.Tool], cursor: str | None, revision: int) -> 
         if not cursor.startswith(prefix) or not offset.isascii() or not offset.isdecimal() or len(offset) > 8:
             raise McpError(types.ErrorData(code=types.INVALID_PARAMS, message="Invalid catalog cursor"))
         start = int(offset)
-        if start % _PAGE_SIZE or not 0 < start < len(tools):
+        if start % _PAGE_SIZE or not 0 < start < total:
             raise McpError(types.ErrorData(code=types.INVALID_PARAMS, message="Invalid catalog cursor"))
     end = start + _PAGE_SIZE
-    next_cursor = f"{revision}:{end}" if end < len(tools) else None
-    return types.ListToolsResult(tools=tools[start:end], nextCursor=next_cursor)
+    next_cursor = f"{revision}:{end}" if end < total else None
+    return slice(start, end), next_cursor
+
+
+
+def catalog_page(tools: list[types.Tool], cursor: str | None, revision: int) -> types.ListToolsResult:
+    """Publish a page from an already materialized static catalogue."""
+    window, next_cursor = catalog_window(len(tools), cursor, revision)
+    return types.ListToolsResult(tools=tools[window], nextCursor=next_cursor)
 
 
 async def serve_stdio(server: Server) -> None:

@@ -44,6 +44,31 @@ class ObservedReceiveStream(ObjectReceiveStream):
         await self.source.aclose()
 
 
+class EventStreamPacing:
+    """Bound stateful GET reconnects without changing request POST deadlines."""
+
+    def __init__(self, minimum_interval: float = 1.0):
+        """Allow a new GET start at most once per interval for this HTTP session."""
+        self.minimum_interval = minimum_interval
+        self.next_start = 0.0
+        self.lock = asyncio.Lock()
+
+    async def request(self, request: httpx.Request):
+        """Pace SSE reconnects and use an idle stream timeout independent of tool calls."""
+        if request.method != "GET":
+            return
+        timeout = request.extensions.get("timeout", {})
+        read_timeout = timeout.get("read")
+        if read_timeout is not None:
+            request.extensions["timeout"] = {**timeout, "read": max(read_timeout, 300)}
+        clock = asyncio.get_running_loop().time
+        async with self.lock:
+            remaining = self.next_start - clock()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            self.next_start = clock() + self.minimum_interval
+
+
 @asynccontextmanager
 async def open_session(config, timeout: float, authorization: str | None = None,
                        probe: ConnectionProbe | None = None):
@@ -66,9 +91,11 @@ async def open_session(config, timeout: float, authorization: str | None = None,
                 token = secret(config.bearer_token_env)
                 authorization = f"Bearer {token}" if token else None
             headers = {"Authorization": authorization} if authorization else {}
-            hooks = {"response": [probe.response]}
+            pacing = EventStreamPacing()
+            request_hooks = [pacing.request]
             if config.forward_trace_context:
-                hooks["request"] = [inject_http_trace]
+                request_hooks.append(inject_http_trace)
+            hooks = {"response": [probe.response], "request": request_hooks}
             client = await stack.enter_async_context(httpx.AsyncClient(
                 headers=headers, timeout=timeout, follow_redirects=False, trust_env=not config.loopback,
                 event_hooks=hooks,

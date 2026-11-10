@@ -5,6 +5,7 @@ import asyncio
 import getpass
 import json
 import logging
+import sqlite3
 import sys
 import warnings
 from collections import deque
@@ -25,6 +26,8 @@ from .policy_settings import ToolPolicySettings
 from .profile import HttpBackend, Profile, SecretKey, load_profile
 from .router import Router
 from .session_context import SessionContext, add_session_options, session_from_cli
+from .skill_store import SkillStore
+from .skill_tools import SkillReference
 from .telemetry import Journal, Telemetry
 from .token_secrets import resolve_token, valid_token
 
@@ -76,6 +79,12 @@ def parser() -> argparse.ArgumentParser:
     token_set.add_argument("key", help="symbolic Keychain reference")
     tag = commands.add_parser("session-tag", help="derive the journal tag for a declared session")
     add_session_options(tag)
+    review = commands.add_parser("skill-review", help="list drafts or read one draft before approval")
+    review.add_argument("id", nargs="?")
+    approve = commands.add_parser("skill-approve", help="approve one immutable MCP skill draft")
+    approve.add_argument("id")
+    discard = commands.add_parser("skill-discard", help="remove one pending MCP skill draft")
+    discard.add_argument("id")
     commands.add_parser("status", help="print status and metrics as JSON")
     logs = commands.add_parser("logs", help="print the most recent metadata journal events")
     logs.add_argument("--backend", help="filter events by the configured MCP backend name")
@@ -104,10 +113,34 @@ def serve(args, profile: Profile, token: str | None, store: MacKeychain | None):
         profile_file = args.profiles.expanduser() / f"{profile.name}.json"
         router = Router(profile, Telemetry(journal), store=store, profile_file=str(profile_file.resolve()))
         settings = ToolPolicySettings(router, directory / "tool-policy.json")
-        app = create_app(router, args.port, token, settings=settings)
+        skill_store = open_skills(args, profile) if profile.skill_router is not None and token else None
+        app = create_app(router, args.port, token, settings=settings, skill_store=skill_store)
         _LOG.info("Profile %s · http://127.0.0.1:%s/", profile.name, args.port)
         uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False, proxy_headers=False,
                     ws="none", log_level="warning", timeout_graceful_shutdown=10)
+
+
+def open_skills(args, profile: Profile) -> SkillStore:
+    """Open the selected profile's SQLite store for the daemon or local operator."""
+    if profile.skill_router is None:
+        raise ValueError("skill_router is disabled for this profile")
+    path = args.state.expanduser() / profile.state_path / "skills.sqlite3"
+    return SkillStore(path, profile.skill_router)
+
+
+def manage_skill(args, profile: Profile) -> None:
+    """Review, approve or discard a draft using local profile-state permissions."""
+    identity = SkillReference.model_validate({"id": args.id}).id if args.id is not None else None
+    store = open_skills(args, profile)
+    if args.command == "skill-approve":
+        result = store.approve(identity)
+    elif args.command == "skill-discard":
+        result = store.discard(identity)
+    elif identity is not None:
+        result = store.get(identity, "draft")
+    else:
+        result = store.drafts()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 def mac_keychain(profile: Profile) -> MacKeychain | None:
@@ -255,6 +288,8 @@ def main(argv=None) -> int:
         origin = f"http://127.0.0.1:{args.port}"
         if args.command == "config":
             print(config_fragment(args, profile, session))
+        elif args.command in {"skill-review", "skill-approve", "skill-discard"}:
+            manage_skill(args, profile)
         elif args.command == "logs":
             if args.backend and args.backend not in profile.backends:
                 raise ValueError("unknown backend for this profile")
@@ -278,6 +313,8 @@ def main(argv=None) -> int:
         _LOG.error("Profile state is already owned by another gateway process")
     except (ValueError, FileExistsError, SecretStoreError) as error:
         _LOG.error("%s", error)
+    except sqlite3.Error:
+        _LOG.error("Skill storage is unavailable")
     except KeyboardInterrupt:
         return 130
     except Exception as error:

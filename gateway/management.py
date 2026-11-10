@@ -1,5 +1,6 @@
 """Expose bounded dashboard settings through a separate local MCP surface."""
 
+import sqlite3
 from html import escape
 
 from mcp import types
@@ -11,6 +12,8 @@ from .mcp_server import catalog_page, make_server
 from .policy_settings import PolicyChange
 from .profile import HttpBackend, Identifier
 from .router import tool_error
+from .skill_store import SkillStore, SkillStoreError
+from .skill_tools import SkillTools
 
 
 class InspectQuery(BaseModel):
@@ -32,12 +35,13 @@ class ReconnectRequest(BaseModel):
 class Management:
     """Keep management commands separate from proxied tools and secret values."""
 
-    def __init__(self, router, settings, origin: str, credentials: bool):
+    def __init__(self, router, settings, origin: str, credentials: bool, skill_store: SkillStore | None = None):
         """Bind this management surface to the selected profile and loopback origin."""
         self.router = router
         self.settings = settings
         self.origin = origin
         self.credentials = credentials
+        self.skills = SkillTools(skill_store, router) if skill_store is not None else None
 
     def inspect(self, query: InspectQuery) -> dict:
         """Expose current policy revision, connection state and browser destinations."""
@@ -103,9 +107,14 @@ class Management:
             "gateway_reconnect_basic": (ReconnectRequest, "Verify and reconnect one MCP with its stored Basic credential."),
             "gateway_reconnect_mcp": (ReconnectRequest, "Reconnect one configured MCP and refresh its tool catalog."),
         }
+        skill_commands = self.skills.commands if self.skills is not None else {}
         tools = []
         for name, (model, description) in schemas.items():
             read_only = name == "gateway_inspect"
+            tools.append(types.Tool(name=name, description=description, inputSchema=model.model_json_schema(),
+                                    annotations=types.ToolAnnotations(readOnlyHint=read_only, openWorldHint=False)))
+
+        for name, (model, description, read_only, _) in skill_commands.items():
             tools.append(types.Tool(name=name, description=description, inputSchema=model.model_json_schema(),
                                     annotations=types.ToolAnnotations(readOnlyHint=read_only, openWorldHint=False)))
 
@@ -115,6 +124,18 @@ class Management:
 
         async def call(params):
             """Validate and execute an explicitly supported operation."""
+            if params.name in skill_commands:
+                model, _, _, execute = skill_commands[params.name]
+                try:
+                    query = model.model_validate(params.arguments or {})
+                    result = await execute(query)
+                except ValidationError:
+                    return tool_error("Invalid skill arguments")
+                except SkillStoreError as error:
+                    return tool_error(str(error))
+                except (OSError, sqlite3.Error):
+                    return tool_error("Skill storage is unavailable")
+                return types.CallToolResult(content=[], structuredContent=result)
             if params.name not in schemas:
                 return tool_error("Unknown management tool")
             model, _ = schemas[params.name]

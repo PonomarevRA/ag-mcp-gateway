@@ -1,5 +1,6 @@
 """Serve MCP Streamable HTTP and the local dashboard behind one boundary."""
 
+import asyncio
 from base64 import b64decode
 from binascii import Error as Base64Error
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -17,6 +18,7 @@ from .credential_ui import CredentialsUI, SECURE_HTML, read_form
 from .dashboard import STYLE, render
 from .management import Management
 from .mcp_server import catalog_page, make_server
+from .skill_tools import maintain_skill_cache
 from .trace_context import with_http_trace
 
 
@@ -68,13 +70,19 @@ class LocalBoundary:
         await self.app(scope, receive, send)
 
 
-def create_app(router, port: int, token: str | None, *, settings=None):
+async def stop_skill_maintenance(task: asyncio.Task) -> None:
+    """Stop this lifespan's cache maintenance loop."""
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+def create_app(router, port: int, token: str | None, *, settings=None, skill_store=None):
     """Attach MCP, status JSON and credential management to one local profile."""
     origin = f"http://127.0.0.1:{port}"
     credentials = CredentialsUI(router.connections, origin, bool(token))
     management = None
     if router.profile.management_bridge and token and settings is not None:
-        management = Management(router, settings, origin, credentials.enabled)
+        management = Management(router, settings, origin, credentials.enabled, skill_store)
 
     async def catalog(cursor):
         """List one page of the currently visible gateway catalog."""
@@ -98,6 +106,9 @@ def create_app(router, port: int, token: str | None, *, settings=None):
         """Publish a fresh SDK manager for each ASGI lifecycle."""
         async with AsyncExitStack() as stack:
             await stack.enter_async_context(router.running())
+            if management is not None and skill_store is not None:
+                maintenance = asyncio.create_task(maintain_skill_cache(skill_store))
+                stack.push_async_callback(stop_skill_maintenance, maintenance)
             state = {}
             for key, server in servers.items():
                 manager = StreamableHTTPSessionManager(server, json_response=True, stateless=True)

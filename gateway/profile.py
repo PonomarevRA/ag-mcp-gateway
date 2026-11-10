@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
 
 from .session_context import SessionField
+from .skill_store import SkillSettings
 
 Identifier = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,32}$")]
 EnvName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]
@@ -105,6 +106,7 @@ class Profile(BaseModel):
     access_token_env: EnvName | None = None
     access_token_keychain: SecretKey | None = None
     management_bridge: bool = Field(default=False, strict=True)
+    skill_router: SkillSettings | None = None
     log_max_bytes: int = Field(default=100_000_000, ge=4096, le=1_000_000_000, strict=True)
     timeout_seconds: float = Field(default=30, gt=0, le=300)
     backends: dict[Identifier, Backend] = Field(min_length=1, max_length=32)
@@ -149,6 +151,8 @@ class Profile(BaseModel):
             raise ValueError("basic_keychain requires a gateway access_token_env or access_token_keychain")
         if self.management_bridge and not has_token:
             raise ValueError("management_bridge requires a gateway token reference")
+        if self.skill_router is not None and not self.management_bridge:
+            raise ValueError("skill_router requires management_bridge")
         if self.denied & self.singleflight:
             raise ValueError("denied and singleflight tool names overlap")
         for name in self.denied | self.singleflight:

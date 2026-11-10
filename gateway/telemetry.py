@@ -91,7 +91,7 @@ class Telemetry:
         self.total.upstream += 1
         self.tools.setdefault(tool, Counts()).upstream += 1
 
-    def completed(self, tool, outcome, elapsed_ms, merged, input_bytes, output_bytes):
+    def completed(self, tool, outcome, elapsed_ms, merged, input_bytes, output_bytes, *, session_tag=None):
         """Update rollups and append one sanitized event per inbound request."""
         for counts in (self.total, self.tools.setdefault(tool, Counts())):
             counts.add_call(outcome, elapsed_ms, merged, input_bytes, output_bytes)
@@ -104,6 +104,8 @@ class Telemetry:
             "request_argument_bytes": input_bytes,
             "result_bytes": output_bytes,
         }
+        if session_tag is not None:
+            event["session_tag"] = session_tag
         try:
             self.journal.write(event)
         except OSError:

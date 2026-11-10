@@ -9,6 +9,8 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
 
+from .session_context import SessionField
+
 Identifier = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,32}$")]
 EnvName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]
 ToolName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_.-]{1,128}$")]
@@ -16,20 +18,41 @@ Environment = Literal["test", "production"]
 _DEFAULT_PORTS = {None: 18792, "test": 18793, "production": 18794}
 
 
-class StdioBackend(BaseModel):
-    """Describe a trusted local command and explicit environment forwarding."""
+ArgumentName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")]
+
+
+class BackendOptions(BaseModel):
+    """Declare optional, local-only session metadata and argument forwarding."""
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    forward_session_context: bool = Field(default=False, strict=True)
+    session_args: dict[ToolName, dict[ArgumentName, SessionField]] = Field(default_factory=dict, max_length=64)
+
+    @field_validator("session_args")
+    @classmethod
+    def reject_credential_parameters(cls, mappings):
+        """Keep caller provenance separate from conventional credential and lease-key arguments."""
+        reserved = {"authorization", "password", "apikey", "secret", "sessionkey", "token",
+                    "accesstoken", "bearertoken", "authtoken", "clientsecret"}
+        for mapping in mappings.values():
+            for parameter in mapping:
+                if parameter.replace("_", "").lower() in reserved:
+                    raise ValueError("session context cannot populate credentials or lease keys")
+        return mappings
+
+
+class StdioBackend(BackendOptions):
+    """Describe a trusted local command and explicit environment forwarding."""
+
     transport: Literal["stdio"]
     command: str = Field(min_length=1)
     args: list[str] = Field(default_factory=list)
     env_from: dict[EnvName, EnvName] = Field(default_factory=dict)
 
 
-class HttpBackend(BaseModel):
+class HttpBackend(BackendOptions):
     """Describe a remote endpoint and an optional bearer-token variable."""
 
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     transport: Literal["http"]
     url: str
     bearer_token_env: EnvName | None = None
@@ -40,7 +63,14 @@ class HttpBackend(BaseModel):
         """Choose at most one upstream authentication source."""
         if self.basic_keychain and self.bearer_token_env:
             raise ValueError("basic_keychain and bearer_token_env are mutually exclusive")
+        if (self.forward_session_context or self.session_args) and not self.loopback:
+            raise ValueError("session context forwarding requires a local MCP backend")
         return self
+
+    @property
+    def loopback(self) -> bool:
+        """Identify an explicitly loopback HTTP endpoint from the validated URL."""
+        return urlsplit(self.url).hostname in {"127.0.0.1", "::1", "localhost"}
 
     @field_validator("url")
     @classmethod

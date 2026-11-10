@@ -9,7 +9,7 @@ import pytest
 from mcp import types
 from starlette.testclient import TestClient
 
-from gateway.credentials import SecretStoreError, basic_authorization, credential_account
+from gateway.credentials import SecretStoreError, basic_authorization, credential_account, pasted_authorization
 from gateway.http_app import create_app
 from gateway.profile import Profile
 from gateway.router import Router
@@ -126,6 +126,10 @@ def test_dashboard_verifies_then_saves_and_reuses_same_gateway_token(gateway):
         assert saved.is_success and "сохранены" in saved.text
         assert "new-fixture-password" not in saved.text and "new-user" not in saved.text
         assert store.values[account] == _NEW and router.routes["grafana.read"].session.label == "new"
+        assert client.post(url, headers=headers, data={"csrf": csrf, "operation": "paste",
+                                                       "basic": "invalid%%%"}).status_code == 400
+        pasted = client.post(url, headers=headers, data={"csrf": csrf, "operation": "paste", "basic": _NEW})
+        assert pasted.is_success and _NEW not in pasted.text
         assert client.post(url, headers=headers, data={"csrf": csrf, "operation": "reconnect"}).is_success
 
     with TestClient(create_app(router, 18794, _LOCAL_TOKEN), base_url=_ORIGIN) as client:
@@ -194,6 +198,11 @@ def test_auth_inputs_and_keychain_scope():
     """Keep colons in passwords and separate profile, backend and endpoint identities."""
     header = basic_authorization("grafana", "p:äss with spaces")
     assert b64decode(header.split()[1]).decode() == "grafana:p:äss with spaces"
+    assert pasted_authorization(header) == pasted_authorization(header.split()[1]) == header
+    latin1 = b64encode("grafana:ä".encode("latin-1")).decode()
+    assert pasted_authorization(latin1) == f"Basic {latin1}"
+    with pytest.raises(ValueError):
+        pasted_authorization("invalid%%%")
     with pytest.raises(ValueError):
         basic_authorization("bad:login", "password")
     scope = "/profiles/company.json"

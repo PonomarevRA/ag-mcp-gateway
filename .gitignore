@@ -14,6 +14,7 @@ dist/
 /profiles/*
 !/profiles/company.example.json
 !/profiles/company-basic.example.json
+!/profiles/local-ag-tasks.example.json
 !/profiles/company-test.example.json
 !/profiles/company-prod.example.json
 /private/runtime/

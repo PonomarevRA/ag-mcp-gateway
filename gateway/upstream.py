@@ -13,6 +13,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
+from .connection_diagnostics import ConnectionProbe
 from .profile import HttpBackend, StdioBackend, secret
 
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_.-]+")
@@ -21,10 +22,10 @@ _TOOL_NAME = re.compile(r"[A-Za-z0-9_.-]+")
 class ObservedReceiveStream(ObjectReceiveStream):
     """Expose SDK transport EOF without consuming messages outside ClientSession."""
 
-    def __init__(self, source: ObjectReceiveStream):
+    def __init__(self, source: ObjectReceiveStream, closed: asyncio.Event):
         """Pair the receive channel with an event owned by the backend worker."""
         self.source = source
-        self.closed = asyncio.Event()
+        self.closed = closed
 
     async def receive(self):
         """Read one message or signal that the underlying transport can no longer deliver."""
@@ -40,8 +41,10 @@ class ObservedReceiveStream(ObjectReceiveStream):
 
 
 @asynccontextmanager
-async def open_session(config, timeout: float, authorization: str | None = None):
+async def open_session(config, timeout: float, authorization: str | None = None,
+                       probe: ConnectionProbe | None = None):
     """Open the selected SDK transport and keep its contexts on the owning task."""
+    probe = probe or ConnectionProbe()
     async with AsyncExitStack() as stack:
         if isinstance(config, StdioBackend):
             environment = {}
@@ -59,13 +62,14 @@ async def open_session(config, timeout: float, authorization: str | None = None)
                 token = secret(config.bearer_token_env)
                 authorization = f"Bearer {token}" if token else None
             headers = {"Authorization": authorization} if authorization else {}
-            loopback = httpx.URL(config.url).host in {"127.0.0.1", "::1", "localhost"}
-            client = await stack.enter_async_context(
-                httpx.AsyncClient(headers=headers, timeout=timeout, follow_redirects=False, trust_env=not loopback)
-            )
+            client = await stack.enter_async_context(httpx.AsyncClient(
+                headers=headers, timeout=timeout, follow_redirects=False, trust_env=not config.loopback,
+                event_hooks={"response": [probe.response]},
+            ))
             streams = await stack.enter_async_context(streamable_http_client(config.url, http_client=client))
-        incoming = ObservedReceiveStream(streams[0])
-        session = ClientSession(incoming, streams[1], read_timeout_seconds=timedelta(seconds=timeout))
+        incoming = ObservedReceiveStream(streams[0], probe.closed)
+        session = ClientSession(incoming, streams[1], read_timeout_seconds=timedelta(seconds=timeout),
+                                message_handler=probe.message)
         await stack.enter_async_context(session)
         yield session, incoming.closed
 
@@ -97,13 +101,17 @@ async def discover(session: ClientSession, prefix: str):
 
 async def run_backend(prefix, config, timeout, publish, authorization: str | None = None):
     """Keep the discovered session alive and publish a sanitized failure on exit."""
+    probe = ConnectionProbe()
     try:
-        async with open_session(config, timeout, authorization) as (session, closed):
+        async with open_session(config, timeout, authorization, probe) as (session, closed):
             async with asyncio.timeout(timeout):
                 await session.initialize()
                 tools = await discover(session, prefix)
-            publish(prefix, session, tools, "ready")
-            await closed.wait()
-            publish(prefix, None, {}, "unavailable (connection closed)")
+            if not closed.is_set():
+                publish(prefix, session, tools, "ready")
+                await closed.wait()
     except Exception as error:
-        publish(prefix, None, {}, f"unavailable ({type(error).__name__})")
+        status = probe.failure(error)
+    else:
+        status = probe.failure(None)
+    publish(prefix, None, {}, status)

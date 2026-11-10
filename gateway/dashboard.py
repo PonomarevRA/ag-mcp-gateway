@@ -2,6 +2,8 @@
 
 from html import escape
 
+from .connection_diagnostics import FAILURE_LABELS
+
 STYLE = """
 :root { color-scheme: light dark; font: 100% system-ui, sans-serif; }
 body { margin: 0; color: #172535; background: #f3f6fa; line-height: 1.5; }
@@ -34,19 +36,31 @@ ul { padding: 0; margin: .7rem 0; list-style: none; display: grid; gap: .45rem; 
 li, h1, header p { overflow-wrap: anywhere; }
 .tools li p { white-space: pre-wrap; margin-top: .2rem; }
 small, .muted { color: #445770; }
+.backends { grid-template-columns: repeat(auto-fit,minmax(min(100%,17rem),1fr)); }
+.backend-heading { display: flex; flex-wrap: wrap; align-items: center; gap: .45rem .65rem; }
+.backend-heading h3 { margin: 0; }
+.backend-actions { display: flex; flex-wrap: wrap; gap: .35rem .8rem; }
+.status-badge { display: inline-block; max-width: 100%; box-sizing: border-box;
+  padding: .1rem .5rem; border-radius: .35rem; font-size: .9em; font-weight: 650;
+  overflow-wrap: anywhere; }
+.status-ready { background: #def3e7; color: #16563a; }
+.status-attention { background: #fff0c4; color: #624600; }
+.status-error { background: #fbe4e5; color: #7d2030; }
+.status-pending { background: #e2edf8; color: #284d72; }
+details { margin-top: .65rem; }
+summary { cursor: pointer; overflow-wrap: anywhere; }
 @media (prefers-color-scheme: dark) {
   body { color: #e7eef9; background: #151e2a; }
   .metrics div, .tools li, .backends li { background: #202d3c; border-color: #52667e; }
   small, .muted { color: #bacbe1; }
+  .status-ready { background: #214936; color: #caf4dc; }
+  .status-attention { background: #59451e; color: #fff0c4; }
+  .status-error { background: #572734; color: #ffe2e7; }
+  .status-pending { background: #294767; color: #e2edf8; }
 }
 """
 
 _ENVIRONMENTS = {"test": "Тестовая среда", "production": "Production"}
-
-_BACKEND_STATUS = {
-    "credentials-missing": "Нужны учётные данные",
-    "keychain-unavailable": "Связка ключей недоступна",
-}
 
 _METRICS = {
     "received": "Запросы",
@@ -83,6 +97,49 @@ def tool_row(tool: dict, metrics: dict) -> str:
     )
 
 
+def backend_card(backend: dict, can_manage: bool, has_tool_group: bool) -> str:
+    """Show confirmed transport readiness and relevant actions for one backend."""
+    name = escape(backend["name"])
+    state = backend["status"]
+    auth = backend["auth"]
+    transport = "Локальный процесс · stdio" if backend["transport"] == "stdio" else "Streamable HTTP"
+    auth_label = {"basic": "HTTP Basic", "bearer": "Bearer", "none": "Без входа через шлюз"}[auth]
+    if state == "ready":
+        title, tone = ("Подключён без входа" if auth == "none" else "Подключён"), "ready"
+        marker = '<span aria-hidden="true">✓</span> '
+    else:
+        title, tone = FAILURE_LABELS.get(state, ("Подключение недоступно", "error"))
+        marker = ""
+    actions = []
+    if has_tool_group:
+        actions.append(f'<a href="#tools-{name}">Инструменты</a>')
+    if auth == "basic" and can_manage:
+        action = "Переавторизоваться" if state == "ready" else "Настроить подключение"
+        actions.append(f'<a href="/credentials?backend={name}">{action}</a>')
+    links = f'<div class="backend-actions">{"".join(actions)}</div>' if actions else ""
+    return (
+        f'<li><div class="backend-heading"><h3>{name}</h3>'
+        f'<span class="status-badge status-{tone}">{marker}{escape(title)}</span></div>'
+        f'<p class="muted">{transport} · {auth_label}</p>'
+        f'<p>Доступных инструментов {display(backend["tools"])}</p>{links}</li>'
+    )
+
+
+def tool_groups(tools: list[dict], query: str, metrics: dict) -> tuple[dict[str, list[str]], int]:
+    """Group matching descriptions by their configured backend namespace."""
+    groups = {}
+    term = query.casefold()
+    count = 0
+    for tool in tools:
+        name = tool["name"]
+        if term not in name.casefold() and term not in tool["description"].casefold():
+            continue
+        prefix = name.partition(".")[0]
+        groups.setdefault(prefix, []).append(tool_row(tool, metrics))
+        count += 1
+    return groups, count
+
+
 def render(status: dict, query: str, *, credentials: bool = False) -> str:
     """Render one dashboard snapshot without executing upstream text or links."""
     label = _ENVIRONMENTS.get(status.get("environment"))
@@ -93,16 +150,14 @@ def render(status: dict, query: str, *, credentials: bool = False) -> str:
         f"<div><dt>{label}</dt><dd>{display(metrics['total'][key])}</dd></div>"
         for key, label in _METRICS.items()
     )
+    groups, count = tool_groups(status["catalog"], query, metrics["tools"])
     backends = "".join(
-        f"<li><strong>{escape(name)}</strong> · {escape(_BACKEND_STATUS.get(state, state))}</li>"
-        for name, state in status["backends"].items()
+        backend_card(item, credentials, item["name"] in groups) for item in status["connections"]
     )
-    term = query.casefold()
-    rows = []
-    for tool in status["catalog"]:
-        if term in tool["name"].casefold() or term in tool["description"].casefold():
-            rows.append(tool_row(tool, metrics["tools"]))
-    catalog = "".join(rows) or "<li>Инструменты не найдены.</li>"
+    catalog = "".join(
+        f'<div><h3 id="tools-{escape(prefix)}">{escape(prefix)}</h3><ul class="tools">{"".join(rows)}</ul></div>'
+        for prefix, rows in groups.items()
+    ) or '<ul class="tools"><li>Инструменты не найдены.</li></ul>'
     return f"""<!doctype html>
 <html lang="ru">
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -110,17 +165,17 @@ def render(status: dict, query: str, *, credentials: bool = False) -> str:
 <main>
 <header><div><h1>ag-mcp-gateway</h1><p>Профиль {escape(status['profile'])}{environment}</p></div>
 <nav aria-label="Действия обзора"><a href="/">Обновить обзор</a>{management}</nav></header>
+<section aria-labelledby="backends"><h2 id="backends">Каталог MCP-серверов</h2>
+<ul class="backends">{backends}</ul></section>
 <section aria-labelledby="metrics"><h2 id="metrics">Вызовы с момента запуска</h2>
 <dl class="metrics">{cards}</dl>
 <p class="muted">Оценка токенов по размеру JSON. Ошибки записи журнала {metrics["journal_errors"]}.</p>
 </section>
-<section aria-labelledby="backends"><h2 id="backends">MCP-серверы</h2>
-<ul class="backends">{backends}</ul></section>
-<section aria-labelledby="catalog"><h2 id="catalog">Каталог инструментов · {len(rows)}</h2>
+<section aria-labelledby="catalog"><h2 id="catalog">Инструменты · {count}</h2>
 <form action="/" method="get">
 <label for="q">Имя или описание</label>
 <input id="q" name="q" maxlength="200" value="{escape(query, quote=True)}">
 <button type="submit">Найти</button>
 </form>
-<ul class="tools">{catalog}</ul></section>
+{catalog}</section>
 </main></html>"""

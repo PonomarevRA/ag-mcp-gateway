@@ -2,7 +2,8 @@
 
 import json
 import re
-from base64 import b64encode
+from base64 import b64decode, b64encode
+from binascii import Error as Base64Error
 from hashlib import sha256
 from typing import Protocol
 
@@ -32,6 +33,25 @@ def basic_authorization(login: str, password: str) -> str:
     if any(ord(char) < 32 or ord(char) == 127 for char in raw):
         raise ValueError("invalid Basic credentials")
     return "Basic " + b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def pasted_authorization(value: str) -> str:
+    """Validate a pasted Basic or raw Base64 pair and return a canonical Basic header."""
+    value = value.strip()
+    if value[:6].lower() == "basic ":
+        value = value[6:].strip()
+    if not value or len(value) + len("Basic ") > _MAX_HEADER:
+        raise ValueError("invalid Basic value")
+    try:
+        decoded = b64decode(value, validate=True)
+    except (Base64Error, ValueError) as error:
+        raise ValueError("invalid Basic value") from error
+    login, separator, password = decoded.partition(b":")
+    if not separator or not 1 <= len(login) <= 1024 or not 1 <= len(password) <= 4096:
+        raise ValueError("invalid Basic value")
+    if any(byte < 32 or byte == 127 for byte in decoded):
+        raise ValueError("invalid Basic value")
+    return "Basic " + b64encode(decoded).decode("ascii")
 
 
 def valid_authorization(value: str) -> bool:

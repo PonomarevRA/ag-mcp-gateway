@@ -10,7 +10,8 @@ from mcp import ClientSession, types
 
 from .connections import BackendConnections, Connection
 from .credentials import SecretStore
-from .profile import Profile
+from .profile import HttpBackend, Profile
+from .session_context import SESSION_META, SessionContext
 from .telemetry import Telemetry
 
 
@@ -93,9 +94,35 @@ class Router:
             "profile": self.profile.name,
             "environment": self.profile.environment,
             "backends": self.statuses.copy(),
+            "connections": self.connection_catalog(catalog),
             "catalog": catalog,
             "metrics": self.telemetry.snapshot(),
         }
+
+    def connection_catalog(self, tools: list[dict]) -> list[dict]:
+        """Summarize configured backends with readiness, auth mode and visible tool counts."""
+        counts = dict.fromkeys(self.profile.backends, 0)
+        for tool in tools:
+            if not tool["denied"]:
+                prefix = tool["name"].partition(".")[0]
+                if prefix in counts:
+                    counts[prefix] += 1
+        items = []
+        for name, backend in self.profile.backends.items():
+            auth = "none"
+            if isinstance(backend, HttpBackend):
+                if backend.basic_keychain:
+                    auth = "basic"
+                elif backend.bearer_token_env:
+                    auth = "bearer"
+            items.append({
+                "name": name,
+                "transport": backend.transport,
+                "auth": auth,
+                "status": self.statuses[name],
+                "tools": counts[name],
+            })
+        return items
 
     async def call(self, name: str, arguments: dict, *, metadata: dict | None = None) -> types.CallToolResult:
         """Check deny policy before routing, then observe one inbound tool call."""
@@ -106,7 +133,14 @@ class Router:
         outcome = "error"
         joined = False
         input_bytes = output_bytes = 0
+        context = None
         try:
+            if metadata is not None and SESSION_META in metadata:
+                try:
+                    context = SessionContext.parse(metadata[SESSION_META])
+                except ValueError:
+                    if not denied:
+                        return tool_error("Invalid gateway session context")
             if denied:
                 outcome = "denied"
                 return tool_error("This tool is disabled by the gateway profile")
@@ -120,9 +154,11 @@ class Router:
                 task, joined = self._shared(name, encoded, route, arguments)
                 result = await asyncio.shield(task)
             else:
-                # Progress tokens belong to the inbound session. No progress stream is relayed.
-                forwarded = {key: value for key, value in (metadata or {}).items() if key != "progressToken"}
-                result = await self._dispatch(name, route, arguments, forwarded or None)
+                try:
+                    arguments, forwarded = self._contextual_call(name, route, arguments, metadata, context)
+                except ValueError:
+                    return tool_error("Configured session parameter is absent from the upstream schema")
+                result = await self._dispatch(name, route, arguments, forwarded)
             outcome = "error" if result.isError else "ok"
             output_bytes = len(result.model_dump_json(by_alias=True, exclude_none=True).encode())
             return result
@@ -133,7 +169,23 @@ class Router:
             raise
         finally:
             elapsed_ms = (monotonic() - start) * 1000
-            self.telemetry.completed(metric_name, outcome, elapsed_ms, joined, input_bytes, output_bytes)
+            session_tag = context.tag if context else None
+            self.telemetry.completed(metric_name, outcome, elapsed_ms, joined, input_bytes, output_bytes,
+                                     session_tag=session_tag)
+
+    def _contextual_call(self, name, route, arguments, metadata, context):
+        """Forward normal MCP extensions and inject only explicitly allowed local identity fields."""
+        backend = self.profile.backends[name.partition(".")[0]]
+        # Progress tokens belong to the inbound session. Gateway identity requires local opt-in.
+        forwarded = {key: value for key, value in (metadata or {}).items()
+                     if key not in {"progressToken", SESSION_META}}
+        if context is not None:
+            if backend.forward_session_context:
+                forwarded[SESSION_META] = context.values
+            mapping = backend.session_args.get(route.tool.name)
+            if mapping:
+                arguments = context.bind(arguments, mapping, route.tool.inputSchema)
+        return arguments, forwarded or None
 
     def _shared(self, name, encoded, route, arguments):
         """Join one flight in this session, or start a flight with no completed-result cache."""

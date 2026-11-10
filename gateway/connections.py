@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 from mcp import ClientSession, types
 
+from .connection_diagnostics import FAILURE_LABELS
 from .credentials import SecretStore, SecretStoreError, credential_account
 from .profile import HttpBackend, Profile
 from .upstream import run_backend
@@ -147,7 +148,8 @@ class BackendConnections:
             candidate = self._start(name, header)
             await candidate.ready.wait()
             if candidate.session is None:
-                raise ReauthorizationError("connection-failed")
+                reason = candidate.status if candidate.status in FAILURE_LABELS else "connection-failed"
+                raise ReauthorizationError(reason)
             if authorization is not None:
                 try:
                     await asyncio.to_thread(self.store.write, self.accounts[name], header)

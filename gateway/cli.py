@@ -19,6 +19,7 @@ from .keychain import MacKeychain
 from .mcp_server import VERSION, serve_stdio
 from .profile import HttpBackend, Profile, load_profile, secret
 from .router import Router
+from .session_context import SessionContext, add_session_options, session_from_cli
 from .telemetry import Journal, Telemetry
 
 _LOG = logging.getLogger("gateway")
@@ -62,14 +63,19 @@ def parser() -> argparse.ArgumentParser:
     commands = root.add_subparsers(dest="command", required=True)
     serve = commands.add_parser("serve", help="run the loopback gateway and dashboard")
     serve.add_argument("--allow-unauthenticated", action="store_true", help="permit local clients without a token")
-    commands.add_parser("stdio", help="attach an MCP stdio client to the running gateway")
+    stdio = commands.add_parser("stdio", help="attach an MCP stdio client to the running gateway")
+    add_session_options(stdio)
+    tag = commands.add_parser("session-tag", help="derive the journal tag for a declared session")
+    add_session_options(tag)
     commands.add_parser("status", help="print status and metrics as JSON")
     logs = commands.add_parser("logs", help="print the most recent metadata journal events")
     logs.add_argument("--backend", help="filter events by the configured MCP backend name")
+    logs.add_argument("--session-tag", help="filter events by a session tag")
     logs.add_argument("--limit", type=int, default=30, choices=range(1, 10001), metavar="1..10000")
     commands.add_parser("demo-profile", help="write a synthetic demo profile")
     commands.add_parser("demo-backend", help="run the synthetic stdio MCP backend")
     config = commands.add_parser("config", help="print a client configuration fragment")
+    add_session_options(config)
     config.add_argument("client", choices=["codex", "cursor", "claude", "opencode", "deepseek", "acp"])
     return root
 
@@ -105,7 +111,7 @@ def mac_keychain(profile: Profile) -> MacKeychain | None:
         return None
 
 
-def show_logs(directory: Path, limit: int, backend: str | None):
+def show_logs(directory: Path, limit: int, backend: str | None, session_tag: str | None):
     """Read a bounded tail across rotations, tolerating a segment moving during a read."""
     recent = deque(maxlen=limit)
     for index in range(3, -1, -1):
@@ -119,18 +125,23 @@ def show_logs(directory: Path, limit: int, backend: str | None):
                         event = json.loads(line)
                     except ValueError:
                         continue
-                    if backend is None or event.get("tool", "").startswith(f"{backend}."):
-                        recent.append(line)
+                    if backend is not None and not event.get("tool", "").startswith(f"{backend}."):
+                        continue
+                    if session_tag is not None and event.get("session_tag") != session_tag:
+                        continue
+                    recent.append(line)
         except FileNotFoundError:
             continue
     sys.stdout.writelines(recent)
 
 
-def config_fragment(args, profile: Profile) -> str:
+def config_fragment(args, profile: Profile, session: SessionContext | None = None) -> str:
     """Generate a client example that references environment secrets by name."""
     command, *leading = executable()
     argv = [*leading, "--profiles", str(args.profiles.expanduser().resolve()),
             "--profile", args.profile, "--port", str(args.port), "stdio"]
+    if session is not None:
+        argv.extend(session.cli_arguments())
     name = profile.client_name
     token_env = profile.access_token_env
     stdio = {"command": command, "args": argv}
@@ -179,15 +190,21 @@ def main(argv=None) -> int:
         if args.command == "demo-backend":
             asyncio.run(serve_stdio(demo_server()))
             return 0
+        session = session_from_cli(args)
+        if args.command == "session-tag":
+            if session is None:
+                raise ValueError("provide at least one session identity")
+            print(session.tag)
+            return 0
         profile = load_profile(args.profiles.expanduser(), args.profile)
         args.port = profile.resolve_port(args.port)
         origin = f"http://127.0.0.1:{args.port}"
         if args.command == "config":
-            print(config_fragment(args, profile))
+            print(config_fragment(args, profile, session))
         elif args.command == "logs":
             if args.backend and args.backend not in profile.backends:
                 raise ValueError("unknown backend for this profile")
-            show_logs(args.state.expanduser() / profile.state_path, args.limit, args.backend)
+            show_logs(args.state.expanduser() / profile.state_path, args.limit, args.backend, args.session_tag)
         else:
             token = secret(profile.access_token_env)
             if args.command == "serve":
@@ -196,7 +213,7 @@ def main(argv=None) -> int:
                 status = asyncio.run(read_status(origin, profile.endpoint_key, token, profile.timeout_seconds))
                 print(json.dumps(status, ensure_ascii=False, indent=2))
             else:
-                asyncio.run(bridge(origin, profile.endpoint_key, token, profile.timeout_seconds + 5))
+                asyncio.run(bridge(origin, profile.endpoint_key, token, profile.timeout_seconds + 5, session))
         return 0
     except Timeout:
         _LOG.error("Profile state is already owned by another gateway process")

@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "name": "local-ag-tasks",
+  "listen_port": 18796,
+  "backends": {
+    "tasks": {
+      "transport": "stdio",
+      "command": "/absolute/path/to/AgTasks",
+      "args": ["--mcp"],
+      "session_args": {
+        "tasks_resolve_conversation": {
+          "harness": "harness",
+          "instance_id": "instanceId",
+          "remote_session_id": "remoteSessionId"
+        }
+      }
+    }
+  },
+  "denied": [],
+  "singleflight": []
+}

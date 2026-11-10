@@ -8,17 +8,18 @@ from urllib.parse import parse_qs
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 
+from .connection_diagnostics import FAILURE_LABELS
 from .connections import ReauthorizationError
-from .credentials import basic_authorization
+from .credentials import basic_authorization, pasted_authorization
 
-_LIMIT = 16_384
+_LIMIT = 32_768
 _MESSAGES = {
     "saved": "Подключение проверено. Учётные данные сохранены в Связке ключей.",
     "saved-offline": "Учётные данные сохранены. Новая сессия закрылась до переключения. Шлюз продолжит использовать прежнее подключение, если оно доступно.",
     "connected": "MCP подключён с сохранёнными учётными данными.",
 }
 _ERRORS = {
-    "invalid": (400, "Проверьте логин и пароль и повторите отправку формы."),
+    "invalid": (400, "Проверьте логин и пароль или строку Basic/Base64."),
     "busy": (409, "Проверка этого MCP уже выполняется."),
     "credentials-missing": (409, "Для этого MCP ещё нет записи в Связке ключей."),
     "keychain-unavailable": (503, "Связка ключей macOS недоступна или не разрешила операцию."),
@@ -48,7 +49,10 @@ class CredentialsUI:
         """Render credential controls and fixed confirmation text."""
         if not self.enabled:
             return PlainTextResponse("Not found", status_code=404, headers=SECURE_HTML)
-        return self._page(_MESSAGES.get(request.query_params.get("result", ""), ""))
+        selected = request.query_params.get("backend")
+        if selected is not None and selected not in self.connections.accounts:
+            return self._error("not-enabled")
+        return self._page(_MESSAGES.get(request.query_params.get("result", ""), ""), selected=selected)
 
     async def update(self, request: Request) -> Response:
         """Validate the protected form, then start one scoped credential transaction."""
@@ -65,34 +69,47 @@ class CredentialsUI:
             operation = fields.pop("operation", "")
             if operation == "save" and set(fields) == {"login", "password"}:
                 authorization = basic_authorization(fields["login"], fields["password"])
+            elif operation == "paste" and set(fields) == {"basic"}:
+                authorization = pasted_authorization(fields["basic"])
             elif operation == "reconnect" and not fields:
                 authorization = None
             else:
                 raise ValueError("invalid form")
         except ValueError:
-            return self._error("invalid")
+            return self._error("invalid", name)
 
         try:
             connected = await self.connections.rotate(name, authorization)
         except ReauthorizationError as error:
-            return self._error(str(error))
+            return self._error(str(error), name)
 
-        if operation == "save":
+        if operation in {"save", "paste"}:
             result = "saved" if connected else "saved-offline"
         elif connected:
             result = "connected"
         else:
-            return self._error("connection-failed")
-        return RedirectResponse(f"/credentials?result={result}", status_code=303, headers=SECURE_HTML)
+            return self._error("connection-failed", name)
+        return RedirectResponse(f"/credentials?backend={name}&result={result}", status_code=303, headers=SECURE_HTML)
 
-    def _error(self, code: str) -> Response:
+    def _error(self, code: str, selected: str | None = None) -> Response:
         """Translate known errors without exposing transport messages or form values."""
-        status, message = _ERRORS.get(code, _ERRORS["connection-failed"])
-        return self._page(message, status)
+        if code in _ERRORS:
+            status, message = _ERRORS[code]
+        elif code in FAILURE_LABELS:
+            message, _tone = FAILURE_LABELS[code]
+            status = 502
+            message += "."
+            worker = self.connections.active.get(selected)
+            if worker is not None and worker.status == "ready":
+                message += " Действующее подключение сохранено."
+        else:
+            status, message = _ERRORS["connection-failed"]
+        return self._page(message, status, selected=selected)
 
-    def _page(self, message: str, status: int = 200) -> Response:
+    def _page(self, message: str, status: int = 200, *, selected: str | None = None) -> Response:
         """Render the profile and one native form pair for each configured Basic backend."""
-        controls = "".join(self._controls(name) for name in sorted(self.connections.accounts))
+        names = [selected] if selected else sorted(self.connections.accounts)
+        controls = "".join(self._controls(name) for name in names)
         notice = f'<p role="status">{escape(message)}</p>' if message else ""
         content = f"""<!doctype html>
 <html lang="ru">
@@ -110,7 +127,14 @@ class CredentialsUI:
         label = escape(name)
         action = f"/credentials/{label}"
         csrf = f'<input type="hidden" name="csrf" value="{self.csrf}">'
-        return f"""<li><h2>{label}</h2>
+        worker = self.connections.active.get(name)
+        if worker is not None and worker.status == "ready":
+            state = '<p class="status-badge status-ready"><span aria-hidden="true">✓</span> MCP подключён</p>'
+        else:
+            code = worker.status if worker is not None else "starting"
+            title, tone = FAILURE_LABELS.get(code, ("Подключение недоступно", "error"))
+            state = f'<p class="status-badge status-{tone}">{escape(title)}</p>'
+        return f"""<li><h2>{label}</h2>{state}
 <form class="credential-form" method="post" action="{action}">
 {csrf}<input type="hidden" name="operation" value="save">
 <div><label for="{label}-login">Логин</label>
@@ -118,6 +142,12 @@ class CredentialsUI:
 <div><label for="{label}-password">Пароль</label>
 <input id="{label}-password" type="password" name="password" required maxlength="1024" autocomplete="new-password"></div>
 <button type="submit">Проверить и сохранить</button></form>
+<details><summary>Ввести готовый Basic / Base64</summary>
+<form class="credential-form" method="post" action="{action}">
+{csrf}<input type="hidden" name="operation" value="paste">
+<div><label for="{label}-basic">Basic / Base64</label>
+<input id="{label}-basic" type="password" name="basic" required maxlength="8198" autocomplete="new-password"></div>
+<button type="submit">Проверить и сохранить Basic</button></form></details>
 <form class="credential-form" method="post" action="{action}">
 {csrf}<input type="hidden" name="operation" value="reconnect">
 <button type="submit">Подключиться с сохранёнными данными</button></form></li>"""

@@ -22,6 +22,7 @@ from .mcp_server import make_server
 from .module_data import ModuleError
 from .module_page import ModulePage
 from .skill_tools import maintain_skill_cache
+from .telemetry import LOG_RETENTION_INTERVAL_SECONDS
 from .telemetry_api import TelemetryAPI
 from .trace_context import with_http_trace
 
@@ -93,6 +94,13 @@ async def maintain_hooks(registry):
         await asyncio.sleep(60)
 
 
+async def maintain_call_journal(journal, retention_days: int):
+    """Expire call segments even while the gateway receives no requests."""
+    while True:
+        await asyncio.sleep(LOG_RETENTION_INTERVAL_SECONDS)
+        journal.prune_expired(retention_days)
+
+
 def create_app(router, port: int, token: str | None, *, settings=None, skill_store=None, feedback=None, technical=None):
     """Attach MCP, status JSON and credential management to one local profile."""
     origin = f"http://127.0.0.1:{port}"
@@ -133,6 +141,10 @@ def create_app(router, port: int, token: str | None, *, settings=None, skill_sto
             events.emit("INFO", "service", "service.starting", "Gateway profile is starting.")
         async with AsyncExitStack() as stack:
             await stack.enter_async_context(router.running())
+            if telemetry_api is not None:
+                cleanup = asyncio.create_task(maintain_call_journal(router.telemetry.journal,
+                                                                   router.profile.log_retention_days))
+                stack.push_async_callback(stop_maintenance, cleanup)
             if management is not None and skill_store is not None:
                 maintenance = asyncio.create_task(maintain_skill_cache(skill_store))
                 stack.push_async_callback(stop_maintenance, maintenance)

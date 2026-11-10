@@ -8,9 +8,13 @@ from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from time import time
 
 _LOG = logging.getLogger("gateway")
 _SEGMENTS = 4
+LOG_FILE_MAX_BYTES = 50_000_000
+DEFAULT_LOG_RETENTION_DAYS = 7
+LOG_RETENTION_INTERVAL_SECONDS = 60
 
 
 class Journal:
@@ -20,10 +24,22 @@ class Journal:
         """Trim retained segments to the configured bound before accepting events."""
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.paths = [folder / f"calls.{index}.jsonl" for index in range(_SEGMENTS)]
-        self.segment_bytes = max_bytes // _SEGMENTS
+        self.segment_bytes = min(max_bytes // _SEGMENTS, LOG_FILE_MAX_BYTES)
         for path in self.paths:
             if path.exists() and path.stat().st_size > self.segment_bytes:
                 path.unlink()
+
+    def prune_expired(self, retention_days: int) -> None:
+        """Remove segments whose last append predates the configured retention window."""
+        cutoff = time() - retention_days * 86400
+        for path in self.paths:
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                _LOG.warning("Unable to expire a gateway call journal segment")
 
     def write(self, event: dict) -> None:
         """Append one event, discarding oldest segments first during rotation."""

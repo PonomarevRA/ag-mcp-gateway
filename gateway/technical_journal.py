@@ -3,16 +3,22 @@
 import json
 import sqlite3
 from collections import deque
-from datetime import datetime, timezone
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Condition, Lock, Thread
+from time import monotonic
 from uuid import uuid4
+
+from .telemetry import DEFAULT_LOG_RETENTION_DAYS, LOG_FILE_MAX_BYTES
+from .telemetry import LOG_RETENTION_INTERVAL_SECONDS as _RETENTION_INTERVAL_SECONDS
 
 APPLICATION = "ag-mcp-gateway"
 STATUS_SCHEMA = "technical-logs-http/v1"
 EVENT_SCHEMA = "technical-log/v1"
 MAX_PAGE_EVENTS = 100
 MAX_PAGE_BYTES = 262_144
+_EVICTION_BATCH_EVENTS = 128
 _MAX_EVENT_BYTES = 16_384
 _MAX_QUEUE_EVENTS = 256
 _MAX_QUEUE_BYTES = 1_048_576
@@ -22,10 +28,11 @@ _PAGE_BYTES = 1024
 class TechnicalJournal:
     """Keep a contiguous committed suffix and a restart-stable cursor in SQLite."""
 
-    def __init__(self, path: Path, max_bytes: int):
-        """Open the local database and start a bounded writer, if storage is available."""
+    def __init__(self, path: Path, max_bytes: int, *, retention_days: int = DEFAULT_LOG_RETENTION_DAYS):
+        """Open the journal with a per-file cap and expire events by age in the writer."""
         self.path = path
-        self.max_bytes = max_bytes
+        self.max_bytes = min(max_bytes, LOG_FILE_MAX_BYTES)
+        self._retention = timedelta(days=retention_days)
         self._db = None
         self._db_lock = Lock()
         self._ready = Condition()
@@ -33,14 +40,16 @@ class TechnicalJournal:
         self._queue_bytes = 0
         self._dropped = 0
         self._error = None
+        self._retention_failed = False
         self._closing = False
         self._worker = None
-        self._batch_size = max(1, min(32, max_bytes // (2 * _MAX_EVENT_BYTES)))
+        self._batch_size = max(1, min(32, self.max_bytes // (2 * _MAX_EVENT_BYTES)))
         try:
             self._db = self._open()
         except (OSError, sqlite3.Error):
             self._error = "journal_unavailable"
         else:
+            self._expire()
             self._worker = Thread(target=self._write_loop, name="gateway-technical-journal", daemon=True)
             self._worker.start()
 
@@ -70,11 +79,16 @@ class TechnicalJournal:
         page_size = db.execute("PRAGMA page_size").fetchone()[0]
         page_limit = self.max_bytes // page_size
         while db.execute("PRAGMA page_count").fetchone()[0] > page_limit:
-            oldest, newest = db.execute("SELECT min(sequence), max(sequence) FROM events").fetchone()
+            oldest, newest = db.execute(
+                "SELECT (SELECT sequence FROM events ORDER BY sequence LIMIT 1),"
+                " (SELECT sequence FROM events ORDER BY sequence DESC LIMIT 1)"
+            ).fetchone()
             if oldest is None:
                 raise OSError("Technical journal quota is too small")
+            # Limit each rollback transaction and retain the newest part when possible.
+            boundary = min(oldest + _EVICTION_BATCH_EVENTS - 1, (oldest + newest) // 2)
             with db:
-                db.execute("DELETE FROM events WHERE sequence <= ?", ((oldest + newest) // 2,))
+                db.execute("DELETE FROM events WHERE sequence <= ?", (boundary,))
         applied = db.execute(f"PRAGMA max_page_count = {page_limit}").fetchone()[0]
         if applied != page_limit:
             raise OSError("Technical journal quota could not be applied")
@@ -99,26 +113,74 @@ class TechnicalJournal:
             self._ready.notify()
 
     def _write_loop(self) -> None:
-        """Drain queued events in FIFO order, counting failures independently of the gateway."""
+        """Drain the FIFO and run age-based cleanup even when no events arrive."""
+        next_cleanup = monotonic() + _RETENTION_INTERVAL_SECONDS
         while True:
             with self._ready:
-                self._ready.wait_for(lambda: self._closing or self._queue)
-                if not self._queue:
+                delay = max(0, next_cleanup - monotonic())
+                self._ready.wait_for(lambda: self._closing or self._queue, timeout=delay)
+                if self._closing and not self._queue:
                     return
                 batch = []
                 for _ in range(min(self._batch_size, len(self._queue))):
                     payload = self._queue.popleft()
                     self._queue_bytes -= len(payload)
                     batch.append(payload)
-            with self._db_lock:
-                lost = self._append(batch)
-                with self._ready:
-                    self._error = "journal_write_failed" if lost else None
-                    if lost:
-                        # One storage failure should not hold shutdown up for one timeout per queued batch.
-                        self._dropped += lost + len(self._queue)
-                        self._queue.clear()
-                        self._queue_bytes = 0
+            if monotonic() >= next_cleanup:
+                self._expire()
+                next_cleanup = monotonic() + _RETENTION_INTERVAL_SECONDS
+            if batch:
+                self._write_batch(batch)
+
+    def _write_batch(self, batch: list[bytes]) -> None:
+        """Append a batch and count losses without repeatedly waiting on failed storage."""
+        with self._db_lock:
+            lost = self._append(batch)
+            with self._ready:
+                self._error = "journal_write_failed" if lost else None
+                if lost:
+                    # One storage failure should not hold shutdown up for one timeout per queued batch.
+                    self._dropped += lost + len(self._queue)
+                    self._queue.clear()
+                    self._queue_bytes = 0
+
+    def _expire(self) -> None:
+        """Release the database lock between chunks so readers can make progress."""
+        cutoff = datetime.now(timezone.utc) - self._retention
+        failed = False
+        while True:
+            with self._ready:
+                if self._closing:
+                    break
+            try:
+                with self._db_lock:
+                    more = self._expire_prefix(cutoff)
+            except (KeyError, OSError, RecursionError, TypeError, ValueError, sqlite3.Error):
+                failed = True
+                break
+            if not more:
+                break
+        with self._ready:
+            self._retention_failed = failed
+
+    def _expire_prefix(self, cutoff: datetime) -> bool:
+        """Delete at most one ordered prefix and report whether another chunk may be expired."""
+        db = self._db
+        query = "SELECT sequence, payload FROM events ORDER BY sequence LIMIT ?"
+        boundary = None
+        count = 0
+        with closing(db.execute(query, (_EVICTION_BATCH_EVENTS,))) as rows:
+            for sequence, payload in rows:
+                recorded = datetime.fromisoformat(json.loads(payload)["recordedAt"])
+                if recorded >= cutoff:
+                    # Keep a contiguous suffix even if the wall clock moved backwards.
+                    break
+                boundary = sequence
+                count += 1
+        if boundary is not None:
+            with db:
+                db.execute("DELETE FROM events WHERE sequence <= ?", (boundary,))
+        return count == _EVICTION_BATCH_EVENTS
 
     def _append(self, batch: list[bytes]) -> int:
         """Commit a batch, retrying quota pressure after evicting the oldest rows."""
@@ -163,8 +225,11 @@ class TechnicalJournal:
         epoch, latest = db.execute("SELECT epoch, latest FROM journal").fetchone()
         oldest = db.execute("SELECT min(sequence) FROM events").fetchone()[0]
         with self._ready:
+            error = self._error
+            if error is None and self._retention_failed:
+                error = "journal_retention_failed"
             health = {
-                "status": "degraded" if self._error else "ok", "errorCode": self._error,
+                "status": "degraded" if error else "ok", "errorCode": error,
                 "queueItems": len(self._queue), "queueBytes": self._queue_bytes, "droppedTotal": self._dropped,
             }
         return {

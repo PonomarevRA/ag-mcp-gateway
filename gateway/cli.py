@@ -116,9 +116,11 @@ def serve(args, profile: Profile, token: str | None, store: MacKeychain | None):
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     with FileLock(str(directory / "gateway.lock"), timeout=0):
         journal = Journal(directory / "logs", profile.log_max_bytes)
+        journal.prune_expired(profile.log_retention_days)
         profile_file = args.profiles.expanduser() / f"{profile.name}.json"
         discovery_enabled = profile.agent_discovery and bool(token)
-        technical = TechnicalJournal(directory / "logs" / "technical.sqlite3", profile.technical_log_max_bytes)
+        technical = TechnicalJournal(directory / "logs" / "technical.sqlite3", profile.technical_log_max_bytes,
+                                     retention_days=profile.log_retention_days)
         events = TechnicalEvents(technical, profile.endpoint_key)
         try:
             telemetry = Telemetry(journal, with_history=discovery_enabled, technical=events)

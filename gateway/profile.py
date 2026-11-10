@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_vali
 
 from .session_context import SessionField
 from .skill_store import SkillSettings
+from .telemetry import DEFAULT_LOG_RETENTION_DAYS, LOG_FILE_MAX_BYTES
 
 Identifier = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,32}$")]
 EnvName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")]
@@ -110,8 +111,9 @@ class Profile(BaseModel):
     modules_enabled: bool = Field(default=False, strict=True)
     module_chain_tools: set[ToolName] = Field(default_factory=set, max_length=256)
     skill_router: SkillSettings | None = None
-    log_max_bytes: int = Field(default=100_000_000, ge=4096, le=1_000_000_000, strict=True)
-    technical_log_max_bytes: int = Field(default=100_000_000, ge=65_536, le=1_000_000_000, strict=True)
+    log_max_bytes: int = Field(default=LOG_FILE_MAX_BYTES, ge=4096, le=1_000_000_000, strict=True)
+    technical_log_max_bytes: int = Field(default=LOG_FILE_MAX_BYTES, ge=65_536, le=1_000_000_000, strict=True)
+    log_retention_days: int = Field(default=DEFAULT_LOG_RETENTION_DAYS, ge=1, le=365, strict=True)
     timeout_seconds: float = Field(default=30, gt=0, le=300)
     backends: dict[Identifier, Backend] = Field(min_length=1, max_length=32)
     denied: set[ToolName] = Field(default_factory=set)

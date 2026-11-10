@@ -181,3 +181,38 @@ def test_collector_byte_limit_preserves_continuation():
         assert payload["nextCursor"]["sequence"] == payload["events"][edge]["sequence"]
     assert json.loads(forward.body)["events"][0]["sequence"] == "1"
     assert json.loads(backward.body)["events"][-1]["sequence"] == "100"
+
+
+def test_call_journal_file_cap_and_idle_expiry(tmp_path, monkeypatch):
+    """Apply the 50 MB file ceiling to legacy quotas and expire an idle segment."""
+    import os
+
+    from gateway.http_app import maintain_call_journal
+    from gateway.telemetry import LOG_FILE_MAX_BYTES
+
+    old = tmp_path / "calls.2.jsonl"
+    with old.open("wb") as source:
+        source.truncate(LOG_FILE_MAX_BYTES + 1)
+    journal = Journal(tmp_path, 1_000_000_000)
+    assert journal.segment_bytes == LOG_FILE_MAX_BYTES
+    assert not old.exists()
+    journal.write({"tool": "fixture.read"})
+    old = journal.paths[1]
+    journal.paths[0].rename(old)
+    os.utime(old, (100, 100))
+    journal.write({"tool": "fixture.read"})
+    monkeypatch.setattr("gateway.http_app.LOG_RETENTION_INTERVAL_SECONDS", 0.005)
+
+    async def expire():
+        """Run the same cleanup task the idle daemon starts."""
+        cleanup = asyncio.create_task(maintain_call_journal(journal, 7))
+        try:
+            async with asyncio.timeout(2):
+                while old.exists():
+                    await asyncio.sleep(0.005)
+        finally:
+            cleanup.cancel()
+            await asyncio.gather(cleanup, return_exceptions=True)
+
+    asyncio.run(expire())
+    assert journal.paths[0].exists()

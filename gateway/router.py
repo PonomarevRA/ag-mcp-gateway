@@ -42,6 +42,7 @@ class Router:
         self.catalog_revision = 0
         self.statuses = dict.fromkeys(profile.backends, "starting")
         self.pending: dict[tuple[str, bytes, int], asyncio.Task] = {}
+        self.management_singleflight: set[str] = set()
         self.connections = BackendConnections(profile, self._publish, store, profile_file)
 
     def _publish(self, prefix: str, worker: Connection):
@@ -81,6 +82,15 @@ class Router:
             ))
         return items
 
+    def singleflight_active(self, name: str, route: Route) -> bool:
+        """Require live read-only metadata for management opt-ins, even after rediscovery."""
+        if name not in self.profile.singleflight:
+            return False
+        if name not in self.management_singleflight:
+            return True
+        annotations = route.tool.annotations
+        return annotations is not None and annotations.readOnlyHint is True
+
     def snapshot(self) -> dict:
         """Describe tool availability and measured traffic without revealing profile secrets."""
         catalog = []
@@ -89,7 +99,7 @@ class Router:
                 "name": name,
                 "description": route.tool.description or "",
                 "denied": name in self.profile.denied,
-                "singleflight": name in self.profile.singleflight,
+                "singleflight": self.singleflight_active(name, route),
             })
         return {
             "profile": self.profile.name,
@@ -153,7 +163,7 @@ class Router:
             encoded = json.dumps(arguments, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
                                  allow_nan=False).encode("utf-8")
             input_bytes = len(encoded)
-            if metadata is None and trace is None and name in self.profile.singleflight:
+            if metadata is None and trace is None and self.singleflight_active(name, route):
                 task, joined = self._shared(name, encoded, route, arguments)
                 result = await asyncio.shield(task)
             else:

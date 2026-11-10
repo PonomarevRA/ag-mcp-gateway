@@ -8,11 +8,13 @@ import pytest
 from mcp import types
 from starlette.testclient import TestClient
 
+from gateway.cli import config_fragment, parser
 from gateway.credentials import SecretStoreError
 from gateway.http_app import create_app
+from gateway.management import InspectQuery, Management
 from gateway.policy_settings import PolicyChange, ToolPolicySettings
 from gateway.profile import Profile
-from gateway.router import Router
+from gateway.router import Route, Router
 from gateway.telemetry import Journal, Telemetry
 from gateway.token_secrets import resolve_token
 
@@ -165,3 +167,64 @@ def test_upstream_bearer_uses_os_item_before_environment(tmp_path, monkeypatch):
         status = client.get("/api/status/fixture").text
         assert "fixture-os-value" not in status and "UPSTREAM_ENV" not in status
         assert client.post("/manage/fixture").status_code == 404
+
+
+def test_saved_management_singleflight_is_suspended_when_read_only_hint_changes(tmp_path):
+    """A changed upstream catalog must not coalesce a tool that can now write."""
+    class Slow:
+        async def call_tool(self, name, arguments, *, meta=None):
+            """Keep concurrent fixture calls in flight together."""
+            await asyncio.sleep(0.01)
+            return types.CallToolResult(content=[])
+
+    def router_for_hint(read_only):
+        """Use a fresh profile and rediscovered tool after each restart."""
+        profile = Profile.model_validate({"name": "fixture", "backends": {
+            "local": {"transport": "stdio", "command": "fixture"},
+        }})
+        router = Router(profile, Telemetry(Journal(tmp_path / "logs", 4096)))
+        tool = types.Tool(name="read", inputSchema={"type": "object"},
+                          annotations=types.ToolAnnotations(readOnlyHint=read_only))
+        router.routes["local.read"] = Route(tool, Slow())
+        return router
+
+    path = tmp_path / "tool-policy.json"
+    original = ToolPolicySettings(router_for_hint(True), path)
+    original.change(PolicyChange(tool="local.read", policy="singleflight", expected_revision=0))
+
+    restored = router_for_hint(False)
+    settings = ToolPolicySettings(restored, path)
+    management = Management(restored, settings, ORIGIN, False)
+    tool = management.inspect(InspectQuery())["tools"][0]
+    assert tool["policy"] == "singleflight" and tool["effective_policy"] == "allow"
+    assert not restored.snapshot()["catalog"][0]["singleflight"]
+
+    async def scenario():
+        """Verify two independently dispatched calls after the hint changes."""
+        await asyncio.gather(restored.call("local.read", {}), restored.call("local.read", {}))
+        assert restored.telemetry.snapshot()["total"]["upstream"] == 2
+
+    asyncio.run(scenario())
+
+
+
+def test_management_config_names_are_distinct_from_ordinary_clients(tmp_path):
+    """Use a reserved client namespace and separate different named profiles."""
+    def fragment(name, management=False):
+        """Render a client entry exactly as the config command would."""
+        profile = Profile.model_validate({"name": name, "environment": "test", "management_bridge": True,
+            "access_token_keychain": "local-gateway",
+            "backends": {"local": {"transport": "stdio", "command": "fixture"}},
+        })
+        argv = ["--profiles", str(tmp_path), "--profile", name, "config", "codex"]
+        if management:
+            argv.append("--management")
+        args = parser().parse_args(argv)
+        args.port = profile.resolve_port(None)
+        return config_fragment(args, profile)
+
+    managed = fragment("x", True)
+    ordinary = fragment("x-manage")
+    assert "[mcp_servers.amg-mgmt-test-x]" in managed
+    assert "[mcp_servers.amg-test-x-manage]" in ordinary
+    assert "mcp-bridge" in managed and "local-gateway" not in managed

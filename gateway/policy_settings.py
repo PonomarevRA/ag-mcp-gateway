@@ -70,6 +70,7 @@ class ToolPolicySettings:
             profile.denied = denied
             profile.singleflight = singleflight
             self.router.catalog_revision += 1
+        self.router.management_singleflight = singleflight - self.baseline_singleflight
         self.state = state
 
     def change(self, change: PolicyChange) -> int:
@@ -86,7 +87,7 @@ class ToolPolicySettings:
             default = "deny"
         elif tool in self.baseline_singleflight:
             default = "singleflight"
-        if change.policy == "singleflight" and default != "singleflight" and tool not in profile.singleflight:
+        if change.policy == "singleflight" and default != "singleflight":
             route = self.router.routes.get(tool)
             annotations = route.tool.annotations if route is not None else None
             if annotations is None or annotations.readOnlyHint is not True:

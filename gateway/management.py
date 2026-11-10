@@ -57,7 +57,12 @@ class Management:
                 policy = "deny"
             elif name in profile.singleflight:
                 policy = "singleflight"
-            tools.append({"tool": name, "policy": policy, "discovered": name in self.router.routes})
+            route = self.router.routes.get(name)
+            effective = policy if route is not None else None
+            if route is not None and policy == "singleflight" and not self.router.singleflight_active(name, route):
+                effective = "allow"
+            tools.append({"tool": name, "policy": policy, "effective_policy": effective,
+                          "discovered": route is not None})
         connections = []
         for name, config in profile.backends.items():
             if query.backend is not None and name != query.backend:
@@ -143,7 +148,10 @@ class Management:
         policies = []
         labels = {"allow": "Разрешён", "deny": "Запрещён", "singleflight": "Singleflight"}
         for tool in current["tools"]:
-            policies.append(f'<li><strong>{escape(tool["tool"])}</strong> · {labels[tool["policy"]]}</li>')
+            label = labels[tool["policy"]]
+            if tool["policy"] == "singleflight" and tool["effective_policy"] != "singleflight":
+                label += " · приостановлен"
+            policies.append(f'<li><strong>{escape(tool["tool"])}</strong> · {label}</li>')
         if not policies:
             policies.append("<li>Инструменты не найдены.</li>")
         links = []

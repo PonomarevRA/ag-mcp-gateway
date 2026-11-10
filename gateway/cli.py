@@ -189,10 +189,11 @@ def config_fragment(args, profile: Profile, session: SessionContext | None = Non
         argv.extend(session.cli_arguments())
     name = profile.client_name
     if management:
-        suffix = "-manage"
-        if len(name) + len(suffix) > 32:
-            suffix = "-m-" + sha256(profile.endpoint_key.encode("ascii")).hexdigest()[:6]
-        name = name[:32 - len(suffix)] + suffix
+        environment = profile.environment or "legacy"
+        name = f"amg-mgmt-{environment}-{profile.name}"
+        if len(name) > 32:
+            suffix = sha256(profile.endpoint_key.encode("ascii")).hexdigest()[:8]
+            name = f"{name[:23]}-{suffix}"
     token_env = profile.access_token_env
     stdio = {"command": command, "args": argv}
     if args.client == "codex":

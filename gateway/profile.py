@@ -22,10 +22,11 @@ ArgumentName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z_][A-Za-z0-9_]
 
 
 class BackendOptions(BaseModel):
-    """Configure startup and optional forwarding of local session metadata."""
+    """Configure startup and opt-in forwarding of request context."""
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
     background_startup: bool = Field(default=False, strict=True)
+    forward_trace_context: bool = Field(default=False, strict=True)
     forward_session_context: bool = Field(default=False, strict=True)
     session_args: dict[ToolName, dict[ArgumentName, SessionField]] = Field(default_factory=dict, max_length=64)
 

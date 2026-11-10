@@ -15,6 +15,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 from .connection_diagnostics import ConnectionProbe
 from .profile import HttpBackend, StdioBackend, secret
+from .trace_context import inject_http_trace
 
 _TOOL_NAME = re.compile(r"[A-Za-z0-9_.-]+")
 
@@ -62,9 +63,12 @@ async def open_session(config, timeout: float, authorization: str | None = None,
                 token = secret(config.bearer_token_env)
                 authorization = f"Bearer {token}" if token else None
             headers = {"Authorization": authorization} if authorization else {}
+            hooks = {"response": [probe.response]}
+            if config.forward_trace_context:
+                hooks["request"] = [inject_http_trace]
             client = await stack.enter_async_context(httpx.AsyncClient(
                 headers=headers, timeout=timeout, follow_redirects=False, trust_env=not config.loopback,
-                event_hooks={"response": [probe.response]},
+                event_hooks=hooks,
             ))
             streams = await stack.enter_async_context(streamable_http_client(config.url, http_client=client))
         incoming = ObservedReceiveStream(streams[0], probe.closed)

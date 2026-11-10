@@ -13,6 +13,7 @@ from .credentials import SecretStore
 from .profile import HttpBackend, Profile
 from .session_context import SESSION_META, SessionContext
 from .telemetry import Telemetry
+from .trace_context import TRACE_FIELDS, TraceContext
 
 
 def tool_error(message: str) -> types.CallToolResult:
@@ -134,6 +135,7 @@ class Router:
         joined = False
         input_bytes = output_bytes = 0
         context = None
+        trace = TraceContext.from_metadata(metadata)
         try:
             if metadata is not None and SESSION_META in metadata:
                 try:
@@ -155,7 +157,7 @@ class Router:
                 result = await asyncio.shield(task)
             else:
                 try:
-                    arguments, forwarded = self._contextual_call(name, route, arguments, metadata, context)
+                    arguments, forwarded = self._contextual_call(name, route, arguments, metadata, context, trace)
                 except ValueError:
                     return tool_error("Configured session parameter is absent from the upstream schema")
                 result = await self._dispatch(name, route, arguments, forwarded)
@@ -171,14 +173,16 @@ class Router:
             elapsed_ms = (monotonic() - start) * 1000
             session_tag = context.tag if context else None
             self.telemetry.completed(metric_name, outcome, elapsed_ms, joined, input_bytes, output_bytes,
-                                     session_tag=session_tag)
+                                     session_tag=session_tag, trace_id=trace.trace_id if trace else None)
 
-    def _contextual_call(self, name, route, arguments, metadata, context):
-        """Forward normal MCP extensions and inject only explicitly allowed local identity fields."""
+    def _contextual_call(self, name, route, arguments, metadata, context, trace):
+        """Apply the selected backend's forwarding rules to request metadata and identity."""
         backend = self.profile.backends[name.partition(".")[0]]
         # Progress tokens belong to the inbound session. Gateway identity requires local opt-in.
         forwarded = {key: value for key, value in (metadata or {}).items()
-                     if key not in {"progressToken", SESSION_META}}
+                     if key not in {"progressToken", SESSION_META} and key.lower() not in TRACE_FIELDS}
+        if trace is not None and backend.forward_trace_context:
+            forwarded.update(trace.carrier())
         if context is not None:
             if backend.forward_session_context:
                 forwarded[SESSION_META] = context.values

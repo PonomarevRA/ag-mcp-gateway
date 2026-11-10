@@ -14,6 +14,7 @@ from starlette.routing import Route
 from .credential_ui import CredentialsUI, SECURE_HTML
 from .dashboard import STYLE, render
 from .mcp_server import catalog_page, make_server
+from .trace_context import with_http_trace
 
 
 def authorized(header: str, token: str, *, basic: bool, bearer: bool = True) -> bool:
@@ -73,8 +74,11 @@ def create_app(router, port: int, token: str | None):
         return catalog_page(router.visible_tools(), cursor, router.catalog_revision)
 
     async def call(params):
-        """Pass extension metadata to the router with the call arguments."""
+        """Pass per-request HTTP trace and MCP metadata to the router."""
         metadata = params.meta.model_dump(by_alias=True, exclude_none=True) if params.meta is not None else None
+        request = mcp.request_context.request
+        if isinstance(request, Request):
+            metadata = with_http_trace(metadata, request.headers)
         return await router.call(params.name, params.arguments or {}, metadata=metadata)
 
     mcp = make_server(catalog, call)

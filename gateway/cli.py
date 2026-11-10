@@ -71,6 +71,7 @@ def parser() -> argparse.ArgumentParser:
     logs = commands.add_parser("logs", help="print the most recent metadata journal events")
     logs.add_argument("--backend", help="filter events by the configured MCP backend name")
     logs.add_argument("--session-tag", help="filter events by a session tag")
+    logs.add_argument("--trace-id", help="filter events by a W3C trace ID")
     logs.add_argument("--limit", type=int, default=30, choices=range(1, 10001), metavar="1..10000")
     commands.add_parser("demo-profile", help="write a synthetic demo profile")
     commands.add_parser("demo-backend", help="run the synthetic stdio MCP backend")
@@ -111,7 +112,8 @@ def mac_keychain(profile: Profile) -> MacKeychain | None:
         return None
 
 
-def show_logs(directory: Path, limit: int, backend: str | None, session_tag: str | None):
+def show_logs(directory: Path, limit: int, backend: str | None, session_tag: str | None,
+              trace_id: str | None = None):
     """Read a bounded tail across rotations, tolerating a segment moving during a read."""
     recent = deque(maxlen=limit)
     for index in range(3, -1, -1):
@@ -125,9 +127,14 @@ def show_logs(directory: Path, limit: int, backend: str | None, session_tag: str
                         event = json.loads(line)
                     except ValueError:
                         continue
-                    if backend is not None and not event.get("tool", "").startswith(f"{backend}."):
+                    if not isinstance(event, dict):
+                        continue
+                    tool = event.get("tool")
+                    if backend is not None and (not isinstance(tool, str) or not tool.startswith(f"{backend}.")):
                         continue
                     if session_tag is not None and event.get("session_tag") != session_tag:
+                        continue
+                    if trace_id is not None and event.get("trace_id") != trace_id:
                         continue
                     recent.append(line)
         except FileNotFoundError:
@@ -204,7 +211,8 @@ def main(argv=None) -> int:
         elif args.command == "logs":
             if args.backend and args.backend not in profile.backends:
                 raise ValueError("unknown backend for this profile")
-            show_logs(args.state.expanduser() / profile.state_path, args.limit, args.backend, args.session_tag)
+            show_logs(args.state.expanduser() / profile.state_path, args.limit, args.backend,
+                      args.session_tag, args.trace_id)
         else:
             token = secret(profile.access_token_env)
             if args.command == "serve":

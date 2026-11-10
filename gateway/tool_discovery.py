@@ -86,15 +86,13 @@ class Discovery:
     def matching(request: Query, candidates, ratings):
         """Yield candidate scores with lexical relevance ahead of usefulness."""
         terms = query_words(request.query)
-        if not terms:
-            return
         exact = request.query.casefold()
         for name, route in candidates:
-            label = f"{name} {(route.tool.title or '')[:120]}"
-            relevance = 3 * len(terms & query_words(label))
-            relevance += len(terms & query_words((route.tool.description or "")[:600]))
-            if name.casefold() == exact:
-                relevance += 100
+            relevance = 100 if name.casefold() == exact else 0
+            if terms:
+                label = f"{name} {(route.tool.title or '')[:120]}"
+                relevance += 3 * len(terms & query_words(label))
+                relevance += len(terms & query_words((route.tool.description or "")[:600]))
             if relevance:
                 helpful, votes = ratings.get(name, (0, 0))
                 yield -relevance, -(helpful + 1) / (votes + 2), name, route

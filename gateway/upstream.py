@@ -45,17 +45,19 @@ class ObservedReceiveStream(ObjectReceiveStream):
 
 
 class EventStreamPacing:
-    """Bound stateful GET reconnects without changing request POST deadlines."""
+    """Bound cursorless notification stream reconnects on one HTTP session."""
 
     def __init__(self, minimum_interval: float = 1.0):
-        """Allow a new GET start at most once per interval for this HTTP session."""
+        """Space cursorless notification GETs by at least the given interval in seconds."""
         self.minimum_interval = minimum_interval
         self.next_start = 0.0
         self.lock = asyncio.Lock()
 
     async def request(self, request: httpx.Request):
-        """Pace SSE reconnects and use an idle stream timeout independent of tool calls."""
-        if request.method != "GET":
+        """Apply the idle timeout only where the SDK cannot be resuming a tool response."""
+        # SDK response resumption always carries Last-Event-ID. The same header can
+        # also appear on a notification stream, so leave all cursor-bearing GETs alone.
+        if request.method != "GET" or "last-event-id" in request.headers:
             return
         timeout = request.extensions.get("timeout", {})
         read_timeout = timeout.get("read")

@@ -12,6 +12,7 @@ from gateway.profile import Profile
 from gateway.router import Route, Router
 from gateway.schema_checks import SchemaChecks
 from gateway.telemetry import Journal, Telemetry
+from gateway.tool_discovery import Discovery, Query
 from gateway.upstream import EventStreamPacing
 
 
@@ -53,6 +54,14 @@ def test_catalog_materializes_only_current_page(tmp_path, monkeypatch):
     assert router.visible_page(None).tools[0].name == "demo.tool_001"
 
 
+
+def test_discovery_matches_punctuation_only_tool_name():
+    """Preserve exact qualified names even when they have no searchable words."""
+    route = Route(types.Tool(name="-", inputSchema={"type": "object"}), object())
+    matches = Discovery.matching(Query(query="_.-"), [("_.-", route)], {})
+    assert [(name, item) for _, _, name, item in matches] == [("_.-", route)]
+
+
 def test_schema_cache_reuses_meta_check_but_checks_each_instance(monkeypatch):
     """Count metaschema work and show bounded eviction and instance rejection."""
     original = Draft202012Validator.check_schema
@@ -74,6 +83,10 @@ def test_schema_cache_reuses_meta_check_but_checks_each_instance(monkeypatch):
     cache.validate("valid", two)
     cache.validate(3, one)
     assert checked == [one, two, one]
+    too_small = SchemaChecks(byte_limit=4)
+    too_small.validate(1, one)
+    too_small.validate(2, one)
+    assert checked[-2:] == [one, one]
 
 
 def test_joined_callers_size_unchanged_result_once(tmp_path, monkeypatch):
@@ -108,16 +121,17 @@ def test_joined_callers_size_unchanged_result_once(tmp_path, monkeypatch):
     assert (counts.received, counts.upstream, counts.merged) == (24, 1, 23)
 
 
-def test_sse_reconnects_are_paced_without_delaying_posts():
-    """Use mock HTTP and prove GET pacing and independent HTTP timeouts."""
+def test_cursorless_sse_reconnects_are_paced_without_delaying_tool_resumption():
+    """Use mock HTTP to verify pacing and deadlines for each request type."""
     async def exercise():
-        """Queue two event-stream reads and an ordinary tool POST."""
+        """Queue two idle reads, a normal POST and a resumable tool response."""
         seen = []
         clock = asyncio.get_running_loop().time
 
         def handle(request):
             """Record the actual transport start and its configured read timeout."""
-            seen.append((request.method, clock(), request.extensions["timeout"]["read"]))
+            seen.append((request.method, clock(), request.extensions["timeout"]["read"],
+                         request.headers.get("last-event-id")))
             return httpx.Response(200, content=b"")
 
         pacing = EventStreamPacing(minimum_interval=0.03)
@@ -127,8 +141,11 @@ def test_sse_reconnects_are_paced_without_delaying_posts():
             again = asyncio.create_task(client.get("http://fixture"))
             await asyncio.sleep(0)
             await client.post("http://fixture")
+            await client.get("http://fixture", headers={"Last-Event-ID": "response-cursor"})
             await again
-        assert [(method, timeout) for method, _, timeout in seen] == [("GET", 300), ("POST", 2), ("GET", 300)]
-        assert seen[2][1] - seen[0][1] >= 0.028
+        assert [(method, timeout, cursor) for method, _, timeout, cursor in seen] == [
+            ("GET", 300, None), ("POST", 2, None), ("GET", 2, "response-cursor"), ("GET", 300, None),
+        ]
+        assert seen[3][1] - seen[0][1] >= 0.028
 
     asyncio.run(exercise())

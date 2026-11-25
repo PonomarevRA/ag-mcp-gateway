@@ -19,6 +19,7 @@ from .connections import ReauthorizationError
 from .credential_ui import LIVE_SETTINGS_HTML, SECURE_HTML, read_form
 from .dashboard import backend_filter, connection_status, last_call_line
 from .mcp_server import catalog_page, make_server
+from .mock_test_models import argument_issues, describe_issues
 from .mock_tests import MockTestError
 from .module_data import ModuleError
 from .module_runtime import ModuleService
@@ -279,10 +280,18 @@ class Management:
         model, _, _, execute = command
         try:
             result = await execute(model.model_validate(arguments))
-        except ValidationError:
-            return tool_error("Invalid mock test arguments", details={"code": "invalid_test_arguments"})
+        except ValidationError as error:
+            issues = argument_issues(error)
+            return tool_error(describe_issues("Invalid mock test arguments", issues), details={
+                "code": "invalid_test_arguments", "issues": issues, "issue_count": error.error_count(),
+            })
         except MockTestError as error:
-            return tool_error(str(error), details={"code": error.code})
+            details = {"code": error.code}
+            message = str(error)
+            if error.issues:
+                details["issues"] = error.issues
+                message = describe_issues("Scenario validation failed", error.issues)
+            return tool_error(message, details=details)
         except (OSError, sqlite3.Error):
             return tool_error("Mock test storage is unavailable", details={"code": "test_storage_unavailable"})
         return types.CallToolResult(content=[], structuredContent=result)

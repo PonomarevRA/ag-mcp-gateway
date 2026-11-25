@@ -15,9 +15,9 @@ from mcp import types
 from pydantic import ValidationError
 
 from .mock_test_models import (
-    MAX_COLLECTIONS, MAX_REQUESTS, MAX_SCENARIO_BYTES, MAX_SCENARIO_RECORD_BYTES,
+    EXAMPLE_SCENARIO, MAX_COLLECTIONS, MAX_REQUESTS, MAX_SCENARIO_BYTES, MAX_SCENARIO_RECORD_BYTES,
     GetRun, GroupRecord, ListScenarios, MockTestError,
-    MoveScenario, RunScenario, SaveGroup, SaveScenario, Scenario, ScenarioRecord,
+    MoveScenario, RunScenario, SaveGroup, SaveScenario, Scenario, ScenarioRecord, ScenarioTemplate,
     ValidateScenario, WorkerReceipt, encode_scenario_record,
     select_fixture, validation_issues,
 )
@@ -111,12 +111,40 @@ class MockTests:
         self.active = 0
         self.commands = {
             "gateway_test_list": (ListScenarios, "List mock request collections and saved requests.", True, self.list),
-            "gateway_test_validate": (ValidateScenario, "Validate a draft mock scenario without saving it.", True, self.validate),
-            "gateway_test_save": (SaveScenario, "Save a synthetic request. Set group_id on creation or use gateway_test_move for existing requests.", False, self.save),
-            "gateway_test_group_save": (SaveGroup, "Create or rename a mock request collection.", False, self.save_group),
+            "gateway_test_template": (
+                ScenarioTemplate,
+                "Get a runnable mock scenario in the scenario field and the validate, save, run and report workflow. "
+                "Call with {} before authoring a scenario.",
+                True, self.template,
+            ),
+            "gateway_test_validate": (
+                ValidateScenario,
+                "Validate a draft in the scenario field. Call gateway_test_template for a complete example. "
+                "The scenario requires id, title, tool and input_schema. Put synthetic responses in "
+                "fixtures[].structured_content and assertions in checks, with JSON Pointer paths like /echo.",
+                True, self.validate,
+            ),
+            "gateway_test_save": (
+                SaveScenario,
+                "Save the scenario from gateway_test_template or your validated draft. Pass scenario, "
+                "expected_revision (0 to create), and optional group_id for a new scenario. "
+                "Use the returned revision to run. Use gateway_test_move to move an existing scenario.",
+                False, self.save,
+            ),
+            "gateway_test_group_save": (
+                SaveGroup, "Create a collection with id, title and expected_revision=0, "
+                "or rename it at the current revision.", False, self.save_group,
+            ),
             "gateway_test_move": (MoveScenario, "Move a mock request to a collection or to ungrouped using its placement revision.", False, self.move),
-            "gateway_test_run": (RunScenario, "Run one saved scenario in an isolated local MCP process.", False, self.run),
-            "gateway_test_run_get": (GetRun, "Read a retained mock test report by run ID.", True, self.get_run),
+            "gateway_test_run": (
+                RunScenario, "Run a saved mock in a synthetic local MCP process. "
+                "Pass the scenario id and expected_revision from save or list. Returns run_id and passed.",
+                False, self.run,
+            ),
+            "gateway_test_run_get": (
+                GetRun, "Read a retained mock report using run_id from gateway_test_run, "
+                "including passed, checks and response.", True, self.get_run,
+            ),
         }
 
     def _active_catalog(self) -> Path:
@@ -283,6 +311,20 @@ class MockTests:
         issues = self._validation_issues(request.scenario)
         return {"valid": not issues, "issues": issues}
 
+    async def template(self, _request: ScenarioTemplate) -> dict:
+        """Return an example and guide callers through the mock commands."""
+        return {
+            "scenario": Scenario.model_validate(EXAMPLE_SCENARIO).model_dump(exclude_unset=True),
+            "workflow": [
+                "Change the id, title and tool to suit your test. Set input_schema for your arguments.",
+                "Use the arguments in the fixture match. Set the synthetic response and corresponding checks.",
+                "Call gateway_test_validate with scenario. After valid is true, call gateway_test_save with scenario, "
+                "expected_revision 0 and optional group_id. Use gateway_test_group_save to create a collection.",
+                "Call gateway_test_run with id and the saved revision as expected_revision. "
+                "Call gateway_test_run_get with run_id to read the report.",
+            ],
+        }
+
     def _validation_issues(self, scenario: Scenario) -> list[dict[str, str]]:
         """Skip matching raw arguments when an effective hook can transform them."""
         live = self.router.modules
@@ -294,7 +336,7 @@ class MockTests:
         """Apply the profile's executable scenario rules before persisting a definition."""
         issues = self._validation_issues(scenario)
         if issues:
-            raise MockTestError(issues[0]["code"], issues[0]["message"])
+            raise MockTestError(issues[0]["code"], issues[0]["message"], issues=issues)
 
     async def save(self, request: SaveScenario) -> dict:
         """Atomically save a definition after checking its observed revision."""

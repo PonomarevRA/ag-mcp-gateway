@@ -6,7 +6,7 @@ from mcp import McpError, types
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
-VERSION = "0.18.0"
+VERSION = "0.18.1"
 _PAGE_SIZE = 100
 TOOL_SORT_META = "ag-mcp-gateway/sort"
 ToolSort = Literal["usage", "name"]

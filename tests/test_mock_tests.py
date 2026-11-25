@@ -354,6 +354,75 @@ def test_idle_mock_sweep_deletes_expired_reports_without_a_new_run(lab):
     assert missing.value.code == "run_not_found"
 
 
+def test_mcp_publishes_a_runnable_mock_template(lab, tmp_path):
+    """Use the advertised example as-is to save, run and read a real mock report."""
+    service, router, _ = lab
+    settings = ToolPolicySettings(router, tmp_path / "policies.json")
+    app = create_app(router, 18793, TOKEN, settings=settings, mock_tests=service)
+    with TestClient(app, base_url=ORIGIN) as client:
+        tools = {tool["name"]: tool for tool in rpc(client, "tools/list").json()["result"]["tools"]}
+        assert tools["gateway_test_template"]["annotations"]["readOnlyHint"] is True
+        template = call(client, "gateway_test_template", {})["structuredContent"]
+        scenario = template["scenario"]
+        for name in ("gateway_test_validate", "gateway_test_save"):
+            assert tools[name]["inputSchema"]["properties"]["scenario"]["examples"] == [scenario]
+        listed = call(client, "gateway_test_list", {})["structuredContent"]
+        assert not listed["scenarios"]
+        checked = call(client, "gateway_test_validate", {"scenario": scenario})["structuredContent"]
+        assert checked == {"valid": True, "issues": []}
+        saved = call(client, "gateway_test_save", {"scenario": scenario, "expected_revision": 0})["structuredContent"]
+        run = call(client, "gateway_test_run", {
+            "id": scenario["id"], "expected_revision": saved["revision"],
+        })["structuredContent"]
+        report = call(client, "gateway_test_run_get", {"run_id": run["run_id"]})["structuredContent"]
+        assert report["passed"] and report["fixture_id"] == scenario["fixtures"][0]["id"]
+        assert report["upstream_calls"] == 1
+
+
+def test_mcp_diagnostics_point_to_fields_without_echoing_inputs(lab, tmp_path):
+    """Expose safe, repairable errors for both model parsing and scenario rules."""
+    service, router, _ = lab
+    settings = ToolPolicySettings(router, tmp_path / "policies.json")
+    app = create_app(router, 18793, TOKEN, settings=settings, mock_tests=service)
+    with TestClient(app, base_url=ORIGIN) as client:
+        scenario = call(client, "gateway_test_template", {})["structuredContent"]["scenario"]
+        malformed = {**scenario, "fixtures": [{**scenario["fixtures"][0], "response": "private-value"}],
+                     "checks": [{"op": "equals", "path": "$.echo", "value": "hello"}],
+                     "assertions": [], "private-key": "private-value"}
+        del malformed["input_schema"]
+        result = call(client, "gateway_test_save", {"scenario": malformed, "expected_revision": 0})
+        assert result["isError"]
+        details = result["structuredContent"]
+        assert details["code"] == "invalid_test_arguments"
+        assert details["issue_count"] == 5
+        issues = {issue["path"]: issue for issue in details["issues"]}
+        assert issues["/scenario/input_schema"]["code"] == "missing"
+        assert "structured_content" in issues["/scenario/fixtures/0/response"]["hint"]
+        assert "JSON Pointer" in issues["/scenario/checks/0/path"]["hint"]
+        assert '"checks"' in issues["/scenario/assertions"]["hint"]
+        assert issues["/scenario/*"]["code"] == "extra_forbidden"
+        assert "/scenario/input_schema" in result["content"][0]["text"]
+        assert "private-key" not in json.dumps(result) and "private-value" not in json.dumps(result)
+
+        too_many = {**scenario, **{f"extra-{index}": index for index in range(12)}}
+        bounded = call(client, "gateway_test_validate", {"scenario": too_many})["structuredContent"]
+        assert bounded["issue_count"] == 12 and len(bounded["issues"]) == 8
+
+        invalid_run = call(client, "gateway_test_run", {"id": scenario["id"], "expected_revision": 0})
+        revision_issue, = invalid_run["structuredContent"]["issues"]
+        assert revision_issue["path"] == "/expected_revision"
+        assert "Use the revision from save or list" in revision_issue["hint"]
+
+        scenario["checks"] = []
+        validated = call(client, "gateway_test_validate", {"scenario": scenario})
+        assert not validated.get("isError") and not validated["structuredContent"]["valid"]
+        issues = validated["structuredContent"]["issues"]
+        assert issues[0]["path"] == "/scenario/checks"
+        saved = call(client, "gateway_test_save", {"scenario": scenario, "expected_revision": 0})
+        assert saved["isError"] and saved["structuredContent"] == {"code": "check_required", "issues": issues}
+        assert "/scenario/checks" in saved["content"][0]["text"]
+
+
 def test_browser_and_mcp_share_a_saved_scenario_and_escape_responses(lab, tmp_path):
     """Verify auth, actual management calls, mutation CSRF and a browser report URL."""
     service, router, _ = lab

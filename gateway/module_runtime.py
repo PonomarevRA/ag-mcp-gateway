@@ -1,13 +1,17 @@
 """Run approved data modules and adapt their values to MCP calls."""
 
 import asyncio
+from time import monotonic
 
+from jsonschema.exceptions import ValidationError
 from mcp import types
 
 from .module_data import (ModuleError, array_required, bounded_json, contains, difference,
                           formula, number, object_required, parse_json, pointer)
 from .schema_checks import SchemaChecks
-from .module_registry import (ActivateHook, Aggregate, Bind, Call, Compare, Containment, Delete,
+from .session_context import TASK_META, session_attribution, task_tag
+from .trace_context import TraceContext
+from .module_registry import (ActivateHook, Aggregate, Bind, Call, Compare, Containment, Delete, Find,
                               HookCapability, ListModules, Math, Module, Object, PinHook, Run, Save,
                               Select, SetGenerations)
 
@@ -39,6 +43,8 @@ class Pipeline:
             return self.get(step.source)
         if isinstance(step, Object):
             return {key: self.get(path) for key, path in step.fields.items()}
+        if isinstance(step, Find):
+            return self.find(step)
         if isinstance(step, Compare):
             changes = difference(self.get(step.left), self.get(step.right))
             return {"equal": not changes, "changes": changes}
@@ -54,6 +60,21 @@ class Pipeline:
             variables = {key: number(self.get(path)) for key, path in step.variables.items()}
             return formula(step.expression, variables)
         raise ModuleError("Automatic hooks require local operations")
+
+    def find(self, step: Find) -> dict:
+        """Resolve exactly one record, stopping before the next call on ambiguity."""
+        expected = self.get(step.match)
+        if not isinstance(expected, str) or not expected.strip():
+            raise ModuleError("Find requires a nonempty string")
+        found = None
+        for item in array_required(self.get(step.source)):
+            if pointer(item, step.field) == expected:
+                if found is not None:
+                    raise ModuleError("Find matched more than one item")
+                found = object_required(item)
+        if found is None:
+            raise ModuleError("Find matched no items")
+        return found
 
     def aggregate(self, step: Aggregate):
         """Reduce an array of numeric values, or count its elements."""
@@ -174,7 +195,68 @@ class ModuleService:
         module = state.modules.get(request.id)
         if module is None:
             raise ModuleError("Module not found")
-        pipeline = Pipeline(request.data)
+        return {"id": module.id, "result": await self.execute(module, request.data, metadata)}
+
+    def published_tools(self) -> tuple[types.Tool, ...]:
+        """Describe the active aggregate tools without exposing their private definitions."""
+        state = self.registry.state
+        return tuple(
+            types.Tool(name=name, description=state.modules[name].title, inputSchema=publication.input_schema,
+                       annotations=types.ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+            for name, publication in sorted(state.publications.items())
+        )
+
+    async def run_published(self, name: str, data: dict, metadata=None) -> types.CallToolResult:
+        """Execute one published snapshot after checking its inputs and all current read permissions."""
+        state = self.registry.state
+        publication = state.publications.get(name)
+        if publication is None:
+            return types.CallToolResult(isError=True, content=[
+                types.TextContent(type="text", text="This module is not published in this profile"),
+            ])
+        module = state.modules[name]
+        start = monotonic()
+        outcome = "error"
+        input_bytes = output_bytes = 0
+        session_tag = workflow_tag = None
+        trace = TraceContext.from_metadata(metadata)
+        try:
+            if metadata is not None:
+                try:
+                    _, session_tag = session_attribution(metadata)
+                    if TASK_META in metadata:
+                        workflow_tag = task_tag(metadata[TASK_META])
+                except ValueError as error:
+                    raise ModuleError("Invalid gateway correlation context") from error
+            self.registry.check_publication_targets(module)
+            try:
+                self.router.schema_checks.validate(data, publication.input_schema)
+            except ValidationError as error:
+                raise ModuleError("Arguments do not match the published module schema") from error
+            input_bytes = len(bounded_json(data))
+            value = await self.execute(module, data, metadata)
+            output = bounded_json(value)
+            output_bytes = len(output)
+            result = types.CallToolResult(
+                structuredContent={"result": value},
+                content=[types.TextContent(type="text", text=output.decode("utf-8"))],
+            )
+            outcome = "ok"
+            return result
+        except ModuleError as error:
+            return types.CallToolResult(isError=True, content=[types.TextContent(type="text", text=str(error))])
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        finally:
+            self.router.telemetry.completed(name, outcome, (monotonic() - start) * 1000, False,
+                                            input_bytes, output_bytes, track_tool=name in self.registry.state.publications,
+                                            session_tag=session_tag, task_tag=workflow_tag,
+                                            trace_id=trace.trace_id if trace else None, module_step=True)
+
+    async def execute(self, module: Module, data, metadata=None):
+        """Apply a saved definition under a shared timeout, forwarding context to each call."""
+        pipeline = Pipeline(data)
         try:
             async with asyncio.timeout(min(60, self.router.profile.timeout_seconds)):
                 for step in module.steps:
@@ -185,7 +267,7 @@ class ModuleService:
                     pipeline.record(step, value)
         except TimeoutError as error:
             raise ModuleError("Module execution timed out") from error
-        return {"id": module.id, "result": pipeline.context["value"]}
+        return pipeline.context["value"]
 
     async def call(self, step: Call, pipeline: Pipeline, metadata):
         """Apply the regular gateway policies and require a current upstream read-only hint."""

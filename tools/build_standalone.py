@@ -11,6 +11,8 @@ import sys
 from tempfile import TemporaryDirectory
 import tomllib
 
+from build_macos_app import build_app
+
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_WIKI = (
     "Home.md", "Home-ru.md", "Installation.md", "Installation-ru.md",
@@ -19,7 +21,7 @@ PUBLIC_WIKI = (
 )
 _EXAMPLES = (
     "company.example.json", "company-basic.example.json", "company-test.example.json",
-    "company-prod.example.json", "local-ag-tasks.example.json",
+    "company-prod.example.json", "local-ag-tasks.example.json", "mock-tests.example.json",
 )
 
 
@@ -57,6 +59,7 @@ def build(output: Path) -> Path:
         ], cwd=ROOT, check=True)
         bundle = work / "dist" / "ag-mcp-gateway"
         stage_public_guides(bundle, version, architecture)
+        build_app(bundle, version, architecture)
         if subprocess.check_output([bundle / "ag-mcp-gateway", "--version"], text=True).strip() != version:
             raise SystemExit("Frozen executable and package versions differ")
         staged_archive = work / archive.name

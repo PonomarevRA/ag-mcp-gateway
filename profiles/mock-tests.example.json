@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "name": "mock-tests",
+  "environment": "test",
+  "listen_port": 18892,
+  "access_token_env": "AMG_MOCK_TEST_TOKEN",
+  "management_bridge": true,
+  "mock_tests_enabled": true,
+  "backends": {}
+}

@@ -1,11 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-
 a = Analysis(
     ['gateway/__main__.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[("gateway/assets", "gateway/assets")],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

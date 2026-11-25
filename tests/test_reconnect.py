@@ -201,7 +201,9 @@ def test_agent_bridge_relist_keeps_already_dispatched_result(tmp_path, monkeypat
             value_type = "string" if generation == 1 else "integer"
             schema = {"type": "object", "properties": {"value": {"type": value_type}}, "required": ["value"]}
             tool = types.Tool(name="read", inputSchema={"type": "object"}, outputSchema=schema)
-            publish(name, Session("old-result" if generation == 1 else 7), {"local.read": tool}, "ready")
+            other = types.Tool(name="other", inputSchema={"type": "object"})
+            publish(name, Session("old-result" if generation == 1 else 7),
+                    {"local.read": tool, "local.other": other}, "ready")
             await asyncio.Event().wait()
 
         monkeypatch.setattr("gateway.connections.run_backend", run_backend)
@@ -227,7 +229,8 @@ def test_agent_bridge_relist_keeps_already_dispatched_result(tmp_path, monkeypat
             async def schema_type():
                 """Read the current value type advertised through the Bridge."""
                 response = await list_tools(types.ListToolsRequest())
-                return response.root.tools[0].outputSchema["properties"]["value"]["type"]
+                tool = next(tool for tool in response.root.tools if tool.name == "local.read")
+                return tool.outputSchema["properties"]["value"]["type"]
 
             def request(arguments):
                 """Construct one call to the same tool name in both generations."""
@@ -245,6 +248,11 @@ def test_agent_bridge_relist_keeps_already_dispatched_result(tmp_path, monkeypat
                 release.set()
                 response = (await held).root
             assert not response.isError and response.structuredContent == {"value": "old-result"}
+            default = await list_tools(types.ListToolsRequest())
+            assert default.root.tools[0].name == "local.read"
+            params = types.PaginatedRequestParams(_meta={"ag-mcp-gateway/sort": "name"})
+            alphabetical = await list_tools(types.ListToolsRequest(params=params))
+            assert alphabetical.root.tools[0].name == "local.other"
 
         monkeypatch.setattr("gateway.bridge.local_client", local_http)
         monkeypatch.setattr("gateway.bridge.serve_stdio", exercise_bridge)
@@ -252,3 +260,6 @@ def test_agent_bridge_relist_keeps_already_dispatched_result(tmp_path, monkeypat
             await bridge(ORIGIN, "test", None, 4)
 
     asyncio.run(scenario())
+    events = list(Journal(tmp_path, 4096).newest_events(4096))
+    assert len(events) == 2 and events[0]["session_tag"] == events[1]["session_tag"]
+    assert len(events[0]["session_tag"]) == 16

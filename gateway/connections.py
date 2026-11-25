@@ -8,13 +8,16 @@ from mcp import ClientSession, types
 
 from .connection_diagnostics import ConnectionProbe, FAILURE_LABELS
 from .credentials import SecretStore, SecretStoreError, credential_account
-from .profile import HttpBackend, Profile
+from .profile import HttpBackend, Profile, StdioBackend
 from .token_secrets import resolve_token
-from .upstream import run_backend
+from .upstream import docker_status, run_backend
 
 
 class ReauthorizationError(RuntimeError):
     """Expose a fixed action failure code without upstream response details."""
+
+
+_DOCKER_RETRY_SECONDS = 3
 
 
 @dataclass
@@ -28,6 +31,7 @@ class Connection:
     session: ClientSession | None = None
     tools: dict[str, types.Tool] = field(default_factory=dict)
     status: str = "starting"
+    awaiting_docker: bool = False
     requests: int = 0
 
     def __post_init__(self):
@@ -100,23 +104,36 @@ class BackendConnections:
         task.add_done_callback(self.workers.discard)
         return task
 
-    def _start(self, name: str, authorization: str | None = None) -> Connection:
+    def _start(self, name: str, authorization: str | None = None, *, wait_for_docker: bool = True) -> Connection:
         """Start a candidate without changing active routes or stored credentials."""
         probe = ConnectionProbe()
-        worker = Connection(closed=probe.closed)
+        config = self.profile.backends[name]
+        docker = config.docker_cli if isinstance(config, StdioBackend) else None
+        worker = Connection(closed=probe.closed, awaiting_docker=wait_for_docker and docker is not None)
 
         def update(_name, session, tools, status):
             """Settle discovery and apply later events only for this active worker."""
             worker.session = session
             worker.tools = tools
             worker.status = status
+            worker.awaiting_docker = status == "docker-required" and wait_for_docker
             if self.active.get(name) is worker:
                 self.publish(name, worker)
             worker.ready.set()
 
         async def run():
             """Load the selected saved authentication before starting the transport."""
-            config = self.profile.backends[name]
+            if docker is not None:
+                while reason := await docker_status(docker, config):
+                    if worker.status != reason:
+                        update(name, None, {}, reason)
+                    if reason != "docker-required" or not wait_for_docker:
+                        return
+                    await asyncio.sleep(_DOCKER_RETRY_SECONDS)
+                if worker.status == "docker-required":
+                    update(name, None, {}, "starting")
+                # Keep reconnect serialized through initial MCP discovery.
+                worker.awaiting_docker = wait_for_docker
             header = authorization
             if name in self.accounts and header is None:
                 try:
@@ -158,36 +175,65 @@ class BackendConnections:
             raise ReauthorizationError("not-enabled")
         if self.store is None:
             raise ReauthorizationError("keychain-unavailable")
-        return await self._replace(name, authorization)
+        return await self._run_candidate(name, authorization)
+
+    async def verify_saved(self, name: str) -> bool:
+        """Check saved Basic credentials on a disposable connection."""
+        if name not in self.accounts:
+            raise ReauthorizationError("not-enabled")
+        return await self._run_candidate(name, None, replace=False)
 
     async def reconnect(self, name: str) -> bool:
         """Open the configured transport again with its current saved authentication."""
-        return await self._replace(name, None)
+        current = self.active.get(name)
+        config = self.profile.backends.get(name)
+        if (not self.closing and current is not None and current.ready.is_set()
+                and not current.live and not current.awaiting_docker and name not in self.rotations
+                and isinstance(config, StdioBackend) and config.docker_cli is not None):
+            return await self._restart_docker_backend(name, current)
+        return await self._run_candidate(name, None)
 
-    async def _replace(self, name: str, authorization: str | None) -> bool:
-        """Serialize replacements per backend while keeping the active connection serving."""
+    async def _restart_docker_backend(self, name: str, previous: Connection) -> bool:
+        """Replace a failed Docker worker and retain its dependency wait after this call."""
+        worker = self._start(name)
+        self.active[name] = worker
+        self.publish(name, worker)
+        self._track(self._retire(previous))
+        await worker.ready.wait()
+        if not worker.live:
+            raise ReauthorizationError(worker.status if worker.status in FAILURE_LABELS else "connection-failed")
+        return True
+
+    async def _run_candidate(self, name: str, authorization: str | None, *, replace: bool = True) -> bool:
+        """Serialize connection checks and replacements for each backend."""
         if self.closing or name not in self.active:
             raise ReauthorizationError("not-enabled")
+        current = self.active[name]
+        if current.awaiting_docker:
+            reason = current.status if current.status == "docker-required" else "busy"
+            raise ReauthorizationError(reason)
         if name in self.rotations:
             raise ReauthorizationError("busy")
-        task = asyncio.create_task(self._activate_candidate(name, authorization))
+        task = asyncio.create_task(self._connect_candidate(name, authorization, replace=replace))
         self.rotations[name] = task
         # A disconnected caller must not interrupt a verified replacement or Keychain write.
         task.add_done_callback(lambda completed: completed.exception() if not completed.cancelled() else None)
         return await asyncio.shield(task)
 
-    async def _activate_candidate(self, name: str, authorization: str | None) -> bool:
-        """Verify, optionally save, then swap routes; discard failures without disturbing the old worker."""
+    async def _connect_candidate(self, name: str, authorization: str | None, *, replace: bool) -> bool:
+        """Verify a candidate, then close it or publish it after any required Keychain write."""
         candidate = None
         activated = False
         try:
-            candidate = self._start(name, authorization)
+            candidate = self._start(name, authorization, wait_for_docker=False)
             await candidate.ready.wait()
             if not candidate.live:
                 reason = candidate.status
                 if reason not in FAILURE_LABELS or reason == "starting":
                     reason = "connection-failed"
                 raise ReauthorizationError(reason)
+            if not replace:
+                return True
             if authorization is not None:
                 try:
                     await asyncio.to_thread(self.store.write, self.accounts[name], authorization)
@@ -208,7 +254,7 @@ class BackendConnections:
                 self.technical.connection(name, "ready", replacement=True)
             return True
         except ReauthorizationError as error:
-            if self.technical is not None:
+            if replace and self.technical is not None:
                 self.technical.connection(name, str(error), replacement=True)
             raise
         finally:

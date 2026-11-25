@@ -15,6 +15,10 @@ HTTP_FAILURES = {
 }
 FAILURE_LABELS = {
     "starting": ("Проверяем подключение", "pending"),
+    "docker-required": ("Запустите Docker для подключения MCP", "attention"),
+    "docker-cli-missing": ("Команда Docker не найдена", "error"),
+    "docker-check-failed": ("Не удалось проверить доступ к Docker", "error"),
+    "upstream-env-missing": ("Переменная окружения MCP не задана", "error"),
     "credentials-missing": ("Требуется вход", "attention"),
     "keychain-unavailable": ("Связка ключей недоступна", "attention"),
     "auth-rejected": ("Учётные данные отклонены · HTTP 401", "attention"),
@@ -27,6 +31,21 @@ FAILURE_LABELS = {
     "unavailable (command not found)": ("Команда MCP не найдена", "error"),
     "unavailable (connection closed)": ("Соединение закрыто", "error"),
 }
+
+DOCKER_RECOVERY = {
+    "docker-required": ("start_docker", "Start Docker or restore access to its engine, then refresh tools/list."),
+    "docker-cli-missing": ("check_docker_cli", "Make the Docker CLI available, then reconnect this MCP."),
+    "docker-check-failed": ("check_docker_access", "Check Docker CLI permissions, then reconnect this MCP."),
+}
+
+
+def docker_recovery(backend: str, status: str) -> dict | None:
+    """Describe a Docker dependency through fixed agent-facing codes and instructions."""
+    recovery = DOCKER_RECOVERY.get(status)
+    if recovery is None:
+        return None
+    action, message = recovery
+    return {"backend": backend, "status": status, "action": action, "message": message}
 
 
 @dataclass

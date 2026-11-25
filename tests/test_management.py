@@ -317,3 +317,21 @@ def test_browser_policy_uses_shared_revision_and_protected_form(tmp_path, monkey
 
         other = client.get("/settings?backend=other&lang=ru", headers=browser)
         assert "other.missing</strong> · Запрещён · Нет в каталоге" in other.text
+
+
+def test_demo_views_show_policy_and_module_examples(tmp_path):
+    """Show useful read-only settings without exposing mutation endpoints in demo."""
+    profile = Profile.model_validate({"name": "demo", "denied": ["demo.blocked"],
+                                      "backends": {"demo": {"transport": "stdio", "command": "unused"}}})
+    router = Router(profile, Telemetry(Journal(tmp_path / "logs", 4096)))
+    with TestClient(create_app(router, 18793, None), base_url=ORIGIN) as client:
+        # No upstream transport is required for a configured default policy to be visible.
+        policy = client.get("/settings?lang=en")
+        assert policy.is_success and "demo.blocked" in policy.text and "Read-only view" in policy.text
+        assert 'method="post"' not in policy.text
+        modules = client.get("/modules?lang=en")
+        assert modules.is_success and "Module examples" in modules.text and "trace_search" in modules.text
+        assert 'method="post"' not in modules.text
+        assert client.post("/settings", headers={"Origin": ORIGIN}).status_code == 405
+        assert client.post("/modules", headers={"Origin": ORIGIN}).status_code == 405
+        assert client.get("/api/settings/revisions").json() == {"policy": f"0:{router.catalog_revision}"}

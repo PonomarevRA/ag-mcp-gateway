@@ -8,6 +8,8 @@ from hashlib import sha256
 from typing import Literal
 
 SESSION_META = "ag-mcp-gateway/session"
+TASK_META = "ag-mcp-gateway/task-id"
+BRIDGE_SESSION_META = "ag-mcp-gateway/bridge-session"
 SessionField = Literal["harness", "instanceId", "remoteSessionId", "conversationId"]
 _OPTIONS = {
     "harness": "--harness",
@@ -16,6 +18,21 @@ _OPTIONS = {
     "conversationId": "--conversation-id",
 }
 _OPAQUE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_BRIDGE_ID = re.compile(r"[a-f0-9]{32}")
+
+
+def task_tag(identity: str) -> str:
+    """Hash a caller-declared workflow attempt ID without persisting the original."""
+    if not isinstance(identity, str) or not _OPAQUE_ID.fullmatch(identity):
+        raise ValueError("Invalid gateway task ID")
+    return sha256(f"task:{identity}".encode("ascii")).hexdigest()[:32]
+
+
+def bridge_session_tag(identity: str) -> str:
+    """Hash an ID allocated by a stdio adapter for its connection lifetime."""
+    if not isinstance(identity, str) or not _BRIDGE_ID.fullmatch(identity):
+        raise ValueError("Invalid gateway bridge session ID")
+    return sha256(f"bridge:{identity}".encode("ascii")).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -72,6 +89,16 @@ class SessionContext:
         for field, value in self.values.items():
             result.append(f"{_OPTIONS[field]}={value}")
         return result
+
+
+def session_attribution(metadata: dict) -> tuple[SessionContext | None, str | None]:
+    """Prefer an explicit session identity, using a stdio connection as the fallback."""
+    if SESSION_META in metadata:
+        context = SessionContext.parse(metadata[SESSION_META])
+        return context, context.tag
+    if BRIDGE_SESSION_META in metadata:
+        return None, bridge_session_tag(metadata[BRIDGE_SESSION_META])
+    return None, None
 
 
 def add_session_options(parser: argparse.ArgumentParser):

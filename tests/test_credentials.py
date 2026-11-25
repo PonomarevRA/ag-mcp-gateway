@@ -139,6 +139,48 @@ def test_dashboard_verifies_then_saves_and_reuses_same_gateway_token(gateway):
         assert router.routes["grafana.read"].session.label == "new"
 
 
+def test_verify_saved_does_not_replace_active_connection(gateway):
+    """Check stored credentials through the browser while leaving the active worker serving."""
+    router, store, account, sessions = gateway
+    browser = {"Authorization": _BROWSER}
+    headers = {**browser, "Origin": _ORIGIN}
+    with TestClient(create_app(router, 18794, _LOCAL_TOKEN), base_url=_ORIGIN) as client:
+        original = router.connections.active["grafana"]
+        form = client.get("/credentials?lang=en", headers=browser)
+        assert "Verify saved credentials" in form.text
+        csrf = re.search(r'name="csrf" value="([^"]+)"', form.text).group(1)
+        fields = {"csrf": csrf, "operation": "verify"}
+        assert client.post("/credentials/grafana", headers=headers, data={**fields, "csrf": "bad"}).status_code == 403
+        response = client.post("/credentials/grafana", headers=headers, data=fields)
+        assert "Saved credentials verified on a separate connection." in response.text
+        assert sessions["old"].closed.is_set() and not original.closed.is_set()
+        assert router.connections.active["grafana"] is original
+        assert store.values[account] == _OLD
+        del store.values[account]
+        missing = client.post("/credentials/grafana", headers=headers, data=fields)
+        assert missing.status_code == 409
+        assert router.connections.active["grafana"] is original
+
+
+@pytest.mark.parametrize("token, reason", [
+    (None, "this profile has no gateway token"),
+    (_LOCAL_TOKEN, "no MCP configured to use Basic authentication"),
+])
+def test_credentials_unavailable_explains_profile_configuration(tmp_path, token, reason):
+    """Offer profile recovery while keeping credential mutations disabled."""
+    profile = Profile.model_validate({
+        "name": "demo", "backends": {"local": {"transport": "stdio", "command": "unused"}},
+    })
+    router = Router(profile, Telemetry(Journal(tmp_path, 4096)))
+    client = TestClient(create_app(router, 18794, token), base_url=_ORIGIN)
+    headers = {"Authorization": _BROWSER} if token else {}
+    response = client.get("/credentials?lang=en", headers=headers)
+    assert response.is_success and reason in response.text
+    assert 'href="agm-gateway://profiles"' in response.text
+    assert 'href="agm-gateway://add-mcp/demo"' in response.text
+    assert client.post("/credentials/local", headers={**headers, "Origin": _ORIGIN}).status_code == 404
+
+
 def test_dashboard_confirmation_requires_verified_operation_and_current_connection(gateway):
     """Reject invented receipts and keep the current status accurate after disconnect."""
     router, _store, _account, sessions = gateway

@@ -13,8 +13,10 @@ from .ui_messages import ENGLISH, MODULE_ERRORS_RU
 
 _NAMES = {"ru": "Русский", "en": "English"}
 _COOKIE = "amg_ui_lang"
-_FILTERS = {"q": 200, "backend": 32, "offset": 6, "edit": 32, "tool": 128, "trace_id": 32, "epoch": 128, "before": 19}
-_PAGES = {"/", "/settings", "/modules", "/credentials", "/diagnostics"}
+_FILTERS = {"sort": 5, "q": 200, "backend": 32, "offset": 6, "edit": 32, "tool": 128, "trace_id": 32,
+            "epoch": 128, "before": 19, "run": 32}
+_PAGES = {"/", "/catalog", "/tools", "/statistics", "/profiles", "/settings", "/modules", "/credentials",
+          "/diagnostics", "/tests"}
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,7 @@ class PageLocale:
     language: str
     path: str = "/"
     filters: tuple[tuple[str, str], ...] = ()
+    mock_tests: bool = False
 
 
 _locale = ContextVar("gateway_page_locale", default=PageLocale("ru"))
@@ -32,6 +35,11 @@ _locale = ContextVar("gateway_page_locale", default=PageLocale("ru"))
 def language() -> str:
     """Return the selected HTML language without changing the MCP contract."""
     return _locale.get().language
+
+
+def mock_tests_available() -> bool:
+    """Return the feature state for the dashboard currently being rendered."""
+    return _locale.get().mock_tests
 
 
 def tr(message: str) -> str:
@@ -59,7 +67,12 @@ def language_switch(*, backend: str | None = None) -> str:
         url = escape(f"{page.path}?{urlencode({**filters, 'lang': code})}", quote=True)
         current = ' aria-current="true"' if code == page.language else ""
         items.append(f'<a href="{url}" lang="{code}" hreflang="{code}" rel="alternate"{current}>{name}</a>')
-    return f'<nav class="language-switch" aria-label="{tr("Язык интерфейса")}">{"".join(items)}</nav>'
+    label = tr("Язык интерфейса")
+    glyph = ('<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none" stroke="currentColor" '
+             'stroke-width="1.65"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/>'
+             '<path d="M3 12h18"/></svg>')
+    return (f'<details class="language-switch"><summary class="header-icon" aria-label="{label}" title="{label}">'
+            f'{glyph}</summary><nav aria-label="{label}">{"".join(items)}</nav></details>')
 
 
 def _browser_language(header: str) -> str:
@@ -84,6 +97,8 @@ def _browser_page(path: str) -> str | None:
     """Map browser actions back to their page and exclude protocol and collector routes."""
     if path in _PAGES:
         return path
+    if path.startswith("/tests/runs/") and path.count("/") == 3:
+        return path
     if path.startswith("/credentials/"):
         return "/credentials"
     if path.startswith("/reconnect/"):
@@ -94,9 +109,10 @@ def _browser_page(path: str) -> str | None:
 class BrowserLocale:
     """Isolate request-local rendering and write preferences only for HTML GETs."""
 
-    def __init__(self, app):
+    def __init__(self, app, *, mock_tests: bool = False):
         """Wrap the app inside the existing loopback and authorization boundary."""
         self.app = app
+        self.mock_tests = mock_tests
 
     async def __call__(self, scope, receive, send):
         """Choose language from an explicit selection, cookie, browser hint or default."""
@@ -113,7 +129,7 @@ class BrowserLocale:
             selected = _browser_language(request.headers.get("accept-language", ""))
         filters = tuple((key, request.query_params[key][:limit])
                         for key, limit in _FILTERS.items() if key in request.query_params)
-        token = _locale.set(PageLocale(selected, page, filters))
+        token = _locale.set(PageLocale(selected, page, filters, self.mock_tests))
 
         async def localized_send(message):
             """Add language metadata and a non-sensitive cookie to localized HTML."""

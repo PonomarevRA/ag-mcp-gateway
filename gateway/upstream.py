@@ -11,7 +11,7 @@ import httpx
 from anyio import ClosedResourceError, EndOfStream
 from anyio.abc import ObjectReceiveStream
 from mcp import StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import get_default_environment, stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
 from .connection_diagnostics import ConnectionProbe
@@ -101,12 +101,7 @@ async def open_session(config, timeout: float, authorization: str | None = None,
     probe = probe or ConnectionProbe()
     async with AsyncExitStack() as stack:
         if isinstance(config, StdioBackend):
-            environment = {}
-            for target, source in config.env_from.items():
-                if source not in os.environ:
-                    raise ValueError("missing upstream environment variable")
-                environment[target] = os.environ[source]
-            params = StdioServerParameters(command=config.command, args=config.args, env=environment)
+            params = StdioServerParameters(command=config.command, args=config.args, env=stdio_environment(config))
             # Child stderr may contain credentials or payloads. Keep the gateway journal metadata-only.
             sink = stack.enter_context(open(os.devnull, "w"))
             streams = await stack.enter_async_context(stdio_client(params, errlog=sink))
@@ -131,6 +126,70 @@ async def open_session(config, timeout: float, authorization: str | None = None,
                                 message_handler=probe.message)
         await stack.enter_async_context(session)
         yield session, incoming.closed
+
+
+def stdio_environment(config: StdioBackend) -> dict[str, str]:
+    """Resolve only the environment overrides explicitly configured for this child."""
+    environment = {}
+    for target, source in config.env_from.items():
+        if source not in os.environ:
+            raise ValueError("missing upstream environment variable")
+        environment[target] = os.environ[source]
+    return environment
+
+
+async def docker_status(command: str, config: StdioBackend) -> str | None:
+    """Check the Docker engine from the same environment as the MCP command."""
+    try:
+        environment = get_default_environment() | stdio_environment(config)
+    except ValueError:
+        return "upstream-env-missing"
+    try:
+        options = docker_endpoint_options(config.args) if command == config.command else []
+        process = await asyncio.create_subprocess_exec(
+            command, *options, "info", env=environment, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return "docker-cli-missing"
+    except OSError:
+        return "docker-check-failed"
+    try:
+        async with asyncio.timeout(3):
+            result = await process.wait()
+    except TimeoutError:
+        return "docker-required"
+    finally:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
+    return None if result == 0 else "docker-required"
+
+
+def docker_endpoint_options(args: list[str]) -> list[str]:
+    """Carry Docker's global endpoint and TLS flags up to the subcommand."""
+    options = []
+    values = {"-H", "--host", "-c", "--context", "--config", "--tlscacert",
+              "--tlscert", "--tlskey", "-l", "--log-level"}
+    switches = {"--tls", "--tlsverify", "-D", "--debug"}
+    index = 0
+    while index < len(args):
+        argument = args[index]
+        flag, separator, _ = argument.partition("=")
+        if flag in switches or (separator and flag in values):
+            options.append(argument)
+        elif argument in values and index + 1 < len(args):
+            options.extend(args[index:index + 2])
+            index += 1
+        elif argument.startswith(("-H", "-c", "-l")) and len(argument) > 2:
+            options.append(argument)
+        else:
+            break
+        index += 1
+    return options
 
 
 async def discover(session: CatalogSession, prefix: str):

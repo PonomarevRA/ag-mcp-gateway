@@ -17,11 +17,19 @@ cd ./gateway-release/ag-mcp-gateway
 
 The demo creates a synthetic local MCP. The overview is at [127.0.0.1:18792](http://127.0.0.1:18792/). Run `./ag-mcp-gateway status` from another terminal. Reuse the generated profile on subsequent starts. If the demo already exists, `demo-profile` reports an existing file.
 
+## Manage profiles in the macOS window
+
+Open `ag-mcp-gateway.app` from the extracted directory and keep it beside the CLI. Choose **+ → Create profile** in the window toolbar. Set the name and environment, then add the first MCP server. The gateway generates a separate profile token in macOS Keychain. Select the profile and choose **Start**. To add a server, choose **MCP catalog → Add MCP**. If the app started the profile, confirm a restart to apply the saved configuration.
+
+Use the menu bar item to open the window or select a profile. Launching the app again brings its existing window to the front. Profiles keep running when you close the window or quit the app. Choose **File → Stop profile** to stop a service.
+
 ## Working profiles and updates
 
 Profile JSON lives under `~/.ag-mcp-gateway/profiles` by default. Copy a bundled `profiles/*.example.json` to an actual name such as `company-test.json`. Match the JSON `name` to the filename. Set approved MCP endpoints, symbolic secret references and tool policies. Pass `--profile company-test` before the command. Use `--profiles`, `--state` and `--port` before the command for explicit isolation.
 
 Start a protected profile with `./ag-mcp-gateway --profile company-test serve`. The default ports are 18792 for an unlabeled profile, 18793 for test and 18794 for production. Two simultaneous profiles require distinct ports and state identities. Production requires a token. Browser login uses `gateway` and the profile token as the password.
+
+On macOS, a protected profile can start when an MCP client connects. Generate the Codex entry with `./ag-mcp-gateway --profile company-test config --start-if-stopped codex`. The `--start-if-stopped` flag after `stdio` starts the service on demand. The service keeps running after the client exits.
 
 For an upgrade, stop the old process with Ctrl+C, keep the profile and state directories, and extract the new build into a fresh directory. Start the new executable against the same profile. Regenerate client entries if the binary path changed. Keep the preceding build and a policy-compliant backup of local state for rollback. Validate compatible state before reverting to an older build.
 

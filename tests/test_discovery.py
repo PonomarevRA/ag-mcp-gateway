@@ -10,6 +10,7 @@ from mcp import types
 from starlette.testclient import TestClient
 
 from gateway.http_app import create_app
+from gateway.module_registry import ModuleRegistry
 from gateway.policy_settings import ToolPolicySettings
 from gateway.profile import Profile
 from gateway.router import Router
@@ -154,6 +155,9 @@ def test_mcp_discovery_hides_denied_and_decorates_allowed_catalog(tmp_path, monk
         found = call("gateway_tools_search", {"query": "логов"})["structuredContent"]
         assert {tool["name"] for tool in found["tools"]} == {"demo.read", "demo.other"}
         assert [skill["tools"] for skill in found["skills"]] == [["demo.read"]]
+        assert found["tools"][0]["name"] == "demo.read" and found["tools"][0]["uses"] == 2
+        alphabetical = call("gateway_tools_search", {"query": "логов", "sort": "name"})["structuredContent"]
+        assert [tool["name"] for tool in alphabetical["tools"]] == ["demo.other", "demo.read"]
         assert "input_schema" not in found["tools"][0]
         tool = call("gateway_tool_describe", {"tool": "demo.read"})["structuredContent"]
         assert tool["latency"] == {"mean_ms": 21, "samples": 2}
@@ -170,8 +174,86 @@ def test_mcp_discovery_hides_denied_and_decorates_allowed_catalog(tmp_path, monk
         read = next(entry for entry in catalog if entry["name"] == "demo.read")
         assert read["_meta"][DISCOVERY_META] == {"latency": tool["latency"],
                                                  "usefulness": {"helpful": 1, "votes": 1, "score": 1}}
-        assert all(entry["name"] != "demo.blocked" for entry in catalog)
+        assert [entry["name"] for entry in catalog] == ["demo.read", "demo.other"]
+        alphabetical = mcp("tools/list", {"_meta": {"ag-mcp-gateway/sort": "name"}}, target="/mcp/test")
+        assert [entry["name"] for entry in alphabetical["tools"]] == ["demo.other", "demo.read"]
         scoped = mcp("tools/list", target="/mcp/test/demo")["tools"]
         assert {entry["name"] for entry in scoped} == {"read", "other"}
         scoped_read = next(entry for entry in scoped if entry["name"] == "read")
         assert scoped_read["_meta"][DISCOVERY_META] == read["_meta"][DISCOVERY_META]
+
+
+def test_keyword_catalog_observes_shape_and_drafts_allowlisted_module(tmp_path, monkeypatch):
+    """Exercise keyword discovery, transient observations and lazy browser access."""
+    profile = Profile.model_validate({
+        "name": "test", "access_token_env": "FIXTURE_TOKEN",
+        "agent_discovery": True, "management_bridge": True, "modules_enabled": True,
+        "backends": {name: {"transport": "stdio", "command": "fixture"}
+                     for name in ("grafana", "opensearch")},
+        "module_chain_tools": ["grafana.search", "opensearch.search", "grafana.blocked"],
+        "denied": ["grafana.blocked"],
+    })
+    router = Router(profile, Telemetry(Journal(tmp_path / "logs", 4096)))
+    router.modules = ModuleRegistry(router, tmp_path / "modules.json")
+    settings = ToolPolicySettings(router, tmp_path / "policy.json")
+
+    class FixtureSession:
+        async def call_tool(self, name, arguments, *, meta=None):
+            """Return a technical field and a private scalar that must never be indexed."""
+            return types.CallToolResult(content=[], structuredContent={
+                "traceId": "private-id-123", "confidentialSecretKey": "private-value",
+            })
+
+    async def fixture(name, config, timeout, publish, authorization, *, probe):
+        """Advertise different trace fields and one opaque runtime-only tool."""
+        field = "traceId" if name == "grafana" else "trace_id"
+        search = types.Tool(name="search", inputSchema={
+            "type": "object", "properties": {field: {"type": "string"}}, "required": [field],
+        }, annotations=types.ToolAnnotations(readOnlyHint=True))
+        descriptors = {f"{name}.search": search}
+        if name == "grafana":
+            descriptors["grafana.opaque"] = types.Tool(name="opaque", inputSchema={"type": "object"})
+            descriptors["grafana.blocked"] = search
+        publish(name, FixtureSession(), descriptors, "ready")
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("gateway.connections.run_backend", fixture)
+    app = create_app(router, 18792, TOKEN, settings=settings, feedback=ToolFeedback(tmp_path / "feedback.sqlite3"))
+    with TestClient(app, base_url="http://127.0.0.1:18792") as client:
+        def mcp(path, name, arguments):
+            """Invoke a real MCP endpoint using the fixture profile token."""
+            response = client.post(path, headers=HEADERS, json={"jsonrpc": "2.0", "id": 1,
+                "method": "tools/call", "params": {"name": name, "arguments": arguments}})
+            return response.json()["result"]
+
+        def find(**arguments):
+            """Search live tools through the management MCP."""
+            return mcp("/manage/test", "gateway_tools_find_keywords", arguments)["structuredContent"]
+
+        before = find(query="traceId", draft_trace_module=True)
+        assert {item["name"] for item in before["tools"]} == {"grafana.search", "opensearch.search"}
+        draft = before["module_draft"]
+        assert [step["tool"] for step in draft["module"]["steps"] if step["op"] == "call"] == [
+            "grafana.search", "opensearch.search"]
+        assert draft["module"]["steps"][0]["fields"] == {"traceId": "/input/trace_id"}
+        assert not router.modules.state.modules
+
+        result = mcp("/mcp/test", "grafana.opaque", {"privateArgument": "another-private-value"})
+        assert not result.get("isError")
+        client.portal.call(router.keywords.collect)
+        after = find(query="trace_id", backend="grafana")
+        assert [item["name"] for item in after["tools"]] == ["grafana.search", "grafana.opaque"]
+        assert after["tools"][1]["observed_keywords"] == ["trace"]
+        assert find(query="private-value")["tools"] == []
+        assert find(query="confidentialSecretKey")["tools"] == []
+
+        url = "/api/tools/keywords?tool=grafana.opaque"
+        assert client.get(url).status_code == 401
+        auth = ("gateway", TOKEN)
+        keywords = client.get(url, auth=auth)
+        assert keywords.json()["observed_keywords"] == ["trace"]
+        assert "private" not in keywords.text
+        assert client.get("/api/tools/keywords?tool=grafana.blocked", auth=auth).status_code == 404
+        page = client.get("/tools?lang=en", auth=auth)
+        assert 'data-keyword-tool="grafana.opaque"' in page.text and "Keywords</summary>" in page.text
+        assert "connect-src 'self'" in page.headers["Content-Security-Policy"]

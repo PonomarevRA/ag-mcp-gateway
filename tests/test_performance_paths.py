@@ -93,6 +93,33 @@ def test_catalog_materializes_only_current_page(tmp_path, monkeypatch):
 
 
 
+def test_usage_order_stays_stable_while_paginating(tmp_path):
+    """New usage changes fresh MCP listings without losing entries in an open listing."""
+    router = fixture_router(tmp_path)
+    for index in range(102):
+        name = f"tool_{index:03}"
+        router.routes[f"demo.{name}"] = Route(types.Tool(name=name, inputSchema={}), object())
+
+    router.telemetry.completed("demo.tool_101", "ok", 1, False, 0, 0)
+    first = router.visible_page(None)
+    assert first.tools[0].name == "demo.tool_101"
+    router.telemetry.completed("demo.tool_100", "ok", 1, False, 0, 0)
+    router.telemetry.completed("demo.tool_100", "ok", 1, True, 0, 0)
+    router.telemetry.completed("demo.tool_099", "denied", 1, False, 0, 0)
+
+    second = router.visible_page(first.nextCursor)
+    assert [tool.name for tool in second.tools] == ["demo.tool_099", "demo.tool_100"]
+    assert router.visible_page(None).tools[0].name == "demo.tool_100"
+    assert router.backend_page("demo", None).tools[0].name == "tool_100"
+    alphabetical = router.visible_page(None, sort="name")
+    assert alphabetical.tools[0].name == "demo.tool_000"
+    assert router.visible_page(alphabetical.nextCursor).tools[0].name == "demo.tool_100"
+    with pytest.raises(McpError):
+        router.visible_page(first.nextCursor, sort="name")
+    with pytest.raises(McpError):
+        router.backend_page("demo", first.nextCursor)
+
+
 def test_discovery_matches_punctuation_only_tool_name():
     """Preserve exact qualified names even when they have no searchable words."""
     route = Route(types.Tool(name="-", inputSchema={"type": "object"}), object())

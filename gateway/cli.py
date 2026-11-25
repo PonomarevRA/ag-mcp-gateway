@@ -9,6 +9,7 @@ import os
 import sqlite3
 import sys
 import warnings
+from functools import partial
 from hashlib import sha256
 from pathlib import Path
 
@@ -16,18 +17,23 @@ import uvicorn
 from pydantic import TypeAdapter, ValidationError
 from filelock import FileLock, Timeout
 
+from .autostart import change_running_port, start_locked, startup_lock, stop_running_profile
 from .bridge import bridge, read_status
 from .credentials import SecretStoreError
 from .demo import demo_server
+from .desktop_profiles import desktop_command
 from .hook_lifecycle import HOOK_ENV
 from .http_app import create_app
 from .keychain import MacKeychain
 from .mcp_server import VERSION, serve_stdio
+from .mock_test_git import export_git_catalog, import_git_catalog, read_git_catalog
+from .mock_test_worker import serve_mock_worker
+from .mock_tests import MockTests
 from .module_registry import ModuleRegistry
 from .policy_settings import ToolPolicySettings
-from .profile import HttpBackend, Profile, SecretKey, load_profile
+from .profile import HttpBackend, Profile, SecretKey, backend_client_name, load_profile
 from .router import Router
-from .session_context import SessionContext, add_session_options, session_from_cli
+from .session_context import SessionContext, add_session_options, session_from_cli, task_tag
 from .skill_store import SkillStore
 from .skill_tools import SkillReference
 from .technical_events import TechnicalEvents
@@ -82,6 +88,8 @@ def parser() -> argparse.ArgumentParser:
     stdio = commands.add_parser("stdio", help="attach an MCP stdio client to the running gateway")
     add_session_options(stdio)
     stdio.add_argument("--backend", help="expose only one configured MCP backend")
+    stdio.add_argument("--start-if-stopped", action="store_true",
+                       help="start this protected profile on demand on macOS")
     commands.add_parser("mcp-bridge", help="attach the authenticated management MCP over stdio")
     token_set = commands.add_parser("token-set", help="save one token in macOS Keychain using hidden input")
     token_set.add_argument("key", help="symbolic Keychain reference")
@@ -97,15 +105,24 @@ def parser() -> argparse.ArgumentParser:
     logs = commands.add_parser("logs", help="print the most recent metadata journal events")
     logs.add_argument("--backend", help="filter events by the configured MCP backend name")
     logs.add_argument("--session-tag", help="filter events by a session tag")
+    logs.add_argument("--task-id", help="filter events by a caller-declared task attempt ID")
     logs.add_argument("--trace-id", help="filter events by a W3C trace ID")
     logs.add_argument("--limit", type=int, default=30, choices=range(1, 10001), metavar="1..10000")
     commands.add_parser("demo-profile", help="write a synthetic demo profile")
     commands.add_parser("demo-backend", help="run the synthetic stdio MCP backend")
+    mock_worker = commands.add_parser("mock-test-worker", help="run a local mock fixture over stdio")
+    mock_worker.add_argument("fixture", type=Path)
+    mock_catalog = commands.add_parser("mock-catalog", help="read or write a Git-friendly mock collection directory")
+    mock_catalog.add_argument("action", choices=["export", "check", "import"])
+    mock_catalog.add_argument("directory", type=Path)
+    desktop = commands.add_parser("desktop", help="local desktop app operations")
+    desktop.add_argument("action", choices=["profiles", "save", "port", "token", "stop"])
     config = commands.add_parser("config", help="print a client configuration fragment")
     add_session_options(config)
     config_scope = config.add_mutually_exclusive_group()
     config_scope.add_argument("--management", action="store_true", help="print a separate management MCP entry")
     config_scope.add_argument("--backend", help="generate an entry for one configured MCP backend")
+    config.add_argument("--start-if-stopped", action="store_true", help="enable on-demand macOS startup in the entry")
     config.add_argument("client", choices=["codex", "cursor", "claude", "opencode", "deepseek", "acp"])
     return root
 
@@ -134,12 +151,34 @@ def serve(args, profile: Profile, token: str | None, store: MacKeychain | None):
             if profile.modules_enabled and token:
                 router.modules = ModuleRegistry(router, directory / "modules.json")
             feedback = ToolFeedback(directory / "tool-feedback.sqlite3") if discovery_enabled else None
-            app = create_app(router, args.port, token, settings=settings, skill_store=skill_store, feedback=feedback, technical=technical)
+            mock_tests = None
+            if profile.mock_tests_enabled and token:
+                mock_tests = MockTests(router, directory / "mock-tests", executable())
+            app = create_app(router, args.port, token, settings=settings, skill_store=skill_store,
+                             feedback=feedback, technical=technical, mock_tests=mock_tests)
             _LOG.info("Profile %s · http://127.0.0.1:%s/", profile.name, args.port)
             uvicorn.run(app, host="127.0.0.1", port=args.port, access_log=False, proxy_headers=False,
                         ws="none", log_level="warning", timeout_graceful_shutdown=10)
         finally:
             technical.close()
+
+
+def manage_mock_catalog(args, profile: Profile) -> dict:
+    """Transfer a mock catalog while the CLI exclusively owns its local profile state."""
+    if not profile.mock_tests_enabled:
+        raise ValueError("Mock catalog transfer requires an opted-in test profile")
+    directory = args.state.expanduser() / profile.state_path
+    bundle = args.directory.expanduser()
+    catalog = read_git_catalog(bundle) if args.action == "import" else None
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with FileLock(str(directory / "gateway.lock"), timeout=0):
+        router = Router(profile, Telemetry(Journal(directory / "logs", profile.log_max_bytes)))
+        if profile.modules_enabled:
+            router.modules = ModuleRegistry(router, directory / "modules.json")
+        service = MockTests(router, directory / "mock-tests", executable())
+        if catalog is not None:
+            return import_git_catalog(service, catalog)
+        return export_git_catalog(service, bundle)
 
 
 def open_skills(args, profile: Profile) -> SkillStore:
@@ -227,7 +266,7 @@ def newest_log_lines(source):
 
 
 def show_logs(directory: Path, limit: int, backend: str | None, session_tag: str | None,
-              trace_id: str | None = None):
+              trace_id: str | None = None, workflow_tag: str | None = None):
     """Find the requested latest matches and print them in chronological order."""
     if limit <= 0:
         return
@@ -258,6 +297,8 @@ def show_logs(directory: Path, limit: int, backend: str | None, session_tag: str
                         continue
                     if trace_id is not None and event.get("trace_id") != trace_id:
                         continue
+                    if workflow_tag is not None and event.get("task_tag") != workflow_tag:
+                        continue
                     recent.append(line + "\n")
                     if len(recent) == limit:
                         break
@@ -282,16 +323,21 @@ def config_fragment(args, profile: Profile, session: SessionContext | None = Non
     if management and session is not None:
         raise ValueError("management configuration does not accept caller session identity")
     transport = "mcp-bridge" if management else "stdio"
-    argv = [*leading, "--profiles", str(args.profiles.expanduser().resolve()),
-            "--profile", args.profile, "--port", str(args.port), transport]
+    autostart = getattr(args, "start_if_stopped", False)
+    argv = [*leading, "--profiles", str(args.profiles.expanduser().resolve()), "--profile", args.profile]
+    if not autostart or getattr(args, "port_override", None) is not None:
+        argv.extend(["--port", str(args.port)])
+    argv.append(transport)
     if session is not None:
         argv.extend(session.cli_arguments())
+    if autostart:
+        if management:
+            raise ValueError("--start-if-stopped requires a regular stdio MCP entry")
+        argv.append("--start-if-stopped")
     name = profile.client_name
     if backend is not None:
         argv.extend(["--backend", backend])
-        identity = f"{profile.endpoint_key}/{backend}"
-        suffix = sha256(identity.encode("ascii")).hexdigest()[:8]
-        name = f"amg-proxy-{backend[:13]}-{suffix}"
+        name = backend_client_name(profile.endpoint_key, backend)
     if management:
         environment = profile.environment or "legacy"
         name = f"amg-mgmt-{environment}-{profile.name}"
@@ -329,6 +375,53 @@ def config_fragment(args, profile: Profile, session: SessionContext | None = Non
     return json.dumps(value, indent=2, ensure_ascii=False)
 
 
+def serve_command(args, profile: Profile, port: int) -> list[str]:
+    """Build a normal serve invocation with the same profile and state directories."""
+    base = Path.home() / ".ag-mcp-gateway"
+    profiles_dir = args.profiles.expanduser().resolve()
+    state_dir = args.state.expanduser().resolve()
+    command = executable()
+    if profiles_dir != base / "profiles":
+        command.extend(["--profiles", str(profiles_dir)])
+    if state_dir != base / "state":
+        command.extend(["--state", str(state_dir)])
+    if port != profile.resolve_port(None):
+        command.extend(["--port", str(port)])
+    command.extend(["--profile", profile.name, "serve"])
+    return command
+
+
+def start_for_stdio(args, profile: Profile) -> int:
+    """Resolve the current port after any in-progress desktop port change."""
+    state_dir = args.state.expanduser().resolve() / profile.state_path
+    with startup_lock(state_dir):
+        current = load_profile(args.profiles.expanduser(), profile.name)
+        if current.state_path != profile.state_path:
+            raise ValueError("profile environment changed while connecting")
+        port = current.resolve_port(args.port_override)
+        start_locked(port, state_dir, serve_command(args, current, port))
+        return port
+
+
+def apply_desktop_port(args, current: Profile, updated: Profile, commit, rollback) -> bool:
+    """Migrate a running profile to its saved port and preserve the original on failure."""
+    state_dir = args.state.expanduser().resolve() / current.state_path
+
+    def command(port: int) -> list[str]:
+        # Use the same explicit port for recovery even if the old settings were already stale.
+        profile = updated if port == updated.resolve_port(None) else current
+        return serve_command(args, profile, port)
+
+    def check_credentials():
+        """Check that the new launcher can read the gateway token before stopping the old process."""
+        store = mac_keychain(current)
+        if not resolve_token(current.access_token_keychain, current.access_token_env, store):
+            raise ValueError("a running profile needs a gateway token to restart")
+
+    return change_running_port(state_dir, current.name, updated.resolve_port(None), command,
+                               commit, rollback, check_credentials)
+
+
 def main(argv=None) -> int:
     """Dispatch one command with concise errors on stderr and clean MCP stdout."""
     args = parser().parse_args(argv)
@@ -348,6 +441,21 @@ def main(argv=None) -> int:
         if args.command == "demo-backend":
             asyncio.run(serve_stdio(demo_server()))
             return 0
+        if args.command == "mock-test-worker":
+            asyncio.run(serve_mock_worker(args.fixture))
+            return 0
+        if args.command == "mock-catalog" and args.action == "check":
+            print(json.dumps(read_git_catalog(args.directory.expanduser()).counts()))
+            return 0
+        if args.command == "desktop":
+            if args.action == "stop":
+                profile = load_profile(args.profiles.expanduser(), args.profile)
+                state_dir = args.state.expanduser().resolve() / profile.state_path
+                stop_running_profile(state_dir, profile.name, Path(executable()[0]))
+                return 0
+            apply_port = partial(apply_desktop_port, args) if sys.platform == "darwin" else None
+            desktop_command(args, sys.stdin, sys.stdout, mac_keychain, apply_port=apply_port)
+            return 0
         session = session_from_cli(args)
         if args.command == "session-tag":
             if session is None:
@@ -355,6 +463,10 @@ def main(argv=None) -> int:
             print(session.tag)
             return 0
         profile = load_profile(args.profiles.expanduser(), args.profile)
+        if args.command == "mock-catalog":
+            print(json.dumps(manage_mock_catalog(args, profile)))
+            return 0
+        args.port_override = args.port
         args.port = profile.resolve_port(args.port)
         origin = f"http://127.0.0.1:{args.port}"
         if args.command == "config":
@@ -365,7 +477,7 @@ def main(argv=None) -> int:
             if args.backend and args.backend not in profile.backends:
                 raise ValueError("unknown backend for this profile")
             show_logs(args.state.expanduser() / profile.state_path, args.limit, args.backend,
-                      args.session_tag, args.trace_id)
+                      args.session_tag, args.trace_id, task_tag(args.task_id) if args.task_id is not None else None)
         else:
             if args.command == "mcp-bridge" and not profile.management_bridge:
                 raise ValueError("management_bridge is disabled for this profile")
@@ -380,13 +492,23 @@ def main(argv=None) -> int:
                 backend = getattr(args, "backend", None)
                 if backend is not None and backend not in profile.backends:
                     raise ValueError("unknown backend for this profile")
-                asyncio.run(bridge(origin, profile.endpoint_key, token, profile.timeout_seconds + 5, session,
-                                   backend=backend, management=args.command == "mcp-bridge",
+                if getattr(args, "start_if_stopped", False):
+                    if not token:
+                        raise ValueError("--start-if-stopped requires a protected profile")
+                    port = start_for_stdio(args, profile)
+                    origin = f"http://127.0.0.1:{port}"
+                management = args.command == "mcp-bridge"
+                timeout = profile.timeout_seconds + 5
+                if management and profile.mock_tests_enabled:
+                    # Mock transport discovery has a separate bounded startup budget.
+                    timeout = max(timeout, 20)
+                asyncio.run(bridge(origin, profile.endpoint_key, token, timeout, session,
+                                   backend=backend, management=management,
                                    hook_session=os.environ.get(HOOK_ENV) if args.command == "stdio" else None))
         return 0
     except Timeout:
         _LOG.error("Profile state is already owned by another gateway process")
-    except (ValueError, FileExistsError, SecretStoreError) as error:
+    except (ValueError, OSError, SecretStoreError) as error:
         _LOG.error("%s", error)
     except sqlite3.Error:
         _LOG.error("SQLite storage is unavailable")

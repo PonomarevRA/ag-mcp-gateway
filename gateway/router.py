@@ -3,30 +3,35 @@
 import asyncio
 import json
 from bisect import bisect_left
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import cached_property
+from hashlib import blake2b
 from time import monotonic
 
 from mcp import ClientSession, McpError, types
 
+from .connection_diagnostics import docker_recovery
 from .connections import BackendConnections, Connection
 from .credentials import SecretStore
 from .hook_lifecycle import HOOK_META
 from .mcp_client import CatalogSession, PublishedOutputError
-from .mcp_server import catalog_window
+from .mcp_server import ToolSort, catalog_window
 from .module_data import ModuleError, json_signature, object_required
 from .module_runtime import check_schema, run_local, transform_result
 from .profile import HttpBackend, Profile
 from .schema_checks import SchemaChecks
-from .session_context import SESSION_META, SessionContext
+from .session_context import BRIDGE_SESSION_META, SESSION_META, TASK_META, session_attribution, task_tag
 from .telemetry import Telemetry
+from .tool_keywords import ToolKeywords
 from .trace_context import TraceContext, without_trace_fields
 
 
-def tool_error(message: str) -> types.CallToolResult:
+def tool_error(message: str, *, details: dict | None = None) -> types.CallToolResult:
     """Return an MCP tool failure carrying the supplied safe client-facing message."""
-    return types.CallToolResult(content=[types.TextContent(type="text", text=message)], isError=True)
+    return types.CallToolResult(content=[types.TextContent(type="text", text=message)],
+                                structuredContent=details, isError=True)
 
 
 @dataclass(frozen=True)
@@ -66,12 +71,15 @@ class Router:
         """Start with an empty catalog for the supplied profile and metrics sink."""
         self.profile = profile
         self.telemetry = telemetry
+        self.keywords = ToolKeywords()
+        self.telemetry.register_backends(profile.backends)
         self.routes: dict[str, Route] = {}
         self.catalog_revision = 0
         self._visible_revision = -1
         self._visible_names: tuple[str, ...] = ()
         self._ordered_names: tuple[str, ...] = ()
         self._available_counts: dict[str, int] = {}
+        self._usage_pages: OrderedDict[str, tuple[str, tuple[str, ...]]] = OrderedDict()
         self.statuses = dict.fromkeys(profile.backends, "starting")
         self.pending: dict[tuple[str, bytes, int], asyncio.Task[FlightResult]] = {}
         self.schema_checks = SchemaChecks()
@@ -100,7 +108,8 @@ class Router:
                     if previous is not None and previous.schema_signature == signature:
                         schema_generation = previous.schema_generation
                 self.routes[name] = Route(tool, worker.session, worker, schema_generation, signature)
-        self.telemetry.prune_tools(self.routes, self.profile.denied)
+        publications = self.modules.state.publications if self.modules is not None else ()
+        self.telemetry.prune_tools(self.routes, self.profile.denied, publications=publications)
 
 
     @asynccontextmanager
@@ -118,6 +127,7 @@ class Router:
     def _catalog_names(self) -> tuple[str, ...]:
         """Cache visibility and ordering for one publication or policy revision."""
         if self._visible_revision != self.catalog_revision:
+            self._usage_pages.clear()
             self._ordered_names = tuple(sorted(self.routes))
             self._visible_names = tuple(name for name in self._ordered_names if name not in self.profile.denied)
             counts = dict.fromkeys(self.profile.backends, 0)
@@ -139,27 +149,72 @@ class Router:
         """Return all public descriptors for callers that explicitly need the complete list."""
         return [self._visible_descriptor(name) for name in self._catalog_names()]
 
-    def visible_page(self, cursor: str | None) -> types.ListToolsResult:
-        """Materialize only the selected revision-fenced page of public descriptors."""
-        names = self._catalog_names()
-        window, next_cursor = catalog_window(len(names), cursor, self.catalog_revision)
-        return types.ListToolsResult(tools=[self._visible_descriptor(name) for name in names[window]],
-                                     nextCursor=next_cursor)
+    def _docker_catalog_meta(self, backend: str | None = None) -> dict | None:
+        """Report blocked dependencies even when the selected catalog is empty."""
+        names = self.statuses if backend is None else (backend,)
+        blocked = []
+        for name in names:
+            recovery = docker_recovery(name, self.statuses[name])
+            if recovery is not None:
+                blocked.append(recovery)
+        if blocked:
+            return {"ag-mcp-gateway/backend-recovery": blocked}
+        return None
 
-    def backend_page(self, backend: str, cursor: str | None) -> types.ListToolsResult:
-        """List tools in a configured backend scope using their original MCP names."""
+    def _list_window(self, names: tuple[str, ...], cursor: str | None, sort: ToolSort | None,
+                     scope: str) -> tuple[tuple[str, ...], str | None]:
+        """Freeze usage order across pages while new calls update the live counters."""
+        if cursor is not None and cursor.startswith("usage:"):
+            snapshot_id = cursor.split(":", 2)[1]
+            saved = self._usage_pages.get(snapshot_id)
+            if sort == "name" or saved is None or saved[0] != scope:
+                raise McpError(types.ErrorData(code=types.INVALID_PARAMS, message="Invalid catalog cursor"))
+            names = saved[1]
+        elif cursor is not None or sort == "name":
+            if sort == "usage":
+                raise McpError(types.ErrorData(code=types.INVALID_PARAMS, message="Invalid catalog cursor"))
+            window, next_cursor = catalog_window(len(names), cursor, self.catalog_revision, scope=f"name:{scope}")
+            return names[window], next_cursor
+        else:
+            # Stable sorting preserves the base order for tools with equal usage.
+            names = tuple(sorted(names, key=lambda name: -self.telemetry.tool_uses(name)))
+            # Reuse snapshots for repeated first-page requests with identical ordering.
+            ordering = "\0".join((scope, *names))
+            snapshot_id = blake2b(ordering.encode(), digest_size=12).hexdigest()
+
+        window, next_cursor = catalog_window(len(names), cursor, self.catalog_revision, scope=f"usage:{snapshot_id}")
+        if cursor is None and next_cursor is not None:
+            # Retain a bounded number of distinct orders per profile.
+            self._usage_pages[snapshot_id] = (scope, names)
+        if snapshot_id in self._usage_pages:
+            self._usage_pages.move_to_end(snapshot_id)
+            if len(self._usage_pages) > 64:
+                self._usage_pages.popitem(last=False)
+        return names[window], next_cursor
+
+    def visible_page(self, cursor: str | None, *, published: tuple[types.Tool, ...] = (),
+                     sort: ToolSort | None = None) -> types.ListToolsResult:
+        """Rank published modules and allowed upstream tools in the profile catalog."""
+        names = self._catalog_names()
+        modules = {tool.name: tool for tool in published}
+        names = tuple(modules) + names
+        if sort == "name" or (cursor is not None and cursor.startswith("name:")):
+            names = tuple(sorted(names))
+        names, next_cursor = self._list_window(names, cursor, sort, self.profile.endpoint_key)
+        tools = [modules[name] if name in modules else self._visible_descriptor(name) for name in names]
+        return types.ListToolsResult(tools=tools, nextCursor=next_cursor, _meta=self._docker_catalog_meta())
+
+    def backend_page(self, backend: str, cursor: str | None, *, sort: ToolSort | None = None) -> types.ListToolsResult:
+        """List allowed tools within one backend using their original MCP names."""
         if backend not in self.profile.backends:
             raise McpError(types.ErrorData(code=types.INVALID_PARAMS, message="Unknown MCP backend"))
         names = self._catalog_names()
         # '/' immediately follows the '.' namespace separator in the sorted names.
         start = bisect_left(names, f"{backend}.")
         end = bisect_left(names, f"{backend}/", lo=start)
-        scope = f"{self.profile.endpoint_key}/{backend}"
-        window, next_cursor = catalog_window(end - start, cursor, self.catalog_revision, scope=scope)
-        page_end = min(end, start + window.stop)
-        tools = [self._visible_descriptor(name, original_name=True)
-                 for name in names[start + window.start:page_end]]
-        return types.ListToolsResult(tools=tools, nextCursor=next_cursor)
+        names, next_cursor = self._list_window(names[start:end], cursor, sort, f"{self.profile.endpoint_key}/{backend}")
+        tools = [self._visible_descriptor(name, original_name=True) for name in names]
+        return types.ListToolsResult(tools=tools, nextCursor=next_cursor, _meta=self._docker_catalog_meta(backend))
 
     async def call_backend(self, backend: str, name: str, arguments: dict, *,
                            metadata: dict | None = None) -> types.CallToolResult:
@@ -182,34 +237,43 @@ class Router:
         self._catalog_names()
         return self._catalog_snapshot(self._ordered_names, self.telemetry.snapshot())
 
-    def dashboard_snapshot(self, query: str, offset: int, backend: str | None, *, page_size: int) -> dict:
+    def dashboard_snapshot(self, query: str, offset: int, backend: str | None, *, page_size: int,
+                           sort: ToolSort = "usage", published: tuple[types.Tool, ...] = ()) -> dict:
         """Filter the full catalog and materialize only the requested browser page."""
         self._catalog_names()
         term = query.casefold()
+        modules = {tool.name: tool for tool in published} if backend is None else {}
+        names = tuple(modules) + self._ordered_names
         matches = []
-        groups = set()
-        for name in self._ordered_names:
+        for name in names:
             prefix = name.partition(".")[0]
             if backend is not None and prefix != backend:
                 continue
             if term and term not in name.casefold():
-                description = self.routes[name].tool.description or ""
-                if term not in description.casefold():
+                tool = modules[name] if name in modules else self.routes[name].tool
+                if term not in (tool.description or "").casefold():
                     continue
             matches.append(name)
-            groups.add(prefix)
+        if sort == "usage":
+            matches.sort(key=lambda name: -self.telemetry.tool_uses(name))
+        else:
+            matches.sort()
         total = len(matches)
         last_page = max(0, total - 1) // page_size * page_size
         offset = min(offset // page_size * page_size, last_page)
         page = matches[offset:offset + page_size]
-        result = self._catalog_snapshot(page, self.telemetry.snapshot(page))
-        result["page"] = {"total": total, "offset": offset, "size": page_size, "backend": backend, "groups": groups}
+        result = self._catalog_snapshot(page, self.telemetry.snapshot(page), published=modules)
+        result["page"] = {"total": total, "offset": offset, "size": page_size, "backend": backend, "sort": sort}
         return result
 
-    def _catalog_snapshot(self, names, metrics: dict) -> dict:
+    def _catalog_snapshot(self, names, metrics: dict, *, published: dict[str, types.Tool] | None = None) -> dict:
         """Assemble current catalog policy and connection metadata for the selected names."""
         catalog = []
         for name in names:
+            if published is not None and name in published:
+                catalog.append({"name": name, "description": published[name].description or "",
+                                "denied": False, "singleflight": False})
+                continue
             route = self.routes[name]
             catalog.append({"name": name, "description": route.tool.description or "",
                             "denied": name in self.profile.denied,
@@ -244,10 +308,25 @@ class Router:
             })
         return items
 
+    def allows_module_read(self, name: str) -> bool:
+        """Check the profile allowlist against the current upstream descriptor and deny policy."""
+        route = self.routes.get(name)
+        annotations = route.tool.annotations if route is not None else None
+        return (name not in self.profile.denied and name in self.profile.module_chain_tools
+                and annotations is not None and annotations.readOnlyHint is True)
+
     async def call(self, name: str, arguments: dict, *, metadata: dict | None = None,
-                   require_read_only: bool = False) -> types.CallToolResult:
-        """Check deny policy before routing, then observe one inbound tool call."""
+                   require_read_only: bool = False, mock_trace: dict | None = None) -> types.CallToolResult:
+        """
+        Check deny policy, apply configured hooks and dispatch an inbound tool call.
+
+        An internal mock caller may supply a fresh dictionary for stage outcomes.
+        The trace records stage states and a change flag without copying payloads.
+        """
         start = monotonic()
+        if mock_trace is not None:
+            mock_trace.update(before_hook="skipped", arguments_changed=False, dispatched=False,
+                              output_schema="skipped", after_hook="skipped")
         denied = name in self.profile.denied
         route = self.routes.get(name)
         metric_name = name if denied or route else "(unknown)"
@@ -256,6 +335,7 @@ class Router:
         joined = False
         input_bytes = output_bytes = 0
         context = None
+        session_tag = workflow_tag = None
         hook_usage = None
         flight = None
         modules = self.modules
@@ -269,24 +349,34 @@ class Router:
         trace = TraceContext.from_metadata(metadata)
         metadata = without_trace_fields(metadata)
         try:
-            if metadata is not None and SESSION_META in metadata:
+            if metadata is not None:
                 try:
-                    context = SessionContext.parse(metadata[SESSION_META])
+                    context, session_tag = session_attribution(metadata)
                 except ValueError:
                     if not denied:
                         error_code = "invalid_session"
                         return tool_error("Invalid gateway session context")
+                if TASK_META in metadata:
+                    try:
+                        workflow_tag = task_tag(metadata[TASK_META])
+                    except ValueError:
+                        if not denied:
+                            error_code = "invalid_task"
+                            return tool_error("Invalid gateway task ID")
             if denied:
                 outcome = "denied"
                 error_code = "policy_denied"
                 return tool_error("This tool is disabled by the gateway profile")
             if route is None:
+                backend = name.partition(".")[0]
+                recovery = docker_recovery(backend, self.statuses.get(backend, ""))
+                if recovery is not None:
+                    error_code = recovery["status"]
+                    return tool_error(recovery["message"], details=recovery)
                 outcome = "unknown"
                 error_code = "unknown_tool"
                 return tool_error("This tool is unavailable in the gateway catalog")
-            annotations = route.tool.annotations
-            if require_read_only and (name not in self.profile.module_chain_tools or
-                                      annotations is None or annotations.readOnlyHint is not True):
+            if require_read_only and not self.allows_module_read(name):
                 error_code = "read_only_required"
                 return tool_error("Module steps require a read-only tool")
             if modules is None:
@@ -297,32 +387,50 @@ class Router:
             else:
                 before, after, hook_usage = modules.for_tool(name, route, hook_token)
             if before is not None:
+                if mock_trace is not None:
+                    mock_trace["before_hook"] = "failed"
+                    original_arguments = arguments
                 arguments = object_required(run_local(before, arguments))
+                if mock_trace is not None:
+                    mock_trace["arguments_changed"] = json_signature(arguments) != json_signature(original_arguments)
             encoded = json.dumps(arguments, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
                                  allow_nan=False).encode("utf-8")
             input_bytes = len(encoded)
-            if metadata is None and trace is None and self.singleflight_active(name, route):
-                if before is not None:
-                    check_schema(arguments, route.tool.inputSchema, self.schema_checks)
-                task, joined = self._shared(name, encoded, route, arguments)
-                flight = await asyncio.shield(task)
-                dispatch = flight
-            else:
+            use_singleflight = metadata is None and trace is None and self.singleflight_active(name, route)
+            forwarded = None
+            if not use_singleflight:
                 try:
                     arguments, forwarded = self._contextual_call(name, route, arguments, metadata, context, trace)
                 except ValueError:
                     error_code = "invalid_session_mapping"
                     return tool_error("Configured session parameter is absent from the upstream schema")
-                if before is not None:
-                    check_schema(arguments, route.tool.inputSchema, self.schema_checks)
+            if before is not None:
+                check_schema(arguments, route.tool.inputSchema, self.schema_checks)
+            if mock_trace is not None:
+                mock_trace["before_hook"] = "applied" if before is not None else "skipped"
+                mock_trace["dispatched"] = True
+            if use_singleflight:
+                task, joined = self._shared(name, encoded, route, arguments)
+                flight = await asyncio.shield(task)
+                dispatch = flight
+            else:
                 dispatch = await self._dispatch(name, route, arguments, forwarded)
             result = dispatch.result
+            if mock_trace is not None and isinstance(route.session, CatalogSession) and route.tool.outputSchema is not None:
+                if dispatch.error_code == "invalid_upstream_output":
+                    mock_trace["output_schema"] = "failed"
+                elif not result.isError:
+                    mock_trace["output_schema"] = "passed"
             if after is not None and not result.isError:
                 try:
                     result = transform_result(after, result, route.tool.outputSchema, self.schema_checks)
                 except ModuleError:
+                    if mock_trace is not None:
+                        mock_trace["after_hook"] = "failed"
                     error_code = "response_hook_failed"
                     return tool_error("Response hook failed after the upstream call completed")
+                if mock_trace is not None:
+                    mock_trace["after_hook"] = "applied"
             if hook_usage is not None and not result.isError:
                 modules.succeeded(hook_usage)
             if flight is not None and result is flight.result:
@@ -330,6 +438,8 @@ class Router:
             else:
                 output_bytes = len(result.model_dump_json(by_alias=True, exclude_none=True).encode())
             outcome = "error" if result.isError else "ok"
+            if outcome == "ok" and not joined:
+                self.keywords.observe(name, arguments, result.structuredContent)
             error_code = (dispatch.error_code or "upstream_tool_error") if result.isError else None
             return result
         except ModuleError as error:
@@ -343,13 +453,14 @@ class Router:
             error_code = None
             raise
         finally:
+            if mock_trace is not None:
+                mock_trace["error_code"] = error_code
             if hook_usage is not None:
                 modules.release(hook_usage)
             elapsed_ms = (monotonic() - start) * 1000
-            session_tag = context.tag if context else None
             self.telemetry.completed(metric_name, outcome, elapsed_ms, joined, input_bytes, output_bytes,
-                                     session_tag=session_tag, trace_id=trace.trace_id if trace else None,
-                                     error_code=error_code,
+                                     session_tag=session_tag, task_tag=workflow_tag, trace_id=trace.trace_id if trace else None,
+                                     error_code=error_code, module_step=require_read_only,
                                      track_tool=metric_name == "(unknown)" or metric_name in self.routes
                                      or metric_name in self.profile.denied)
 
@@ -358,7 +469,7 @@ class Router:
         backend = self.profile.backends[name.partition(".")[0]]
         # Progress tokens belong to the inbound session. Gateway identity requires local opt-in.
         forwarded = {key: value for key, value in (metadata or {}).items()
-                     if key not in {"progressToken", SESSION_META}}
+                     if key not in {"progressToken", SESSION_META, BRIDGE_SESSION_META, TASK_META}}
         if trace is not None and backend.forward_trace_context:
             forwarded.update(trace.carrier())
         if context is not None:

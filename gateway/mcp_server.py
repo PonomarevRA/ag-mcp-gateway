@@ -1,20 +1,38 @@
 """Adapt a catalog and a call handler to the SDK tool-only MCP server."""
 
+from typing import Literal
+
 from mcp import McpError, types
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
-VERSION = "0.15.0"
+VERSION = "0.18.0"
 _PAGE_SIZE = 100
+TOOL_SORT_META = "ag-mcp-gateway/sort"
+ToolSort = Literal["usage", "name"]
 
 
-def make_server(list_tools, call_tool) -> Server:
+def requested_sort(meta: types.RequestParams.Meta | None) -> ToolSort | None:
+    """Read the optional per-request MCP extension and reject unsupported values."""
+    values = meta.model_extra if meta is not None else None
+    if not values or TOOL_SORT_META not in values:
+        return None
+    value = values[TOOL_SORT_META]
+    if value == "usage" or value == "name":
+        return value
+    raise McpError(types.ErrorData(code=types.INVALID_PARAMS, message="Tool sort must be usage or name"))
+
+
+def make_server(list_tools, call_tool, *, forward_catalog_meta: bool = False) -> Server:
     """Preserve full tool results and let the policy handler see blocked calls."""
     server = Server("ag-mcp-gateway", version=VERSION)
 
     async def catalog(request: types.ListToolsRequest) -> types.ServerResult:
         """Read one catalog page with its opaque cursor."""
         cursor = request.params.cursor if request.params else None
+        if forward_catalog_meta:
+            meta = request.params.meta if request.params else None
+            return types.ServerResult(await list_tools(cursor, meta))
         return types.ServerResult(await list_tools(cursor))
 
     async def call(request: types.CallToolRequest) -> types.ServerResult:

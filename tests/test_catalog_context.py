@@ -7,12 +7,15 @@ from contextlib import asynccontextmanager
 import httpx
 import pytest
 from mcp import types
+from starlette.testclient import TestClient
 
+from gateway.cli import show_logs
 from gateway.connection_diagnostics import ConnectionProbe
 from gateway.dashboard import render
+from gateway.http_app import create_app
 from gateway.profile import Profile
 from gateway.router import Route, Router
-from gateway.session_context import SESSION_META, SessionContext
+from gateway.session_context import SESSION_META, TASK_META, SessionContext, task_tag
 from gateway.telemetry import Journal, Telemetry
 from gateway.upstream import run_backend
 
@@ -32,7 +35,39 @@ class RecordingSession:
         return types.CallToolResult(content=[])
 
 
-def test_local_context_maps_missing_args_and_journal_uses_tag(tmp_path):
+def test_statistics_scopes_server_cards_to_lifetime_counts(tmp_path):
+    """Show only the selected backend's counts and keep totals independent of catalog filters."""
+    profile = Profile.model_validate({
+        "name": "fixture",
+        "backends": {
+            "demo": {"transport": "stdio", "command": "unused"},
+            "basic": {"transport": "http", "url": "https://remote.example.com/mcp"},
+        },
+    })
+    router = Router(profile, Telemetry(Journal(tmp_path, 4096)))
+    tool = types.Tool(name="echo", inputSchema={"type": "object"})
+    router.routes["demo.echo"] = Route(tool, RecordingSession())
+    assert not asyncio.run(router.call("demo.echo", {})).isError
+
+    app = create_app(router, 18792, None)
+    client = TestClient(app, base_url="http://127.0.0.1:18792")
+    catalog = client.get("/catalog").text
+    for name in ("demo", "basic"):
+        assert f'href="/statistics?backend={name}"' in catalog
+
+    for backend, received in (("", 1), ("demo", 1), ("basic", 0)):
+        response = client.get("/statistics", params={"backend": backend, "q": "ignored", "offset": 100})
+        assert response.status_code == 200
+        assert f'data-metric="received">{received}</td>' in response.text
+        assert f'data-metric="upstream">{received}</td>' in response.text
+        if backend:
+            assert f'value="{backend}" selected' in response.text
+    invalid = client.get("/statistics", params={"backend": "<invalid>"})
+    assert invalid.status_code == 400 and 'aria-invalid="true"' in invalid.text
+    assert "data-metric=" not in invalid.text and "<invalid>" not in invalid.text
+
+
+def test_local_context_maps_missing_args_and_journal_uses_tag(tmp_path, capsys):
     """Explicit args win, only configured local tools receive the reserved context."""
     mapping = {"harness": "harness", "instance_id": "instanceId", "remote_session_id": "remoteSessionId"}
     profile = Profile.model_validate({
@@ -43,7 +78,7 @@ def test_local_context_maps_missing_args_and_journal_uses_tag(tmp_path):
             "remote": {"transport": "http", "url": "https://remote.example.com/mcp"},
         },
     })
-    router = Router(profile, Telemetry(Journal(tmp_path, 4096)))
+    router = Router(profile, Telemetry(Journal(tmp_path / "logs", 8192)))
     local = RecordingSession()
     remote = RecordingSession()
     tool = types.Tool(name="tasks_resolve_conversation", inputSchema={
@@ -54,7 +89,8 @@ def test_local_context_maps_missing_args_and_journal_uses_tag(tmp_path):
 
     async def scenario():
         """Compare local, remote and malformed requests against the same configuration."""
-        meta = {SESSION_META: _IDENTITY, "other.example/context": "ordinary extension", "progressToken": 17}
+        meta = {SESSION_META: _IDENTITY, TASK_META: "fixture-task-1",
+                "other.example/context": "ordinary extension", "progressToken": 17}
         explicit = {"harness": "manual"}
         assert not (await router.call("tasks.tasks_resolve_conversation", explicit, metadata=meta)).isError
         assert explicit == {"harness": "manual"}
@@ -65,6 +101,8 @@ def test_local_context_maps_missing_args_and_journal_uses_tag(tmp_path):
         assert remote.calls == [(tool.name, {}, {"other.example/context": "ordinary extension"})]
         invalid = {SESSION_META: {"sessionKey": "unsafe"}}
         assert (await router.call("tasks.tasks_resolve_conversation", {}, metadata=invalid)).isError
+        invalid_task = {SESSION_META: _IDENTITY, TASK_META: "invalid task"}
+        assert (await router.call("tasks.tasks_resolve_conversation", {}, metadata=invalid_task)).isError
         assert len(local.calls) == 1
         schema = types.Tool(name=tool.name, inputSchema={"type": "object"})
         router.routes["tasks.tasks_resolve_conversation"] = Route(schema, local)
@@ -72,12 +110,17 @@ def test_local_context_maps_missing_args_and_journal_uses_tag(tmp_path):
         assert len(local.calls) == 1
 
     asyncio.run(scenario())
-    contents = (tmp_path / "calls.0.jsonl").read_text()
+    contents = (tmp_path / "logs" / "calls.0.jsonl").read_text()
     assert "fixture-chat-123" not in contents and "local-fixture" not in contents
     events = [json.loads(line) for line in contents.splitlines()]
     tag = SessionContext.parse(_IDENTITY).tag
     assert events[0]["session_tag"] == events[1]["session_tag"] == tag
+    assert events[0]["task_tag"] == events[1]["task_tag"] == task_tag("fixture-task-1")
+    assert all("task_tag" not in event for event in events[2:4])
+    assert "fixture-task-1" not in contents and "invalid task" not in contents
     assert SessionContext.parse({**_IDENTITY, "conversationId": "fixture-binding"}).tag == tag
+    show_logs(tmp_path, 30, "remote", tag, workflow_tag=task_tag("fixture-task-1"))
+    assert json.loads(capsys.readouterr().out) == events[1]
 
 
 @pytest.mark.parametrize("feature", [
@@ -168,9 +211,9 @@ def test_catalog_distinguishes_local_access_and_authenticated_failure(tmp_path):
                                         RecordingSession())
     page = render(router.snapshot(), "", credentials=True)
     assert "Подключён без входа" in page and "HTTP 401" in page
-    assert 'href="/credentials?backend=grafana"' in page and 'href="#tools-tasks"' in page
-    filtered = render(router.snapshot(), "non-matching", credentials=True)
-    assert "Инструменты не найдены" in filtered and 'href="#tools-tasks"' not in filtered
+    assert 'href="/credentials?backend=grafana"' in page and 'href="/tools?backend=tasks#catalog"' in page
+    filtered = render(router.snapshot(), "non-matching", credentials=True, section="/tools")
+    assert "Инструменты не найдены" in filtered and 'id="tools-tasks"' not in filtered
 
 
 def test_context_cannot_be_used_as_a_lease_key():
@@ -196,10 +239,6 @@ def test_cli_identity_accepts_dash_prefixed_remote_id():
 
 def test_dashboard_pages_search_the_full_catalog(tmp_path):
     """Keep full search and status while rendering only one browser page."""
-    from starlette.testclient import TestClient
-
-    from gateway.http_app import create_app
-
     profile = Profile.model_validate({
         "name": "paged",
         "backends": {name: {"transport": "stdio", "command": "unused"} for name in ("alpha", "beta")},
@@ -214,21 +253,38 @@ def test_dashboard_pages_search_the_full_catalog(tmp_path):
             router.routes[f"{backend}.{name}"] = Route(tool, RecordingSession())
 
     client = TestClient(create_app(router, 18792, None), base_url="http://127.0.0.1:18792")
-    first = client.get("/").text
-    assert "Инструменты · 250" in first
+    home = client.get("/").text
+    assert '<h1 id="section-title" class="workspace-title">Каталог MCP</h1>' in home
+    assert 'href="/tools?backend=beta#catalog"' in home
+    assert 'alpha.tool_000' not in home
+    first = client.get("/tools").text
+    assert "Найдено инструментов: 250" in first
+    assert '/assets/tool-catalog.js' in first and '/assets/tool-catalog.js' not in home
+    assert first.count('data-tool-card') == 100
+    rail = client.get("/assets/ag-rail/feed-rail.js")
+    assert rail.status_code == 200 and "export function createFeedRail" in rail.text
+    assert rail.headers["content-type"].startswith("text/javascript")
+    assert client.get("/assets/ag-rail/manifest.json").status_code == 404
     assert "alpha.tool_000" in first and "alpha.tool_099" in first and "alpha.tool_100" not in first
-    assert 'rel="next" href="/?offset=100"' in first and 'href="/?backend=beta#catalog"' in first
+    assert 'rel="next" href="/tools?offset=100"' in first
     assert "alpha.tool_001</strong> <small>Запрещён" in first
-    assert 'href="/?backend=alpha#catalog"' in first
-    filtered_backend = client.get("/?q=Fixture&backend=alpha&lang=en").text
+    filtered_backend = client.get("/tools?q=Fixture&backend=alpha&lang=en").text
     assert "MCP filter" in filtered_backend and "Clear filters" in filtered_backend
     assert "beta.tool_000" not in filtered_backend
-    second = client.get("/?offset=100").text
+    router.telemetry.completed("beta.tool_124", "ok", 1, False, 0, 0)
+    popular = client.get("/tools?lang=en").text
+    assert '<option value="usage" selected>Most used</option>' in popular
+    assert popular.index("beta.tool_124</strong>") < popular.index("alpha.tool_000</strong>")
+    alphabetical = client.get("/tools?sort=name").text
+    assert '<option value="name" selected>Name</option>' in alphabetical
+    assert 'rel="next" href="/tools?offset=100&amp;sort=name"' in alphabetical
+    assert "beta.tool_124</strong>" not in alphabetical
+    second = client.get("/tools?offset=100&sort=name").text
     assert "alpha.tool_100" in second and "beta.tool_074" in second and "beta.tool_075" not in second
-    last = client.get("/?backend=beta&offset=999999&lang=ru").text
-    assert "Инструменты · 125" in last and "beta.tool_124" in last and "alpha.tool_124" not in last
-    filtered = client.get("/", params={"q": "NEEDLE"}).text
-    assert "Инструменты · 1" in filtered and "beta.tool_124" in filtered and "alpha.tool_000" not in filtered
+    last = client.get("/tools?backend=beta&offset=999999&lang=ru&sort=name").text
+    assert "Найдено инструментов: 125" in last and "beta.tool_124" in last and "alpha.tool_124" not in last
+    filtered = client.get("/tools", params={"q": "NEEDLE"}).text
+    assert "Найдено инструментов: 1" in filtered and "beta.tool_124" in filtered and "alpha.tool_000" not in filtered
     assert "&lt;escaped&gt;" in filtered and "<escaped>" not in filtered
     status = client.get("/api/status/paged").json()
     assert len(status["catalog"]) == 250

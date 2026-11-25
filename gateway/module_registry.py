@@ -4,6 +4,7 @@ import logging
 import time
 from collections import Counter
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -45,6 +46,15 @@ class Object(Step):
     fields: dict[JsonKey, Pointer] = Field(max_length=32)
 
 
+class Find(Step):
+    """Select one object by an exact string match in a previous result."""
+
+    op: Literal["find"]
+    source: Pointer
+    field: Pointer
+    match: Pointer
+
+
 class Compare(Step):
     op: Literal["compare"]
     left: Pointer
@@ -82,7 +92,7 @@ class Call(Step):
     arguments: Pointer = "/value"
 
 
-Operation = Annotated[Select | Object | Compare | Containment | Aggregate | Math | Call, Field(discriminator="op")]
+Operation = Annotated[Select | Object | Find | Compare | Containment | Aggregate | Math | Call, Field(discriminator="op")]
 
 
 class Module(Contract):
@@ -119,11 +129,26 @@ class Hooks(Contract):
     after: Identifier | None = None
 
 
+class Publication(Contract):
+    """Define required JSON object fields for one published tool."""
+
+    fields: dict[Identifier, Literal["string", "boolean", "integer", "number", "object", "array"]] = Field(
+        default_factory=dict, max_length=16,
+    )
+
+    @cached_property
+    def input_schema(self) -> dict:
+        """Generate an MCP schema with no external references or executable constraints."""
+        return {"type": "object", "properties": {name: {"type": kind} for name, kind in self.fields.items()},
+                "required": list(self.fields), "additionalProperties": False}
+
+
 class ModuleState(Contract):
     """Capture all definitions and bindings in one atomically replaced snapshot."""
 
     revision: int = Field(default=0, ge=0, strict=True)
     modules: dict[Identifier, Module] = Field(default_factory=dict, max_length=64)
+    publications: dict[Identifier, Publication] = Field(default_factory=dict, max_length=64)
     bindings: dict[ToolName, Hooks] = Field(default_factory=dict, max_length=256)
     lifecycle: dict[Identifier, HookLife] = Field(default_factory=dict, max_length=64)
     generation_rules: GenerationRules = Field(default_factory=GenerationRules)
@@ -140,6 +165,8 @@ class ModuleState(Contract):
         for key, module in self.modules.items():
             if key != module.id:
                 raise ValueError("module identity mismatch")
+        if not self.publications.keys() <= self.modules.keys():
+            raise ValueError("publication requires a saved module")
         if any(key not in self.modules or not self.modules[key].local for key in self.lifecycle):
             raise ValueError("hook history requires a local module")
         for hook in self.bindings.values():
@@ -157,6 +184,13 @@ class Change(Contract):
 
 class Save(Change):
     module: Module
+
+
+class Publish(Change):
+    """Publish a saved module or remove its existing public entry."""
+
+    id: Identifier
+    publication: Publication | None
 
 
 class Delete(Change):
@@ -241,6 +275,8 @@ class ModuleRegistry:
         """Persist a bounded snapshot before publishing it to the event loop."""
         data = bounded_json(state.document(), MAX_STATE, node_limit=32_000)
         write_state(self.path, data)
+        if state.publications != self.state.publications:
+            self.router.catalog_revision += 1
         self.state = state
 
     def _check_revision(self, expected: int):
@@ -262,7 +298,10 @@ class ModuleRegistry:
     def save(self, change: Save) -> dict:
         """Add or replace a definition, resetting usage after a change in steps."""
         module = change.module
+        self._check_revision(change.expected_revision)
         before = self.state.modules.get(module.id)
+        if module.id in self.state.publications and module != before:
+            raise ModuleError("Unpublish the tool before editing its module")
         history = self.state.lifecycle.copy()
         if not module.local:
             history.pop(module.id, None)
@@ -276,9 +315,33 @@ class ModuleRegistry:
         bounded_json(definitions, MAX_DEFINITIONS, node_limit=24_000)
         return self._edit(change, modules=modules, lifecycle=history)
 
+    def check_publication_targets(self, module: Module) -> None:
+        """Require current policy and metadata to permit every upstream read."""
+        for step in module.steps:
+            if isinstance(step, Call) and not self.router.allows_module_read(step.tool):
+                raise ModuleError("Published modules require allowed read-only MCP tools")
+
+    def publish(self, change: Publish) -> dict:
+        """Atomically expose a validated saved module, or remove its catalog entry."""
+        self._check_revision(change.expected_revision)
+        module = self.state.modules.get(change.id)
+        if module is None:
+            raise ModuleError("Module not found")
+        publications = self.state.publications.copy()
+        if change.publication is None:
+            publications.pop(change.id, None)
+        else:
+            self.check_publication_targets(module)
+            publications[change.id] = change.publication
+        if publications == self.state.publications:
+            return {"revision": self.state.revision}
+        return self._edit(change, publications=publications)
+
     def delete(self, change: Delete) -> dict:
         """Remove a definition only after all profile and session references end."""
         self._check_revision(change.expected_revision)
+        if change.id in self.state.publications:
+            raise ModuleError("Unpublish the tool before deleting its module")
         modules = self.state.modules.copy()
         if change.id in self.protected(int(time.time())) or self.inflight[change.id]:
             raise ModuleError("Detach or close active hook bindings before deleting the module")
@@ -317,7 +380,7 @@ class ModuleRegistry:
 
     def protected(self, now: int) -> set[str]:
         """Collect modules held by current profile bindings or unexpired activations."""
-        active = set(self.inflight)
+        active = set(self.inflight) | self.state.publications.keys()
         for hooks in self.state.bindings.values():
             active.update(name for name in (hooks.before, hooks.after) if name is not None)
         self.sessions.reap(now)

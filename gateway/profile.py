@@ -53,6 +53,14 @@ class StdioBackend(BackendOptions):
     command: str = Field(min_length=1)
     args: list[str] = Field(default_factory=list)
     env_from: dict[EnvName, EnvName] = Field(default_factory=dict)
+    requires_docker: bool = Field(default=False, strict=True)
+
+    @property
+    def docker_cli(self) -> str | None:
+        """Reuse an explicit Docker executable, or use PATH for a wrapper's prerequisite."""
+        if Path(self.command).name.lower() in {"docker", "docker.exe"}:
+            return self.command
+        return "docker" if self.requires_docker else None
 
 
 class HttpBackend(BackendOptions):
@@ -102,6 +110,13 @@ def mcp_path(profile_key: str, backend: str | None = None) -> str:
     return f"{path}/{backend}" if backend is not None else path
 
 
+def backend_client_name(profile_key: str, backend: str) -> str:
+    """Keep generated client entries distinct across profile and backend pairs."""
+    identity = f"{profile_key}/{backend}"
+    suffix = sha256(identity.encode("ascii")).hexdigest()[:8]
+    return f"amg-proxy-{backend[:13]}-{suffix}"
+
+
 class Profile(BaseModel):
     """Bind server identities, policies and journal limits to one local profile."""
 
@@ -115,13 +130,15 @@ class Profile(BaseModel):
     management_bridge: bool = Field(default=False, strict=True)
     agent_discovery: bool = Field(default=False, strict=True)
     modules_enabled: bool = Field(default=False, strict=True)
+    mock_tests_enabled: bool = Field(default=False, strict=True)
+    chain_suggestions: bool = Field(default=False, strict=True)
     module_chain_tools: set[ToolName] = Field(default_factory=set, max_length=256)
     skill_router: SkillSettings | None = None
     log_max_bytes: int = Field(default=LOG_FILE_MAX_BYTES, ge=4096, le=1_000_000_000, strict=True)
     technical_log_max_bytes: int = Field(default=LOG_FILE_MAX_BYTES, ge=65_536, le=1_000_000_000, strict=True)
     log_retention_days: int = Field(default=DEFAULT_LOG_RETENTION_DAYS, ge=1, le=365, strict=True)
     timeout_seconds: float = Field(default=30, gt=0, le=300)
-    backends: dict[Identifier, Backend] = Field(min_length=1, max_length=32)
+    backends: dict[Identifier, Backend] = Field(max_length=32)
     denied: set[ToolName] = Field(default_factory=set)
     singleflight: set[ToolName] = Field(default_factory=set)
 
@@ -163,10 +180,16 @@ class Profile(BaseModel):
             raise ValueError("basic_keychain requires a gateway access_token_env or access_token_keychain")
         if self.management_bridge and not has_token:
             raise ValueError("management_bridge requires a gateway token reference")
+        if self.mock_tests_enabled and (self.environment != "test" or not self.management_bridge):
+            raise ValueError("mock_tests_enabled requires an authenticated test management profile")
+        if not self.backends and not self.mock_tests_enabled:
+            raise ValueError("a profile requires at least one configured backend")
         if self.agent_discovery and not self.management_bridge:
             raise ValueError("agent_discovery requires management_bridge")
         if self.module_chain_tools and not self.modules_enabled:
             raise ValueError("module_chain_tools requires modules_enabled")
+        if self.chain_suggestions and not self.modules_enabled:
+            raise ValueError("chain_suggestions requires modules_enabled")
         if self.modules_enabled and not self.management_bridge:
             raise ValueError("modules_enabled requires management_bridge")
         if self.skill_router is not None and not self.management_bridge:

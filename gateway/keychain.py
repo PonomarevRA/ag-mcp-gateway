@@ -36,6 +36,7 @@ class MacKeychain:
                          [_POINTER, _SIZE, _TEXT, _SIZE, _TEXT, _SIZE, _TEXT, c.POINTER(_POINTER)])
         self.modify = _bind(security, "SecKeychainItemModifyAttributesAndData",
                             [_POINTER, _POINTER, _SIZE, _TEXT])
+        self.delete = _bind(security, "SecKeychainItemDelete", [_POINTER])
         self.free_data = _bind(security, "SecKeychainItemFreeContent", [_POINTER, _POINTER])
         self.release = _bind(foundation, "CFRelease", [_POINTER], result=None)
 
@@ -89,6 +90,20 @@ class MacKeychain:
     def write_token(self, key: str, value: str) -> None:
         """Store a token without passing it through a subprocess."""
         self._write(f"token/{key}", value, valid_token)
+
+    def delete_token(self, key: str) -> None:
+        """Remove a newly generated token when a profile transaction cannot commit."""
+        name = f"token/{key}".encode("ascii")
+        item = _POINTER()
+        with self._keychain() as keychain:
+            status = self.find(keychain, len(_SERVICE), _SERVICE, len(name), name, None, None, c.byref(item))
+            if status == _NOT_FOUND:
+                return
+            _check(status)
+            try:
+                _check(self.delete(item))
+            finally:
+                self.release(item)
 
     def _write(self, account: str, value: str, validate) -> None:
         """Add or replace a validated generic password through Security.framework."""

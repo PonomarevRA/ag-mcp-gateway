@@ -14,9 +14,11 @@ class PublishedOutputError(ValueError):
 class CatalogSession(ClientSession):
     """Keep discovery and call validation tied to immutable published tool descriptors."""
 
-    async def catalog_page(self, cursor: str | None) -> types.ListToolsResult:
+    async def catalog_page(self, cursor: str | None, meta: types.RequestParams.Meta | None = None) -> types.ListToolsResult:
         """Read a page without changing the SDK's per-tool output schema cache."""
-        params = types.PaginatedRequestParams(cursor=cursor) if cursor is not None else None
+        params = None
+        if cursor is not None or meta is not None:
+            params = types.PaginatedRequestParams(cursor=cursor, _meta=meta)
         request = types.ClientRequest(types.ListToolsRequest(params=params))
         return await self.send_request(request, types.ListToolsResult)
 

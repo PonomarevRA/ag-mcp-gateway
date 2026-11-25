@@ -3,8 +3,10 @@
 import json
 import logging
 import math
+import os
 import re
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,12 +66,33 @@ class Journal:
     def recent_successes(self, max_bytes: int, limit: int) -> list[tuple[str, float]]:
         """Read a bounded tail of retained successful non-joined journal events."""
         samples = []
+        for event in self.newest_events(max_bytes):
+            if event.get("outcome") != "ok" or event.get("joined") is not False:
+                continue
+            name, elapsed = event.get("tool"), event.get("duration_ms")
+            if (isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name) and "." in name and
+                    type(elapsed) in (int, float) and 0 <= elapsed < 86_400_000 and math.isfinite(elapsed)):
+                samples.append((name, elapsed))
+                if len(samples) == limit:
+                    break
+        samples.reverse()
+        return samples
+
+    def newest_events(self, max_bytes: int):
+        """Yield complete journal events newest first within a total read budget."""
+        seen = set()
         remaining = max_bytes
         for path in self.paths:
-            if remaining <= 0 or len(samples) >= limit:
+            if remaining <= 0:
                 break
             try:
                 with path.open("rb") as source:
+                    stat = os.fstat(source.fileno())
+                    identity = stat.st_dev, stat.st_ino
+                    if stat.st_ino and identity in seen:
+                        continue
+                    if stat.st_ino:
+                        seen.add(identity)
                     size = source.seek(0, 2)
                     offset = max(0, size - remaining)
                     source.seek(offset)
@@ -77,26 +100,18 @@ class Journal:
             except FileNotFoundError:
                 continue
             except OSError:
-                _LOG.warning("Unable to read tool latency history")
+                _LOG.warning("Unable to read gateway call history")
                 break
             remaining -= len(data)
             if offset:
                 data = data.partition(b"\n")[2]
-            for line in reversed(data.splitlines()):
+            for line in reversed(data.split(b"\n")[:-1]):
                 try:
                     event = json.loads(line)
                 except (ValueError, UnicodeError, RecursionError):
                     continue
-                if not isinstance(event, dict) or event.get("outcome") != "ok" or event.get("joined") is not False:
-                    continue
-                name, elapsed = event.get("tool"), event.get("duration_ms")
-                if (isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name) and "." in name and
-                        type(elapsed) in (int, float) and 0 <= elapsed < 86_400_000 and math.isfinite(elapsed)):
-                    samples.append((name, elapsed))
-                    if len(samples) == limit:
-                        break
-        samples.reverse()
-        return samples
+                if isinstance(event, dict):
+                    yield event
 
 
 class LatencyHistory:
@@ -180,30 +195,49 @@ class Telemetry:
         self.technical = technical
         self.total = Counts()
         self.tools: dict[str, Counts] = {}
+        self._backends: dict[str, Counts] = {}
         self.journal_errors = 0
         self._last_upstream: dict[str, str] = {}
         self.history = LatencyHistory(journal) if with_history else None
+
+    def register_backends(self, names: Iterable[str]) -> None:
+        """Limit process-lifetime rollups to the configured backend identities."""
+        self._backends = {name: Counts() for name in names}
+
+    def statistics(self, backend: str | None = None) -> dict:
+        """Summarize the gateway or one configured backend independently of the catalog page."""
+        counts = self.total if backend is None else self._backends[backend]
+        return {"total": counts.snapshot(), "journal_errors": self.journal_errors}
 
     def upstream_started(self, tool: str) -> None:
         """Count and timestamp an actual dispatch, including calls that return errors."""
         self.total.upstream += 1
         self.tools.setdefault(tool, Counts()).upstream += 1
-        self._last_upstream[tool.partition(".")[0]] = datetime.now(timezone.utc).isoformat()
+        backend = tool.partition(".")[0]
+        backend_counts = self._backends.get(backend)
+        if backend_counts is not None:
+            backend_counts.upstream += 1
+        self._last_upstream[backend] = datetime.now(timezone.utc).isoformat()
 
     def last_upstream_at(self, backend: str) -> str | None:
         """Return the latest upstream dispatch time for this backend in UTC."""
         return self._last_upstream.get(backend)
 
+    def tool_uses(self, name: str) -> int:
+        """Count completed tool requests other than policy denials in this process."""
+        counts = self.tools.get(name)
+        return counts.received - counts.denied if counts is not None else 0
+
     def tool_latency(self, tool: str) -> tuple[float | None, int]:
         """Expose observed successful latency when agent discovery is enabled."""
         return self.history.mean(tool) if self.history is not None else (None, 0)
 
-    def prune_tools(self, live_names, denied) -> None:
+    def prune_tools(self, live_names, denied, *, publications=()) -> None:
         """Keep live counters and the 256 most recently introduced retired identities."""
         retired = 0
         remove = []
         for name in reversed(self.tools):
-            if name == "(unknown)" or name in live_names or name in denied:
+            if name == "(unknown)" or name in live_names or name in denied or name in publications:
                 continue
             retired += 1
             if retired > _RETIRED_TOOL_LIMIT:
@@ -212,12 +246,15 @@ class Telemetry:
             del self.tools[name]
 
     def completed(self, tool, outcome, elapsed_ms, merged, input_bytes, output_bytes, *,
-                  session_tag=None, trace_id=None, error_code=None, track_tool=True):
+                  session_tag=None, task_tag=None, trace_id=None, error_code=None, track_tool=True, module_step=False):
         """Update rollups and append one sanitized event per inbound request."""
         duration = round(elapsed_ms, 2)
         if self.history is not None and outcome == "ok" and not merged:
             self.history.add(tool, duration)
         self.total.add_call(outcome, elapsed_ms, merged, input_bytes, output_bytes)
+        backend_counts = self._backends.get(tool.partition(".")[0])
+        if backend_counts is not None:
+            backend_counts.add_call(outcome, elapsed_ms, merged, input_bytes, output_bytes)
         counts = self.tools.get(tool)
         if counts is None and track_tool:
             counts = self.tools[tool] = Counts()
@@ -236,8 +273,12 @@ class Telemetry:
             event["error_code"] = error_code
         if session_tag is not None:
             event["session_tag"] = session_tag
+        if task_tag is not None:
+            event["task_tag"] = task_tag
         if trace_id is not None:
             event["trace_id"] = trace_id
+        if module_step:
+            event["module_step"] = True
         try:
             self.journal.write(event)
         except OSError:

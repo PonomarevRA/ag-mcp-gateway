@@ -171,8 +171,18 @@ def test_external_collection_and_agent_diagnosis(tmp_path, monkeypatch):
             assert "trace_id=" + trace + "&amp;lang=en" in html.text
             empty = client.get("/diagnostics?trace_id=" + "1" * 32, headers=HEADERS)
             assert "На этой странице нет ошибок и предупреждений." in empty.text
-            assert client.get("/diagnostics?trace_id=bad", headers=HEADERS).status_code == 400
-            assert client.get("/diagnostics?epoch=expired&before=4", headers=HEADERS).status_code == 409
+            invalid_trace = client.get("/diagnostics", headers=HEADERS, params={"backend": "local", "trace_id": 'a"<bad>'})
+            assert invalid_trace.status_code == 400 and 'value="a&quot;&lt;bad&gt;"' in invalid_trace.text
+            assert 'aria-invalid="true" aria-describedby="diagnostic-feedback" autofocus' in invalid_trace.text
+            mixed = client.get("/diagnostics", headers=HEADERS,
+                               params={"backend": "local", "trace_id": "wrong", "before": "nope"})
+            assert mixed.status_code == 400
+            assert 'value="wrong" maxlength="32" aria-invalid="true"' in mixed.text
+            assert 'href="/diagnostics?backend=local&amp;trace_id="' in mixed.text
+            stale_page = client.get("/diagnostics", headers=HEADERS,
+                                    params={**params, "epoch": "expired", "before": 4})
+            assert stale_page.status_code == 409 and 'aria-invalid="true"' not in stale_page.text
+            assert f'href="/diagnostics?backend=local&amp;trace_id={trace}" aria-describedby="diagnostic-feedback" autofocus' in stale_page.text
 
             with sqlite3.connect(journal.path) as connection:
                 connection.execute("UPDATE events SET payload=? WHERE sequence=4", (b"{}",))

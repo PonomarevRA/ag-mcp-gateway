@@ -1,0 +1,87 @@
+.ag-button,
+.ag-field,
+.ag-nav {
+  font: var(--ag-text-size)/1.4 var(--ag-font);
+}
+.ag-button {
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--ag-space-2);
+  min-height: var(--ag-control-height);
+  min-width: var(--ag-control-height);
+  padding: 5px 12px;
+  border: 1px solid var(--ag-border);
+  border-radius: var(--ag-radius-control);
+  background: var(--ag-surface);
+  color: var(--ag-text);
+  cursor: pointer;
+  vertical-align: middle;
+  white-space: nowrap;
+  text-decoration: none;
+  font-weight: 500;
+}
+.ag-button--primary {
+  background: var(--ag-accent);
+  border-color: var(--ag-accent);
+  color: var(--ag-on-accent);
+}
+.ag-button--danger {
+  background: var(--ag-danger);
+  border-color: var(--ag-danger);
+  color: var(--ag-surface);
+}
+.ag-button--quiet {
+  background: transparent;
+  border-color: transparent;
+}
+.ag-button:hover:not(:disabled) {
+  filter: brightness(0.96);
+}
+/* Quiet actions gain a surface only during interaction; their hit target stays intact. */
+.ag-button--quiet:hover:not(:disabled),
+.ag-button--quiet[aria-expanded="true"],
+.ag-button--quiet[aria-pressed="true"] {
+  background: var(--ag-surface-alt);
+  filter: none;
+}
+.ag-button--quiet:focus-visible {
+  outline: 2px solid var(--ag-accent);
+  outline-offset: 2px;
+}
+.ag-button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.ag-button[aria-busy="true"] {
+  cursor: progress;
+}
+.ag-button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.ag-section-stack {
+  display: grid;
+  gap: 12px;
+  color: var(--ag-text);
+  min-width: 0;
+}
+.ag-section-stack > h3 {
+  margin: 0;
+  font-size: 15px;
+  line-height: 1.4;
+}
+.ag-section-stack__description {
+  margin: 0;
+  color: var(--ag-muted);
+  font-size: 12px;
+}
+.ag-section-stack__items {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+.ag-section-stack[data-density="compact"],
+.ag-section-stack[data-density="compact"] > .ag-section-stack__items {
+  gap: 8px;
+}

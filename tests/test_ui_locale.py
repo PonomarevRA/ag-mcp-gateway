@@ -38,11 +38,11 @@ def test_browser_locales_and_cookie(tmp_path):
         page = client.get("/?q=test&backend=demo&offset=100&confirmation=do-not-copy",
                           headers={"Accept-Language": "fr, en-US;q=.9, ru;q=.6"})
         assert page.headers["Content-Language"] == "en" and "set-cookie" not in page.headers
-        assert 'lang="en"' in page.text and "MCP server catalog" in page.text
+        assert 'lang="en"' in page.text and "MCP catalog" in page.text
         assert '?q=test&amp;backend=demo&amp;offset=100&amp;lang=ru' in page.text
         assert "do-not-copy" not in page.text
         page = client.get("/settings?lang=ru")
-        assert "Настройки MCP" in page.text
+        assert "Политика инструментов" in page.text
         assert "amg_ui_lang=ru" in page.headers["set-cookie"]
         assert "HttpOnly" in page.headers["set-cookie"]
         assert client.get("/credentials", headers={"Accept-Language": "en"}).headers["Content-Language"] == "ru"

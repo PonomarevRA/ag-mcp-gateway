@@ -189,7 +189,7 @@ def test_module_page_and_management_share_state(fixture_gateway):
         assert client.get("/modules").status_code == 401
         assert client.get("/modules", headers=bearer).status_code == 401
         page = client.get("/modules", headers=browser)
-        assert 'aria-current="page">Модули' in page.text
+        assert 'href="/modules" aria-current="page"' in page.text
         assert 'href="/modules"' in client.get("/", headers=browser).text
         csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
         draft = {"id": "module", "title": "<script>demo</script>",
@@ -238,6 +238,7 @@ def test_module_page_preserves_operator_work(fixture_gateway):
         invalid = post("save", 0, data=draft)
         assert invalid.status_code == 400
         assert escape(draft) in invalid.text and '<p id="module-feedback" role="alert"' in invalid.text
+        assert 'aria-describedby="definition-help module-feedback" aria-invalid="true" autofocus' in invalid.text
         assert registry.state.revision == 0
 
         body = definition("projection", {"op": "select", "source": "/input/value"}).model_dump_json()
@@ -253,6 +254,7 @@ def test_module_page_preserves_operator_work(fixture_gateway):
         editor = stale.text.split('<h2 id="editor">', 1)[1].split("</form>", 1)[0]
         assert 'name="revision" value="0"' in editor
         assert "Preserved unsaved draft" in editor
+        assert 'tabindex="-1" autofocus' in editor and 'aria-invalid="true"' not in editor
         link = re.search(r'<a href="([^"]+)">Open the current form</a>', editor).group(1)
         fresh_location = unescape(link)
         assert fresh_location == "/modules?edit=projection&tool=demo.read&view=current#editor"
@@ -267,6 +269,9 @@ def test_module_page_preserves_operator_work(fixture_gateway):
         assert result.status_code == 200 and "<pre>null</pre>" in result.text
         assert 'value="projection" selected' in result.text
         assert escape(data) in result.text
+        invalid_run = post("run", 1, id="projection", data=draft)
+        assert invalid_run.status_code == 400 and escape(draft) in invalid_run.text
+        assert 'aria-describedby="module-feedback" aria-invalid="true" autofocus' in invalid_run.text
 
         opened = post("open", 1)
         lifecycle = opened.text.split('<h2 id="lifecycle">', 1)[1]

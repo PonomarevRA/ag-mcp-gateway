@@ -13,20 +13,24 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 
 from .agent_diagnostics import AgentDiagnostics
+from .chain_suggestions import ChainSuggestions
+from .connection_diagnostics import docker_recovery
 from .connections import ReauthorizationError
-from .credential_ui import SECURE_HTML, read_form
-from .dashboard import connection_status, last_call_line
+from .credential_ui import LIVE_SETTINGS_HTML, SECURE_HTML, read_form
+from .dashboard import backend_filter, connection_status, last_call_line
 from .mcp_server import catalog_page, make_server
+from .mock_tests import MockTestError
 from .module_data import ModuleError
 from .module_runtime import ModuleService
-from .policy_settings import PolicyChange
+from .policy_settings import PolicyChange, PolicyState
 from .profile import HttpBackend, Identifier
 from .router import tool_error
 from .skill_store import SkillStore, SkillStoreError
 from .skill_tools import SkillTools
 from .tool_discovery import Discovery
 from .tool_feedback import FeedbackError, ToolFeedback
-from .ui_locale import language, language_switch, tr
+from .ui_locale import tr
+from .ui_shell import revision_notice, shell
 
 
 _POLICY_LABELS = {"allow": "Разрешён", "deny": "Запрещён", "singleflight": "Singleflight"}
@@ -65,13 +69,17 @@ class Management:
     """Keep management commands separate from proxied tools and secret values."""
 
     def __init__(self, router, settings, origin: str, credentials: bool, skill_store: SkillStore | None = None,
-                 feedback: ToolFeedback | None = None, telemetry_api=None, *, csrf: str | None = None):
+                 feedback: ToolFeedback | None = None, telemetry_api=None, *, csrf: str | None = None,
+                 bridge_enabled: bool = False, mock_tests=None):
         """Bind this management surface to the selected profile and loopback origin."""
         self.router = router
         self.settings = settings
         self.origin = origin
         self.credentials = credentials
-        self.csrf = csrf
+        self.csrf = csrf if settings is not None else None
+        self.bridge_enabled = bridge_enabled
+        self.mock_tests = mock_tests
+        self.default_policy = PolicyState()
         self.confirmation: tuple[str, int, str] | None = None
         self._policy_key: tuple[int, int] | None = None
         self._policy_names: tuple[str, ...] = ()
@@ -79,10 +87,20 @@ class Management:
         self.discovery = Discovery(router, feedback, self.skills) if feedback is not None else None
         self.diagnostics = AgentDiagnostics(telemetry_api) if telemetry_api is not None else None
         self.modules = ModuleService(router.modules, router) if router.modules is not None else None
+        self.chains = ChainSuggestions(router) if self.modules is not None and router.profile.chain_suggestions else None
+
+    @property
+    def policy_state(self) -> PolicyState:
+        """Expose the active policy state even without a writable settings store."""
+        return self.settings.state if self.settings is not None else self.default_policy
+
+    def browser_revision(self) -> str:
+        """Identify the exact policy and tool catalog shown by the browser."""
+        return f"{self.policy_state.revision}:{self.router.catalog_revision}"
 
     def policy_names(self) -> tuple[str, ...]:
         """Reuse the ordered policy union until route or override membership changes."""
-        state = self.settings.state
+        state = self.policy_state
         key = self.router.catalog_revision, state.revision
         if key != self._policy_key:
             profile = self.router.profile
@@ -100,6 +118,8 @@ class Management:
         views = {"catalog": f"{self.origin}/", "settings": f"{self.origin}/settings"}
         if self.modules is not None:
             views["modules"] = f"{self.origin}/modules"
+        if self.mock_tests is not None:
+            views["tests"] = f"{self.origin}/tests"
         if self.credentials:
             views["credentials"] = f"{self.origin}/credentials"
         names = self.policy_names()
@@ -143,10 +163,13 @@ class Management:
             }
             if self.credentials and name in self.router.connections.accounts:
                 entry["credentials_url"] = f"{views['credentials']}?backend={name}"
+            recovery = docker_recovery(name, entry["status"])
+            if recovery is not None:
+                entry["recovery"] = recovery
             connections.append(entry)
         return {
             "profile": profile.endpoint_key,
-            "revision": self.settings.state.revision,
+            "revision": self.policy_state.revision,
             "views": views,
             "connections": connections,
             "tools": tools,
@@ -166,14 +189,16 @@ class Management:
         discovery_commands = self.discovery.commands if self.discovery is not None else {}
         module_commands = self.modules.commands if self.modules is not None else {}
         diagnostic_commands = self.diagnostics.commands if self.diagnostics is not None else {}
-        data_commands = {**skill_commands, **discovery_commands, **diagnostic_commands}
+        chain_commands = self.chains.commands if self.chains is not None else {}
+        test_commands = self.mock_tests.commands if self.mock_tests is not None else {}
+        data_commands = {**skill_commands, **discovery_commands, **diagnostic_commands, **chain_commands}
         tools = []
         for name, (model, description) in schemas.items():
             read_only = name == "gateway_inspect"
             tools.append(types.Tool(name=name, description=description, inputSchema=model.model_json_schema(),
                                     annotations=types.ToolAnnotations(readOnlyHint=read_only, openWorldHint=False)))
 
-        for name, (model, description, read_only, _) in {**data_commands, **module_commands}.items():
+        for name, (model, description, read_only, _) in {**data_commands, **module_commands, **test_commands}.items():
             tools.append(types.Tool(name=name, description=description, inputSchema=model.model_json_schema(),
                                     annotations=types.ToolAnnotations(readOnlyHint=read_only, openWorldHint=False)))
 
@@ -183,6 +208,8 @@ class Management:
 
         async def call(params):
             """Validate and execute an explicitly supported operation."""
+            if params.name in test_commands:
+                return await self.call_mock_test(test_commands[params.name], params.arguments or {})
             if params.name in module_commands:
                 model, _, _, execute = module_commands[params.name]
                 try:
@@ -203,6 +230,8 @@ class Management:
                     scope = "diagnostic"
                 elif params.name in discovery_commands:
                     scope = "discovery"
+                elif params.name in chain_commands:
+                    scope = "chain suggestion"
                 try:
                     query = model.model_validate(params.arguments or {})
                     result = await execute(query)
@@ -232,13 +261,31 @@ class Management:
                               "catalog_revision": self.router.catalog_revision}
             except ValidationError:
                 return tool_error("Invalid management arguments")
-            except (ValueError, ReauthorizationError) as error:
+            except ReauthorizationError as error:
+                recovery = docker_recovery(query.backend, str(error))
+                if recovery is not None:
+                    return tool_error(recovery["message"], details=recovery)
+                return tool_error(str(error))
+            except ValueError as error:
                 return tool_error(str(error))
             except OSError:
                 return tool_error("Unable to save tool policy")
             return types.CallToolResult(content=[], structuredContent=result)
 
         return make_server(catalog, call)
+
+    async def call_mock_test(self, command, arguments) -> types.CallToolResult:
+        """Dispatch one test command and preserve its safe machine-readable failure code."""
+        model, _, _, execute = command
+        try:
+            result = await execute(model.model_validate(arguments))
+        except ValidationError:
+            return tool_error("Invalid mock test arguments", details={"code": "invalid_test_arguments"})
+        except MockTestError as error:
+            return tool_error(str(error), details={"code": error.code})
+        except (OSError, sqlite3.Error):
+            return tool_error("Mock test storage is unavailable", details={"code": "test_storage_unavailable"})
+        return types.CallToolResult(content=[], structuredContent=result)
 
     def _browser_query(self, request: Request) -> tuple[int, str | None]:
         """Align browser offsets and use only a backend configured on this profile."""
@@ -253,9 +300,9 @@ class Management:
         notice = ""
         if self.confirmation is not None:
             receipt, revision, message = self.confirmation
-            if request.query_params.get("saved") == receipt and self.settings.state.revision == revision:
+            if request.query_params.get("saved") == receipt and self.policy_state.revision == revision:
                 notice = message
-        return HTMLResponse(self.page(offset, backend, notice=notice), headers=SECURE_HTML)
+        return HTMLResponse(self.page(offset, backend, notice=notice), headers=LIVE_SETTINGS_HTML)
 
     async def submit(self, request: Request) -> Response:
         """Apply one same-origin browser policy edit through the Bridge's CAS path."""
@@ -297,7 +344,7 @@ class Management:
     def _policy_error(self, offset: int, backend: str | None, message: str, status: int) -> Response:
         """Show current policy data after a rejected edit without reflecting form text."""
         return HTMLResponse(self.page(offset, backend, notice=message, error=True),
-                            status_code=status, headers=SECURE_HTML)
+                            status_code=status, headers=LIVE_SETTINGS_HTML)
 
     def _connection_rows(self, connections: list[dict]) -> str:
         """Render credential entry points and status for the selected MCPs."""
@@ -337,12 +384,15 @@ class Management:
         escaped_name = escape(name, quote=True)
         select_label = escape(tr("Политика для {tool}").format(tool=name), quote=True)
         save_label = escape(tr("Сохранить политику для {tool}").format(tool=name), quote=True)
-        return f"""<form class="module-form" method="post" action="{action}">
+        return f"""<form class="gateway-filter" method="post" action="{action}" data-ag-form-row="stack">
 <input type="hidden" name="csrf" value="{escape(self.csrf, quote=True)}">
 <input type="hidden" name="tool" value="{escaped_name}">
 <input type="hidden" name="expected_revision" value="{revision}">
-<select name="policy" aria-label="{select_label}">{"".join(options)}</select>
-<button type="submit" aria-label="{save_label}">{tr("Сохранить политику")}</button></form>"""
+<div class="ag-select" data-ag-form-field><label for="policy-{escaped_name}">{tr("Политика")}</label>
+<div class="gateway-control-line">
+<select class="ag-select__control" id="policy-{escaped_name}" name="policy" aria-label="{select_label}">{"".join(options)}</select>
+<button class="ag-button ag-button--secondary" type="submit" aria-label="{save_label}">{tr("Сохранить политику")}</button>
+</div></div></form>"""
 
     def _policy_rows(self, tools: list[dict], revision: int, action: str) -> str:
         """Show configured policy and distinguish missing tools from paused coalescing."""
@@ -353,20 +403,17 @@ class Management:
                 label += " · " + tr("Нет в каталоге")
             elif tool["policy"] == "singleflight" and tool["effective_policy"] != "singleflight":
                 label += " · " + tr("приостановлен")
+            route = self.router.routes.get(tool["tool"])
+            summary = route.tool.description if route is not None else None
+            description = f'<p class="policy-description muted">{escape(summary[:300])}</p>' if summary else ""
             form = self._policy_form(tool, revision, action)
-            rows.append(f'<li><strong>{escape(tool["tool"])}</strong> · {label}{form}</li>')
+            rows.append(f'<li><strong>{escape(tool["tool"])}</strong> · {label}{description}{form}</li>')
         return "".join(rows) or f"<li>{tr('Инструменты не найдены.')}</li>"
 
     def _backend_filter(self, backend: str | None) -> str:
         """Render a native GET filter so pagination never spans unrelated MCPs."""
-        options = [f'<option value="">{tr("Все MCP")}</option>']
-        for name in self.router.profile.backends:
-            selected = " selected" if name == backend else ""
-            options.append(f'<option value="{escape(name, quote=True)}"{selected}>{escape(name)}</option>')
-        return f"""<form class="module-form" method="get" action="/settings">
-<label for="policy-backend">{tr("Фильтр по MCP")}</label>
-<select id="policy-backend" name="backend">{"".join(options)}</select>
-<button type="submit">{tr("Применить фильтр")}</button></form>"""
+        return backend_filter(self.router.profile.backends, backend, path="/settings", identity="policy-backend",
+                              label="Фильтр по MCP", action="Применить фильтр")
 
     def page(self, offset: int, backend: str | None = None, *, notice: str = "", error: bool = False) -> str:
         """Render the scoped, revisioned policy view without exposing secret values."""
@@ -389,26 +436,36 @@ class Management:
         count = tr("Показано {start}–{stop} из {total}").format(
             start=offset + 1, stop=offset + len(current["tools"]), total=total,
         ) if total else ""
-        gateway = self.router.profile
-        token_source = "Хранилище ОС" if gateway.access_token_keychain else "Окружение"
-        if gateway.access_token_keychain and gateway.access_token_env:
-            token_source = "Хранилище ОС, затем окружение"
+        mode = (
+            "Изменения действуют для следующих вызовов в текущей сессии."
+            if self.csrf is not None else "Режим просмотра. Для изменения политики откройте защищённый профиль."
+        )
+        refresh = revision_notice("policy", self.browser_revision(), _settings_url(offset, backend) + "#tool-policy")
+        bridge = (
+            f'<p>{tr("Через MCP Bridge также доступны")} <code>gateway_<wbr>inspect</code> · '
+            '<code>gateway_<wbr>set_<wbr>tool_<wbr>policy</code>.</p>'
+            if self.bridge_enabled else ""
+        )
+        profile = self.router.profile
+        sources = []
+        if profile.access_token_keychain:
+            sources.append(tr("Хранилище ОС"))
+        if profile.access_token_env:
+            sources.append(tr("Окружение"))
+        token_source = f'<p>{tr("Источник токена шлюза")} · {" → ".join(sources)}.</p>' if sources else ""
         feedback = ""
         if notice:
             role = "alert" if error else "status"
             feedback = f'<p role="{role}">{escape(tr(notice))}</p>'
-        return f"""<!doctype html>
-<html lang="{language()}"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{tr("Настройки MCP")}</title><link rel="stylesheet" href="/dashboard.css">
-<main><header><div><h1>{tr("Настройки MCP")}</h1><p>{tr("Профиль")} {escape(current["profile"])}</p></div>
-<a href="/">{tr("К каталогу")}</a>{language_switch()}</header><section aria-labelledby="policy"><h2 id="policy">{tr("Управление")}</h2>
-<p>{tr("MCP Bridge включён. Ревизия политики")} {current["revision"]}.</p>
-<p>{tr("Источник токена шлюза")} · {tr(token_source)}.</p></section>
-<section aria-labelledby="tool-policy"><h2 id="tool-policy">{tr("Политика инструментов")}</h2>
-{feedback}{self._backend_filter(backend)}
-<p>{tr("Через MCP Bridge также доступны")} <code>gateway_<wbr>inspect</code> · <code>gateway_<wbr>set_<wbr>tool_<wbr>policy</code>.</p>
-<p>{count}</p>
+        content = f"""<section id="tool-policy" data-ag-width="fill" aria-labelledby="section-title">
+<p class="muted">{tr(mode)}</p>
+{refresh}{feedback}{self._backend_filter(backend)}
+<p class="muted">{count}</p>
 <ul class="tools">{policies}</ul>
 <nav class="backend-actions" aria-label="{tr("Страницы инструментов")}">{"".join(links)}</nav></section>
-<section aria-labelledby="sources"><h2 id="sources">{tr("Источники учётных данных MCP")}</h2>
-<ul class="tools">{rows}</ul></section></main></html>"""
+<section data-ag-width="fill" aria-labelledby="sources"><h2 id="sources">{tr("Источники учётных данных MCP")}</h2>
+<ul class="tools">{rows}</ul>
+<details><summary>{tr("Управление")}</summary>
+<p>{tr("Ревизия политики")} {current["revision"]}.</p>{token_source}{bridge}
+</details></section>"""
+        return shell("/settings", current["profile"], tr("Политика инструментов"), content)

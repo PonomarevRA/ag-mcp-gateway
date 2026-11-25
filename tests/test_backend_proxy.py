@@ -1,9 +1,12 @@
 """Exercise each backend proxy through the real MCP HTTP transport."""
 
 import asyncio
+import json
+import re
 from base64 import b64encode
 from collections import Counter
 from contextlib import AsyncExitStack, asynccontextmanager
+from html import unescape
 
 import httpx
 import pytest
@@ -63,6 +66,7 @@ def gateway(tmp_path, monkeypatch):
         tools = {f"{name}.{tool}": types.Tool(
             name=tool, inputSchema={"type": "object", "properties": {"caller": {"type": "string"}}},
             description=f"Synthetic {name} {tool}",
+            annotations=types.ToolAnnotations(readOnlyHint=True) if tool == "project.read" else None,
         ) for tool in names}
         publish(name, Session(name, generation), tools, "ready")
         await asyncio.Event().wait()
@@ -89,6 +93,26 @@ def rpc(client, path, method, params=None, *, headers=HEADERS):
         request["params"] = params
     return client.post(path, headers=headers, json=request)
 
+
+
+def test_catalog_copy_settings_are_scoped_and_exclude_tokens(gateway):
+    """Each card copies the gateway address for only its backend and uses a token placeholder."""
+    app, _, _ = gateway
+    with TestClient(app, base_url=ORIGIN) as client:
+        response = client.get("/catalog?lang=en", auth=("gateway", TOKEN))
+    assert response.status_code == 200
+    assert response.text.count('data-copy-mcp ') == 2
+    payloads = re.findall(r'<textarea[^>]*data-mcp-config[^>]*>(.*?)</textarea>', response.text, re.S)
+    entries = {}
+    for payload in payloads:
+        servers = json.loads(unescape(payload))["mcpServers"]
+        assert len(servers) == 1
+        entries.update(servers)
+    assert len(entries) == 2
+    assert {entry["url"] for entry in entries.values()} == {ORIGIN + LOCAL, ORIGIN + OTHER}
+    assert all(entry["headers"] == {"Authorization": "Bearer <gateway-profile-token>"}
+               for entry in entries.values())
+    assert TOKEN not in response.text
 
 def test_proxy_isolates_backends_and_shares_policy_and_metadata(gateway):
     """Bind original MCP names to one configured server without bypassing policy."""
@@ -263,5 +287,134 @@ def test_scoped_sdk_call_shares_persisted_hooks_singleflight_and_statistics(gate
             metrics = status["metrics"]["tools"][tool]
             assert metrics["received"] == 2 and metrics["upstream"] == metrics["merged"] == 1
             assert metrics["timed"] == 2 and metrics["input_tokens_estimate"] > 0
+
+    asyncio.run(scenario())
+
+
+def test_live_settings_share_updates_with_already_initialized_clients(gateway, tmp_path):
+    """Update a live policy from the browser and a live module from MCP Bridge."""
+    _, router, calls = gateway
+    router.modules = ModuleRegistry(router, tmp_path / "live-modules.json")
+    app = create_app(router, 18793, TOKEN, settings=ToolPolicySettings(router, tmp_path / "live-policy.json"))
+    browser = {"Authorization": "Basic " + b64encode(f"gateway:{TOKEN}".encode()).decode(),
+               "Origin": ORIGIN}
+    tool = "local.before_reload"
+    manage = "/manage/test/fixture"
+
+    async def scenario():
+        """Keep the same client sessions throughout browser and management updates."""
+        async with sdk_clients(app, LOCAL, manage) as (http, (proxy, bridge)):
+            worker = router.connections.active["local"]
+            first = await proxy.request_tool("before_reload", {}, None)
+            assert not first.isError and first.structuredContent["generation"] == 1
+            revisions_url = ORIGIN + "/api/settings/revisions"
+            before = (await http.get(revisions_url, headers=browser)).json()
+            page = await http.get(ORIGIN + "/settings?backend=local&lang=en", headers=browser)
+            assert "Synthetic local before_reload" in page.text
+            csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
+            saved = await http.post(ORIGIN + "/settings?backend=local", headers=browser, data={
+                "csrf": csrf, "tool": tool, "policy": "deny", "expected_revision": "0",
+            })
+            assert saved.status_code == 303
+            assert (await proxy.request_tool("before_reload", {}, None)).isError
+            assert "before_reload" not in {tool.name for tool in (await proxy.catalog_page(None)).tools}
+            assert (await http.get(revisions_url, headers=browser)).json()["policy"] != before["policy"]
+
+            module = {"id": "extract", "title": "Extract",
+                      "steps": [{"op": "select", "source": "/input/value"}]}
+            result = await bridge.request_tool("gateway_module_save", {"expected_revision": 0, "module": module}, None)
+            assert not result.isError
+            assert (await http.get(revisions_url, headers=browser)).json()["modules"] == "1"
+            page = await http.get(ORIGIN + "/modules", headers=browser)
+            assert "Extract" in page.text and 'data-settings-revision="1"' in page.text
+            outcome = await bridge.request_tool("gateway_module_run", {
+                "id": "extract", "expected_revision": 1, "data": {"value": 42},
+            }, None)
+            assert outcome.structuredContent["result"] == 42
+            assert router.connections.active["local"] is worker
+
+    asyncio.run(scenario())
+    assert len(calls) == 1
+
+
+def test_publish_trace_search_into_open_aggregate_session(gateway, tmp_path):
+    """Publish through the browser, run two reads in one call and remove the tool live."""
+    _, router, calls = gateway
+    router.profile.module_chain_tools = {"local.project.read", "other.project.read", "local.before_reload"}
+    registry = ModuleRegistry(router, tmp_path / "published-modules.json")
+    router.modules = registry
+    app = create_app(router, 18793, TOKEN, settings=ToolPolicySettings(router, tmp_path / "published-policy.json"))
+    manage = "/manage/test/fixture"
+    browser = {"Authorization": "Basic " + b64encode(f"gateway:{TOKEN}".encode()).decode(),
+               "Origin": ORIGIN}
+    definition = {
+        "id": "trace_search", "title": "Kibana and logs by trace ID",
+        "steps": [
+            {"op": "object", "fields": {"traceId": "/input/trace_id"}},
+            {"op": "call", "tool": "local.project.read", "save_as": "kibana"},
+            {"op": "object", "fields": {"trace_id": "/input/trace_id"}},
+            {"op": "call", "tool": "other.project.read", "save_as": "logs"},
+            {"op": "object", "fields": {"kibana": "/steps/kibana", "logs": "/steps/logs"}},
+        ],
+    }
+
+    async def scenario():
+        """Reuse initialized aggregate, scoped and management clients for every state."""
+        async with sdk_clients(app, PROFILE, LOCAL, manage) as (http, (aggregate, scoped, bridge)):
+            first = await aggregate.catalog_page(None)
+            assert first.nextCursor and all(tool.name != "trace_search" for tool in first.tools)
+            saved = await bridge.request_tool("gateway_module_save", {"expected_revision": 0, "module": definition}, None)
+            assert not saved.isError
+            url = ORIGIN + "/modules?edit=trace_search&lang=en"
+            page = await http.get(url, headers=browser)
+            assert "Publish as a read-only tool" in page.text
+            csrf = re.search(r'name="csrf" value="([^"]+)"', page.text).group(1)
+            fields = {"csrf": csrf, "revision": "1", "action": "publish", "data": '{"trace_id":"string"}'}
+            assert (await http.post(url, headers=HEADERS, data=fields)).status_code == 401
+            assert (await http.post(url, headers=browser, data={**fields, "csrf": "bad"})).status_code == 403
+            assert (await http.post(url, headers=browser, data=fields)).status_code == 303
+            restored = ModuleRegistry(router, registry.path)
+            assert restored.state.publications["trace_search"].fields == {"trace_id": "string"}
+            with pytest.raises(McpError, match="Invalid catalog cursor"):
+                await aggregate.catalog_page(first.nextCursor)
+            tools = (await aggregate.catalog_page(None)).tools
+            published = next(tool for tool in tools if tool.name == "trace_search")
+            assert published.annotations.readOnlyHint is True
+            assert published.inputSchema["required"] == ["trace_id"]
+            assert "trace_search" not in {tool.name for tool in (await scoped.catalog_page(None)).tools}
+            assert (await aggregate.request_tool("trace_search", {"trace_id": 42}, None)).isError
+            assert not calls
+
+            trace = "0123456789abcdef0123456789abcdef"
+            answer = await aggregate.request_tool("trace_search", {"trace_id": trace}, None)
+            assert not answer.isError
+            assert router.telemetry.tool_uses("trace_search") == 2
+            assert (await aggregate.catalog_page(None)).tools[0].name == "trace_search"
+            tools_page = await http.get(ORIGIN + "/tools?lang=en", headers=browser)
+            assert "<strong>trace_search</strong>" in tools_page.text
+            assert "Uses 2" in tools_page.text
+            combined = answer.structuredContent["result"]
+            assert combined["kibana"]["arguments"] == {"traceId": trace}
+            assert combined["logs"]["arguments"] == {"trace_id": trace}
+            assert [(backend, name) for backend, name, _, _ in calls] == [
+                ("local", "project.read"), ("other", "project.read"),
+            ]
+
+            denied = await bridge.request_tool("gateway_set_tool_policy", {
+                "tool": "other.project.read", "policy": "deny", "expected_revision": 0,
+            }, None)
+            assert not denied.isError
+            assert (await aggregate.request_tool("trace_search", {"trace_id": trace}, None)).isError
+            assert len(calls) == 2
+
+            changed = {**definition, "title": "Changed while published"}
+            assert (await bridge.request_tool("gateway_module_save", {
+                "expected_revision": 2, "module": changed,
+            }, None)).isError
+            assert (await http.post(url, headers=browser, data={
+                "csrf": csrf, "revision": "2", "action": "unpublish",
+            })).status_code == 303
+            assert (await aggregate.request_tool("trace_search", {"trace_id": trace}, None)).isError
+            assert "trace_search" not in {tool.name for tool in (await aggregate.catalog_page(None)).tools}
 
     asyncio.run(scenario())
